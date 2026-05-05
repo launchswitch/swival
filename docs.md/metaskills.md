@@ -8,7 +8,7 @@ They are a dynamic extension to a regular agent
 skill: they sit next to a normal `SKILL.md` file and help an agent do the parts
 of a task that should be repeatable, bounded, and easy to inspect.
 
-## 1. The Problem MetaSKILLs Solve
+## 1. Motivation
 
 Static skills are great when the useful thing is instruction:
 
