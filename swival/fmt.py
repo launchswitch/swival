@@ -8,6 +8,7 @@ import time
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.markup import escape
+from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.rule import Rule
 from rich.spinner import Spinner
@@ -206,7 +207,7 @@ _DIFF_MAX_BYTES = 4096
 
 def tool_diff(file_path: str, old: str, new: str) -> None:
     """Print a colored unified diff of an edit to stderr."""
-    lines = list(
+    diff_lines = list(
         difflib.unified_diff(
             old.splitlines(keepends=True),
             new.splitlines(keepends=True),
@@ -214,16 +215,23 @@ def tool_diff(file_path: str, old: str, new: str) -> None:
             tofile=file_path,
         )
     )
-    if not lines:
+    if not diff_lines:
         return
+
+    additions = sum(
+        1 for dl in diff_lines if dl.startswith("+") and not dl.startswith("+++")
+    )
+    deletions = sum(
+        1 for dl in diff_lines if dl.startswith("-") and not dl.startswith("---")
+    )
 
     output = Text()
     total_bytes = 0
     shown = 0
-    for line in lines:
+    for line in diff_lines:
         if shown >= _DIFF_MAX_LINES or total_bytes >= _DIFF_MAX_BYTES:
-            remaining = len(lines) - shown
-            output.append(f"    ... {remaining} more lines\n", style="dim")
+            remaining = len(diff_lines) - shown
+            output.append(f"... {remaining} more lines\n", style="dim")
             break
         if line.startswith("---") or line.startswith("+++"):
             style = "bold"
@@ -240,14 +248,30 @@ def tool_diff(file_path: str, old: str, new: str) -> None:
         if len(encoded) > budget:
             encoded = encoded[:budget]
             line = encoded.decode("utf-8", errors="ignore")
-        display = f"    {line}"
+        display = line if _console.is_terminal else f"    {line}"
         output.append(display, style=style)
         if not display.endswith("\n"):
             output.append("\n")
         total_bytes += len(encoded)
         shown += 1
 
-    _console.print(output, end="")
+    if _console.is_terminal:
+        subtitle = Text()
+        subtitle.append(f"+{additions}", style="green")
+        subtitle.append(" / ", style="dim")
+        subtitle.append(f"-{deletions}", style="red")
+        panel = Panel(
+            output,
+            title=file_path,
+            title_align="left",
+            subtitle=subtitle,
+            subtitle_align="right",
+            border_style="dim",
+            padding=(0, 1),
+        )
+        _console.print(panel)
+    else:
+        _console.print(output, end="")
 
 
 def tool_error(name: str, msg: str) -> None:
