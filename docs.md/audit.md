@@ -23,9 +23,11 @@ Scope it to a directory or glob:
 ```text
 swival> /audit src/auth/
 swival> /audit *.py
+swival> /audit src/*.py
+swival> /audit src/**/*.py
 ```
 
-The `*` in a glob matches across `/`, so `*.py` already covers every Python file at every depth. There is no need (and no support) for a `**` recursive form.
+The matcher uses `pathlib.PurePosixPath.full_match` for any pattern that contains a wildcard. A bare `*` does not cross directory separators, so `src/*.py` matches only direct children of a top-level `src/` directory. Use `**` when you want recursion: `src/**/*.py` matches every `.py` file at any depth under `src/`. As a convenience, a wildcard pattern with no `/` is treated as recursive on its own, so `*.py` still selects every Python file in the repository.
 
 Multiple paths can be passed; they are unioned into a single audit run with one
 state file and one set of reports:
@@ -222,7 +224,7 @@ swival> /audit src/api/ --regen
 force_review = ["swival/audit.py", "swival/edit.py", "swival/sandbox_*.py"]
 ```
 
-`force_review` is a list of fnmatch globs evaluated against repo-relative paths from `git ls-files`. A trailing `/` on an entry expands to the directory and everything below it (`src/` matches `src/a.py`, `src/sub/b.py`, and so on). Matching files are unconditionally promoted into Phase 3, regardless of what triage decides. It is the surgical alternative to `--all` for paths you always want deep-reviewed.
+`force_review` is a list of path globs evaluated against repo-relative paths from `git ls-files`, using the same matcher as `/audit` focus arguments (see "Filtering" below for the full rules). A trailing `/` on a non-wildcard entry expands to the directory and everything below it (`src/` matches `src/a.py`, `src/sub/b.py`, and so on); a single `*` does not cross `/`, so `src/*.py` matches only direct children, while `src/**/*.py` recurses. Matching files are unconditionally promoted into Phase 3, regardless of what triage decides. It is the surgical alternative to `--all` for paths you always want deep-reviewed.
 
 A glob in the project file that matches zero paths in scope produces a warning, since it usually means a stale entry after a rename. Globs in the global file are silent on zero matches, on the assumption that a global glob like `swival/audit.py` will trivially miss in unrelated repositories. Globs from both files are merged: project entries layer on top of global entries.
 
@@ -240,9 +242,24 @@ Only files with recognized source or configuration extensions are auditable:
 
 Other file types (`.md`, `.png`, `.csv`, etc.) are excluded.
 
-When a focus argument is provided, it works as both an fnmatch pattern and a prefix filter. For example, `/audit src/` includes all files under `src/`, and `/audit *.py` includes all Python files.
+A focus argument is matched against each repo-relative path with three rules, evaluated in order:
 
-Wildcards in a focus glob match across directory separators, so a single `*` is enough to recurse. `/audit *.rs` selects every `.rs` file in the repository, including ones nested several directories deep like `crates/foo/src/bar.rs`. To restrict the recursion to a subtree, anchor the pattern with a prefix: `/audit src/*.rs` matches every `.rs` file at any depth under `src/`. Multiple patterns can be combined in one run, for example `/audit '*.rs' '*.toml'`. Quote the pattern when invoking from a shell that would expand it before swival sees it.
+1. Exact match. `src/foo.py` selects only `src/foo.py`.
+2. Prefix match for entries with no wildcard. `src` and `src/` both expand to "anything under top-level `src/`".
+3. Wildcard match via `pathlib.PurePosixPath.full_match`. A single `*` matches one path segment and does not cross `/`, `?` matches one non-separator character, `**` matches any number of intermediate directories, and `[abc]` is a character class.
+
+A wildcard pattern with no `/` is treated as recursive, so `*.py` keeps doing the natural thing and selects every Python file in the repository. Anchored patterns are precise:
+
+| Pattern          | Matches                                                                 |
+| ---------------- | ----------------------------------------------------------------------- |
+| `*.rs`           | every `.rs` file at any depth (slashless wildcard, recursive shorthand) |
+| `src/*.rs`       | only direct `.rs` children of a top-level `src/` directory              |
+| `src/**/*.rs`    | every `.rs` file at any depth under a top-level `src/` directory        |
+| `src/`           | every file under a top-level `src/` directory                           |
+
+Anchored patterns never match suffixes: `src/*.rs` does *not* select `crates/foo/src/bar.rs`, because the leading `src/` is rooted at the repository top.
+
+Multiple patterns can be combined in one run, for example `/audit '*.rs' '*.toml'`. Quote the pattern when invoking from a shell that would expand it before swival sees it.
 
 ## State and Storage
 

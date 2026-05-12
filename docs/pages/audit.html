@@ -109,8 +109,10 @@
 <p>Scope it to a directory or glob:</p>
 <pre><code class="language-text">swival&gt; /audit src/auth/
 swival&gt; /audit *.py
+swival&gt; /audit src/*.py
+swival&gt; /audit src/**/*.py
 </code></pre>
-<p>The <code>*</code> in a glob matches across <code>/</code>, so <code>*.py</code> already covers every Python file at every depth. There is no need (and no support) for a <code>**</code> recursive form.</p>
+<p>The matcher uses <code>pathlib.PurePosixPath.full_match</code> for any pattern that contains a wildcard. A bare <code>*</code> does not cross directory separators, so <code>src/*.py</code> matches only direct children of a top-level <code>src/</code> directory. Use <code>**</code> when you want recursion: <code>src/**/*.py</code> matches every <code>.py</code> file at any depth under <code>src/</code>. As a convenience, a wildcard pattern with no <code>/</code> is treated as recursive on its own, so <code>*.py</code> still selects every Python file in the repository.</p>
 <p>Multiple paths can be passed; they are unioned into a single audit run with one
 state file and one set of reports:</p>
 <pre><code class="language-text">swival&gt; /audit src/auth/ src/api/
@@ -232,7 +234,7 @@ swival&gt; /audit src/api/ --regen
 <pre><code class="language-toml">[audit]
 force_review = [&quot;swival/audit.py&quot;, &quot;swival/edit.py&quot;, &quot;swival/sandbox_*.py&quot;]
 </code></pre>
-<p><code>force_review</code> is a list of fnmatch globs evaluated against repo-relative paths from <code>git ls-files</code>. A trailing <code>/</code> on an entry expands to the directory and everything below it (<code>src/</code> matches <code>src/a.py</code>, <code>src/sub/b.py</code>, and so on). Matching files are unconditionally promoted into Phase 3, regardless of what triage decides. It is the surgical alternative to <code>--all</code> for paths you always want deep-reviewed.</p>
+<p><code>force_review</code> is a list of path globs evaluated against repo-relative paths from <code>git ls-files</code>, using the same matcher as <code>/audit</code> focus arguments (see "Filtering" below for the full rules). A trailing <code>/</code> on a non-wildcard entry expands to the directory and everything below it (<code>src/</code> matches <code>src/a.py</code>, <code>src/sub/b.py</code>, and so on); a single <code>*</code> does not cross <code>/</code>, so <code>src/*.py</code> matches only direct children, while <code>src/**/*.py</code> recurses. Matching files are unconditionally promoted into Phase 3, regardless of what triage decides. It is the surgical alternative to <code>--all</code> for paths you always want deep-reviewed.</p>
 <p>A glob in the project file that matches zero paths in scope produces a warning, since it usually means a stale entry after a rename. Globs in the global file are silent on zero matches, on the assumption that a global glob like <code>swival/audit.py</code> will trivially miss in unrelated repositories. Globs from both files are merged: project entries layer on top of global entries.</p>
 <p>Adding a glob between runs takes effect on resume: if a saved run has a SKIP record for a path that now matches <code>force_review</code>, the resume promotes that record before Phase 3 sees it. Removing a glob is <em>not</em> honored on resume; rescinding mid-audit is more confusing than it is worth, so re-run from scratch instead.</p>
 <h2 id="scope">Scope</h2>
@@ -241,8 +243,41 @@ force_review = [&quot;swival/audit.py&quot;, &quot;swival/edit.py&quot;, &quot;s
 <p><strong>Source:</strong> <code>.py</code>, <code>.js</code>, <code>.ts</code>, <code>.tsx</code>, <code>.jsx</code>, <code>.go</code>, <code>.rs</code>, <code>.java</code>, <code>.kt</code>, <code>.rb</code>, <code>.php</code>, <code>.c</code>, <code>.cc</code>, <code>.cpp</code>, <code>.h</code>, <code>.hpp</code>, <code>.cs</code>, <code>.swift</code>, <code>.scala</code>, <code>.sh</code>, <code>.zig</code></p>
 <p><strong>Configuration:</strong> <code>.json</code>, <code>.toml</code>, <code>.yaml</code>, <code>.yml</code>, <code>.xml</code>, <code>.ini</code>, <code>.conf</code>, <code>.sql</code>, <code>.graphql</code>, <code>.proto</code>, <code>.rego</code>, <code>.tf</code>, <code>.cue</code></p>
 <p>Other file types (<code>.md</code>, <code>.png</code>, <code>.csv</code>, etc.) are excluded.</p>
-<p>When a focus argument is provided, it works as both an fnmatch pattern and a prefix filter. For example, <code>/audit src/</code> includes all files under <code>src/</code>, and <code>/audit *.py</code> includes all Python files.</p>
-<p>Wildcards in a focus glob match across directory separators, so a single <code>*</code> is enough to recurse. <code>/audit *.rs</code> selects every <code>.rs</code> file in the repository, including ones nested several directories deep like <code>crates/foo/src/bar.rs</code>. To restrict the recursion to a subtree, anchor the pattern with a prefix: <code>/audit src/*.rs</code> matches every <code>.rs</code> file at any depth under <code>src/</code>. Multiple patterns can be combined in one run, for example <code>/audit '*.rs' '*.toml'</code>. Quote the pattern when invoking from a shell that would expand it before swival sees it.</p>
+<p>A focus argument is matched against each repo-relative path with three rules, evaluated in order:</p>
+<ol>
+<li>Exact match. <code>src/foo.py</code> selects only <code>src/foo.py</code>.</li>
+<li>Prefix match for entries with no wildcard. <code>src</code> and <code>src/</code> both expand to "anything under top-level <code>src/</code>".</li>
+<li>Wildcard match via <code>pathlib.PurePosixPath.full_match</code>. A single <code>*</code> matches one path segment and does not cross <code>/</code>, <code>?</code> matches one non-separator character, <code>**</code> matches any number of intermediate directories, and <code>[abc]</code> is a character class.</li>
+</ol>
+<p>A wildcard pattern with no <code>/</code> is treated as recursive, so <code>*.py</code> keeps doing the natural thing and selects every Python file in the repository. Anchored patterns are precise:</p>
+<table>
+<thead>
+<tr>
+<th>Pattern</th>
+<th>Matches</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>*.rs</code></td>
+<td>every <code>.rs</code> file at any depth (slashless wildcard, recursive shorthand)</td>
+</tr>
+<tr>
+<td><code>src/*.rs</code></td>
+<td>only direct <code>.rs</code> children of a top-level <code>src/</code> directory</td>
+</tr>
+<tr>
+<td><code>src/**/*.rs</code></td>
+<td>every <code>.rs</code> file at any depth under a top-level <code>src/</code> directory</td>
+</tr>
+<tr>
+<td><code>src/</code></td>
+<td>every file under a top-level <code>src/</code> directory</td>
+</tr>
+</tbody>
+</table>
+<p>Anchored patterns never match suffixes: <code>src/*.rs</code> does <em>not</em> select <code>crates/foo/src/bar.rs</code>, because the leading <code>src/</code> is rooted at the repository top.</p>
+<p>Multiple patterns can be combined in one run, for example <code>/audit '*.rs' '*.toml'</code>. Quote the pattern when invoking from a shell that would expand it before swival sees it.</p>
 <h2 id="state-and-storage">State and Storage</h2>
 <p>Audit state is persisted in <code>.swival/audit/&lt;run_id&gt;/state.json</code>. This includes:</p>
 <ul>

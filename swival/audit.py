@@ -453,20 +453,34 @@ def _resolve_scope(base_dir: str, focus: list[str]) -> AuditScope:
 def _match_path_glob(file: str, glob: str) -> bool:
     """True when ``file`` (a repo-relative path) is selected by ``glob``.
 
-    Selection rules:
-    - exact match
-    - fnmatch wildcard (``*``, ``?``, ``[...]``)
-    - prefix match: a trailing ``/`` (or no slash on a non-wildcard entry)
-      means "this path or anything inside this directory"
+    Selection rules, in order:
+
+    - exact match: ``src/foo.rs`` selects only ``src/foo.rs``.
+    - prefix match (no wildcard): ``src`` and ``src/`` both select
+      anything under ``src/``.
+    - pathlib wildcard match via ``PurePosixPath.full_match``: ``*``
+      does *not* cross ``/``, ``?`` matches a single non-separator
+      character, ``**`` matches any number of intermediate directories,
+      and ``[abc]`` is a character class. A wildcard pattern with no
+      ``/`` is implicitly recursive: ``*.rs`` is rewritten to
+      ``**/*.rs`` so it keeps selecting every ``.rs`` file at any depth.
+      This means ``src/*.rs`` matches only direct ``.rs`` children of a
+      top-level ``src/``, and ``src/**/*.rs`` is the recursive form.
     """
-    import fnmatch
+    from pathlib import PurePosixPath
 
     if file == glob:
         return True
-    if fnmatch.fnmatch(file, glob):
-        return True
-    prefix = glob if glob.endswith("/") else glob + "/"
-    return file.startswith(prefix)
+
+    has_wildcard = any(c in glob for c in "*?[")
+    if not has_wildcard:
+        prefix = glob if glob.endswith("/") else glob + "/"
+        return file.startswith(prefix)
+
+    pattern = glob.rstrip("/") or glob
+    if "/" not in pattern:
+        pattern = f"**/{pattern}"
+    return PurePosixPath(file).full_match(pattern)
 
 
 def _is_auditable(path: str) -> bool:

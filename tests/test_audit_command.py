@@ -4632,6 +4632,78 @@ class TestCallAuditLlmOverflowRetry:
         assert calls[1] < 2000
 
 
+class TestMatchPathGlob:
+    def test_exact_match(self):
+        from swival.audit import _match_path_glob
+
+        assert _match_path_glob("src/foo.rs", "src/foo.rs")
+        assert not _match_path_glob("src/foo.rs", "src/bar.rs")
+
+    def test_prefix_no_wildcard(self):
+        from swival.audit import _match_path_glob
+
+        assert _match_path_glob("src/a.py", "src")
+        assert _match_path_glob("src/sub/a.py", "src/")
+        assert not _match_path_glob("source/a.py", "src")
+
+    def test_slashless_wildcard_is_recursive(self):
+        from swival.audit import _match_path_glob
+
+        assert _match_path_glob("foo.rs", "*.rs")
+        assert _match_path_glob("src/foo.rs", "*.rs")
+        assert _match_path_glob("crates/foo/src/bar.rs", "*.rs")
+        assert not _match_path_glob("foo.py", "*.rs")
+
+    def test_anchored_single_star_does_not_cross_slash(self):
+        from swival.audit import _match_path_glob
+
+        assert _match_path_glob("src/foo.rs", "src/*.rs")
+        assert not _match_path_glob("src/sub/bar.rs", "src/*.rs")
+        assert not _match_path_glob("src/sub/deep/bar.rs", "src/*.rs")
+
+    def test_anchored_double_star_recurses(self):
+        from swival.audit import _match_path_glob
+
+        assert _match_path_glob("src/foo.rs", "src/**/*.rs")
+        assert _match_path_glob("src/sub/bar.rs", "src/**/*.rs")
+        assert _match_path_glob("src/a/b/c.rs", "src/**/*.rs")
+        assert not _match_path_glob("crates/foo/src/bar.rs", "src/**/*.rs")
+
+    def test_anchored_pattern_does_not_match_suffix(self):
+        from swival.audit import _match_path_glob
+
+        assert not _match_path_glob("crates/foo/src/bar.rs", "src/*.rs")
+        assert not _match_path_glob("a/b/src/bar.rs", "src/**/*.rs")
+
+    def test_question_mark_and_charclass(self):
+        from swival.audit import _match_path_glob
+
+        assert _match_path_glob("src/a.rs", "src/?.rs")
+        assert not _match_path_glob("src/ab.rs", "src/?.rs")
+        assert _match_path_glob("src/a.rs", "src/[ab].rs")
+        assert not _match_path_glob("src/c.rs", "src/[ab].rs")
+
+    def test_resolve_scope_anchored_glob_is_repo_rooted_and_segment_aware(
+        self, tmp_path
+    ):
+        from swival.audit import _resolve_scope
+
+        _init_git(tmp_path)
+        _commit_file(tmp_path, "src/lib.rs", "// top")
+        _commit_file(tmp_path, "src/nested/lib.rs", "// nested")
+        _commit_file(tmp_path, "crates/foo/src/lib.rs", "// vendored")
+
+        scope = _resolve_scope(str(tmp_path), ["src/*.rs"])
+        assert "src/lib.rs" in scope.mandatory_files
+        assert "src/nested/lib.rs" not in scope.mandatory_files
+        assert "crates/foo/src/lib.rs" not in scope.mandatory_files
+
+        recursive = _resolve_scope(str(tmp_path), ["src/**/*.rs"])
+        assert "src/lib.rs" in recursive.mandatory_files
+        assert "src/nested/lib.rs" in recursive.mandatory_files
+        assert "crates/foo/src/lib.rs" not in recursive.mandatory_files
+
+
 class TestMultiFocusPaths:
     def test_normalize_focus_strips_trailing_slash_and_dedupes(self):
         from swival.audit import _normalize_focus

@@ -7,7 +7,6 @@ shims for every transitive dependency: mcp, openai, litellm, python,
 """
 
 import os
-import sys
 
 import pytest
 
@@ -146,9 +145,7 @@ class TestChildEnv:
         result = child_env()
         assert result["PATH"] == "/usr/bin"
 
-    def test_extra_cannot_disable_stripping_via_virtual_env(
-        self, own_bin, monkeypatch
-    ):
+    def test_extra_cannot_disable_stripping_via_virtual_env(self, own_bin, monkeypatch):
         # The threat: parent has no VIRTUAL_ENV, but extra slips
         # VIRTUAL_ENV=<sys.prefix> in alongside a polluted PATH.
         # Activation is decided from the parent env only, so stripping
