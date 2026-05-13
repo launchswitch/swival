@@ -233,9 +233,10 @@ halfway. Pause, resume, replace, or clear the goal at any time. See
 
 **Run on a timer.** `/loop 5m /babysit-prs` re-runs a prompt or command every
 five minutes; pair it with one-shot mode and `systemd` or `tmux` to turn
-Swival into a long-lived poller. The interval accepts compound durations
-like `1h30m`, each iteration streams its output to stdout, and `SIGTERM`
-shuts the loop down cleanly between iterations.
+Swival into a long-lived poller. The interval is forgiving: `1h30m`,
+`5 minutes`, `every hour`, `half an hour`, and `1 minute and 30 seconds`
+all work. Each iteration streams its output to stdout, and `SIGTERM` shuts
+the loop down cleanly between iterations.
 
 **A2A server mode.** Run `swival --serve` and your agent becomes an A2A
 endpoint that other agents can call over HTTP. Multi-turn context, streaming,

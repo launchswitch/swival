@@ -82,11 +82,20 @@ Without `--oneshot-commands`, input that looks like a command script is treated 
 
 `/continue` restarts the agent loop for the existing conversation without adding a new user message.
 
-`/loop <interval> <prompt-or-command>` runs a prompt on a recurring interval until you stop it. The interval accepts compound durations like `5m`, `30s`, `1h30m`, `2h`, with a 5-second floor and a 24-hour ceiling. If you omit the interval, it defaults to 10 minutes. The prompt can be plain text, a slash command, or a `!custom-command` — each iteration goes through the same dispatch path as if you typed it yourself, so state (todo list, snapshot, file tracker) carries forward across runs. `Ctrl-C` once skips the current iteration; press it twice within two seconds to exit the loop. Works in one-shot mode too, which is the recommended way to run Swival as a long-lived poller under `systemd`, `tmux`, or `nohup`: each iteration's answer is streamed to stdout with a blank-line separator, diagnostics go to stderr, and `SIGTERM` shuts the loop down cleanly between iterations (a second `SIGTERM` exits immediately with code 143).
+`/loop <interval> <prompt-or-command>` runs a prompt on a recurring interval until you stop it.
+
+The interval grammar is forgiving: the compact form (`5m`, `30s`, `1h30m`) still works, and so do natural-language shapes like `1 min`, `5 minutes`, `30 sec`, `every hour`, `every 5 minutes`, `a minute`, `half an hour`, and components joined by `and` such as `1 minute and 30 seconds`. The 5-second floor and 24-hour ceiling still apply.
+
+If the input never looks like an interval, the whole argument becomes the prompt and the interval defaults to 10 minutes. If it begins as an interval but is malformed (repeated units, trailing `and`, `every` followed by nothing, bounds violation, etc.) the command errors rather than silently scheduling the wrong prompt.
+
+The prompt can be plain text, a slash command, or a `!custom-command`. Each iteration goes through the same dispatch path as if you typed it yourself, so state (todo list, snapshot, file tracker) carries forward across runs. `Ctrl-C` once skips the current iteration; press it twice within two seconds to exit the loop.
+
+Works in one-shot mode too, which is the recommended way to run Swival as a long-lived poller under `systemd`, `tmux`, or `nohup`: each iteration's answer is streamed to stdout with a blank-line separator, diagnostics go to stderr, and `SIGTERM` shuts the loop down cleanly between iterations (a second `SIGTERM` exits immediately with code 143).
 
 ```sh
 swival --oneshot-commands '/loop 5m /babysit-prs'
-swival --oneshot-commands '/loop 30s check git status and report unusual activity'
+swival --oneshot-commands '/loop every hour /audit'
+swival --oneshot-commands '/loop 30 sec check git status and report unusual activity'
 ```
 
 `/status` shows a compact session overview: model, endpoint, context usage, message/turn counts, file access, mode flags, and state summaries (thinking, todo, snapshot, checkpoints, continue file).

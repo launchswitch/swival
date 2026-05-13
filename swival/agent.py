@@ -2749,10 +2749,10 @@ def _ensure_chatgpt_responses_model_registered(litellm_module, model_str: str) -
 
     source_info = dict(model_cost.get(bare) or {})
     if not source_info:
-        source_info = dict(model_cost.get("chatgpt/gpt-5.4") or {})
+        source_info = dict(model_cost.get("chatgpt/gpt-5.5") or {})
     if not source_info:
         try:
-            source_info = dict(litellm_module.get_model_info("chatgpt/gpt-5.4"))
+            source_info = dict(litellm_module.get_model_info("chatgpt/gpt-5.5"))
         except Exception:
             return
 
@@ -9277,56 +9277,197 @@ _LOOP_MIN_SECONDS = 5
 _LOOP_MAX_SECONDS = 24 * 60 * 60
 _LOOP_DOUBLE_TAP_WINDOW = 2.0
 
+_LOOP_UNIT_SECONDS = {
+    "s": 1,
+    "sec": 1,
+    "secs": 1,
+    "second": 1,
+    "seconds": 1,
+    "m": 60,
+    "min": 60,
+    "mins": 60,
+    "minute": 60,
+    "minutes": 60,
+    "h": 3600,
+    "hr": 3600,
+    "hrs": 3600,
+    "hour": 3600,
+    "hours": 3600,
+}
+_LOOP_UNIT_FAMILY = {
+    name: ("h" if secs == 3600 else "m" if secs == 60 else "s")
+    for name, secs in _LOOP_UNIT_SECONDS.items()
+}
+_LOOP_UNIT_ORDER = {"s": 0, "m": 1, "h": 2}
+_LOOP_INDEF_ARTICLES = frozenset({"a", "an"})
+
+
+class _LoopIntervalError(Exception):
+    """The input committed to looking like an interval but is malformed."""
+
+
+def _check_loop_unit_order(
+    rank: int, last_rank: int | None, component_desc: str
+) -> None:
+    if last_rank is not None and rank >= last_rank:
+        raise _LoopIntervalError(
+            f"/loop: duration component {component_desc} repeats or reorders units"
+        )
+
+
+def _consume_loop_interval(tokens: list[str]) -> tuple[int | None, int]:
+    """Consume a leading interval prefix from ``tokens``.
+
+    Three outcomes:
+
+    - ``(None, 0)`` — no interval prefix; caller treats the full input as a prompt.
+    - ``(seconds, consumed)`` — valid interval, ``tokens[consumed:]`` is the prompt.
+    - raises ``_LoopIntervalError`` — input looked like an interval but is malformed.
+    """
+    if not tokens:
+        return None, 0
+
+    i = 0
+    has_every = False
+    if tokens[0] == "every":
+        has_every = True
+        i = 1
+        if i >= len(tokens):
+            raise _LoopIntervalError("/loop: 'every' must be followed by a duration")
+
+    if i < len(tokens) and tokens[i] == "half":
+        j = i + 1
+        if j < len(tokens) and tokens[j] in _LOOP_INDEF_ARTICLES:
+            j += 1
+        if j >= len(tokens) or _LOOP_UNIT_FAMILY.get(tokens[j]) not in ("h", "m"):
+            if has_every:
+                raise _LoopIntervalError(
+                    "/loop: 'half' must be followed by 'hour' or 'minute'"
+                )
+            return None, 0
+        fam = _LOOP_UNIT_FAMILY[tokens[j]]
+        return (3600 if fam == "h" else 60) // 2, j + 1
+
+    if has_every and i < len(tokens) and _LOOP_UNIT_FAMILY.get(tokens[i]) is not None:
+        return _LOOP_UNIT_SECONDS[tokens[i]], i + 1
+
+    seconds = 0
+    last_family_rank: int | None = None
+    components_consumed = 0
+    expecting_component = False
+    while i < len(tokens):
+        if components_consumed > 0 and tokens[i] == "and":
+            if i + 1 >= len(tokens):
+                raise _LoopIntervalError(
+                    "/loop: trailing 'and' with no further duration"
+                )
+            i += 1
+            expecting_component = True
+
+        tok = tokens[i]
+        match = _LOOP_DURATION_RE.fullmatch(tok)
+        if match is not None and any(match.groups()):
+            h_raw, m_raw, s_raw = match.groups()
+            h = int(h_raw) if h_raw is not None else 0
+            m_val = int(m_raw) if m_raw is not None else 0
+            s = int(s_raw) if s_raw is not None else 0
+            lowest_fam = "s" if s_raw is not None else "m" if m_raw is not None else "h"
+            rank = _LOOP_UNIT_ORDER[lowest_fam]
+            _check_loop_unit_order(rank, last_family_rank, tok)
+            seconds += h * 3600 + m_val * 60 + s
+            last_family_rank = rank
+            i += 1
+            components_consumed += 1
+            expecting_component = False
+            continue
+
+        if tok in _LOOP_INDEF_ARTICLES:
+            count = 1
+        elif tok.isdigit():
+            count = int(tok)
+        else:
+            if expecting_component:
+                raise _LoopIntervalError(
+                    f"/loop: expected a duration after 'and', got {tok!r}"
+                )
+            break
+
+        if i + 1 >= len(tokens) or _LOOP_UNIT_FAMILY.get(tokens[i + 1]) is None:
+            if expecting_component:
+                raise _LoopIntervalError("/loop: expected a duration after 'and'")
+            break
+
+        unit_tok = tokens[i + 1]
+        rank = _LOOP_UNIT_ORDER[_LOOP_UNIT_FAMILY[unit_tok]]
+        _check_loop_unit_order(rank, last_family_rank, f"{tok} {unit_tok}")
+        seconds += count * _LOOP_UNIT_SECONDS[unit_tok]
+        last_family_rank = rank
+        i += 2
+        components_consumed += 1
+        expecting_component = False
+
+    if components_consumed == 0:
+        return None, 0
+    return seconds, i
+
+
+def _slice_loop_remainder(stripped: str, tokens: list[str], consumed: int) -> str:
+    """Return the substring of ``stripped`` that follows the first ``consumed`` tokens.
+
+    Preserves runs of whitespace and tabs inside the prompt portion that
+    ``" ".join(tokens[consumed:])`` would collapse.
+    """
+    pos = 0
+    for idx, tok in enumerate(tokens):
+        while pos < len(stripped) and stripped[pos].isspace():
+            pos += 1
+        if idx == consumed:
+            return stripped[pos:]
+        pos += len(tok)
+    return ""
+
 
 def _parse_loop_args(cmd_arg: str) -> tuple[int, str]:
     """Parse ``/loop`` arguments into ``(interval_seconds, prompt)``.
 
-    The first whitespace-delimited token is treated as an interval only if
-    it fully matches the duration grammar. Otherwise the entire argument is
-    the prompt and the interval defaults to 10 minutes.
+    The interval grammar accepts the original compact form (``5m``,
+    ``1h30m``) as well as natural-language shapes such as ``1 min``,
+    ``5 minutes``, ``every hour``, ``a minute``, ``half an hour``, and
+    components joined by ``and``. Input that never looked like an
+    interval flows through as a prompt with the default cadence.
+    Input that began as an interval but is malformed raises
+    ``ValueError``.
     """
     stripped = cmd_arg.strip()
     if not stripped:
         raise ValueError("/loop requires a prompt")
 
-    first, _, rest = stripped.partition(" ")
-    rest = rest.lstrip()
+    tokens = stripped.split()
+    lowered = [t.lower() for t in tokens]
+    try:
+        seconds, consumed = _consume_loop_interval(lowered)
+    except _LoopIntervalError as exc:
+        raise ValueError(str(exc)) from None
 
-    interval = _try_parse_duration(first)
-    if interval is not None and rest:
-        return interval, rest
+    if seconds is None:
+        return _LOOP_DEFAULT_SECONDS, stripped
 
-    if interval is not None and not rest:
-        raise ValueError(f"/loop got an interval ({first}) but no prompt to run")
-
-    return _LOOP_DEFAULT_SECONDS, stripped
-
-
-def _try_parse_duration(token: str) -> int | None:
-    """Return seconds if ``token`` is a valid duration; ``None`` otherwise.
-
-    Validates the floor and ceiling and rejects degenerate values like
-    ``0s`` and the empty match (no unit) so a bare integer falls through
-    to the prompt branch.
-    """
-    if not token:
-        return None
-    match = _LOOP_DURATION_RE.fullmatch(token)
-    if match is None:
-        return None
-    h, m, s = match.groups()
-    if h is None and m is None and s is None:
-        return None
-    total = (int(h or 0) * 3600) + (int(m or 0) * 60) + int(s or 0)
-    if total < _LOOP_MIN_SECONDS:
+    interval_text = " ".join(tokens[:consumed])
+    if consumed == len(tokens):
         raise ValueError(
-            f"/loop interval {token} is below the {_LOOP_MIN_SECONDS}s floor"
+            f"/loop got an interval ({interval_text}) but no prompt to run"
         )
-    if total > _LOOP_MAX_SECONDS:
+    if seconds < _LOOP_MIN_SECONDS:
         raise ValueError(
-            f"/loop interval {token} exceeds the {_LOOP_MAX_SECONDS // 3600}h ceiling"
+            f"/loop interval {interval_text} is below the {_LOOP_MIN_SECONDS}s floor"
         )
-    return total
+    if seconds > _LOOP_MAX_SECONDS:
+        raise ValueError(
+            f"/loop interval {interval_text} exceeds the "
+            f"{_LOOP_MAX_SECONDS // 3600}h ceiling"
+        )
+
+    return seconds, _slice_loop_remainder(stripped, tokens, consumed)
 
 
 def _format_loop_duration(seconds: int) -> str:

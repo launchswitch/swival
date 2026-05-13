@@ -4,6 +4,7 @@ All notable user-facing changes to Swival.
 
 ## 1.0.15
 
+- `/loop` now accepts natural-language intervals. Alongside the compact `5m`, `1h30m` form you can write `1 min`, `5 minutes`, `30 sec`, `every hour`, `every 5 minutes`, `a minute`, `half an hour`, or join components with `and` as in `1 minute and 30 seconds`. The 5-second floor and 24-hour ceiling are unchanged. Inputs that begin as an interval but are malformed (repeated units, trailing `and`, `every` with no duration, bounds violations) now raise an error instead of silently looping the wrong prompt.
 - Swival now speaks the Agent Client Protocol on stdio via `--acp`. `/` and `!` commands are currently ignored when using ACP. `--acp-log` writes diagnostics to a separate log file for debugging client integrations.
 - Agent MetaSKILLs have been implemented. They are a powerful evolution of agent SKILLs, enabling dynamic workflows through instructions written in a Python subset rather than simple prompts.
 - `/audit` triage is less likely to miss files worth deep review.

@@ -1402,7 +1402,7 @@ def generate_config(
         "#",
         "# [profiles.gpt5]",
         '# provider = "chatgpt"',
-        '# model = "gpt-5.4"',
+        '# model = "gpt-5.5"',
         '# reasoning_effort = "high"',
         "",
         "# --- MCP server examples ---",

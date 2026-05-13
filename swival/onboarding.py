@@ -505,7 +505,7 @@ def _ask_chatgpt(s: dict) -> None:
     )
     _console.print()
 
-    model = _prompt_text("Model name", default="gpt-5.4")
+    model = _prompt_text("Model name", default="gpt-5.5")
     if model:
         s["model"] = model
 
@@ -517,7 +517,7 @@ def _ask_chatgpt(s: dict) -> None:
 
 
 def _ask_openrouter(s: dict) -> None:
-    s["model"] = _prompt_text_required("Model (e.g. openai/gpt-5.4)")
+    s["model"] = _prompt_text_required("Model (e.g. openai/gpt-5.5)")
 
     _ask_api_key(s, env_var="OPENROUTER_API_KEY")
 

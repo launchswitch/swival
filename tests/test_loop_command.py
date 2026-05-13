@@ -98,6 +98,150 @@ class TestParseLoopArgs:
         assert prompt == "30m1h foo"
 
 
+class TestParseLoopArgsRelaxed:
+    def test_space_between_number_and_short_unit(self):
+        assert agent._parse_loop_args("1 min hello") == (60, "hello")
+
+    def test_long_unit_plural(self):
+        assert agent._parse_loop_args("5 minutes hello world") == (300, "hello world")
+
+    def test_sec_abbrev(self):
+        assert agent._parse_loop_args("30 sec /audit") == (30, "/audit")
+
+    def test_secs_abbrev(self):
+        assert agent._parse_loop_args("30 secs /audit") == (30, "/audit")
+
+    def test_every_unit(self):
+        assert agent._parse_loop_args("every hour /audit") == (3600, "/audit")
+
+    def test_every_duration(self):
+        assert agent._parse_loop_args("every 5 minutes /audit") == (300, "/audit")
+
+    def test_every_minute(self):
+        assert agent._parse_loop_args("every minute now") == (60, "now")
+
+    def test_indef_article_a(self):
+        assert agent._parse_loop_args("a minute hello") == (60, "hello")
+
+    def test_indef_article_an(self):
+        assert agent._parse_loop_args("an hour /audit") == (3600, "/audit")
+
+    def test_half_an_hour(self):
+        assert agent._parse_loop_args("half an hour /audit") == (1800, "/audit")
+
+    def test_half_hour(self):
+        assert agent._parse_loop_args("half hour /audit") == (1800, "/audit")
+
+    def test_every_half_hour(self):
+        assert agent._parse_loop_args("every half hour foo") == (1800, "foo")
+
+    def test_whitespace_compound(self):
+        assert agent._parse_loop_args("1h 30m hello") == (5400, "hello")
+
+    def test_long_compound(self):
+        assert agent._parse_loop_args("2 hours 30 minutes hello") == (9000, "hello")
+
+    def test_and_connector(self):
+        assert agent._parse_loop_args("1 minute and 30 seconds foo") == (90, "foo")
+
+    def test_case_insensitive_every(self):
+        assert agent._parse_loop_args("EVERY Hour /audit") == (3600, "/audit")
+
+    def test_case_insensitive_unit(self):
+        assert agent._parse_loop_args("5 MINUTES foo") == (300, "foo")
+
+    def test_preserves_internal_whitespace(self):
+        seconds, prompt = agent._parse_loop_args("5m   hello   world")
+        assert seconds == 300
+        assert prompt == "hello   world"
+
+    def test_preserves_tabs(self):
+        seconds, prompt = agent._parse_loop_args("5m\thello\tworld")
+        assert seconds == 300
+        assert prompt == "hello\tworld"
+
+    def test_uppercase_interval_preserves_prompt_casing_and_spacing(self):
+        seconds, prompt = agent._parse_loop_args("EVERY Hour   /Audit Now")
+        assert seconds == 3600
+        assert prompt == "/Audit Now"
+
+
+class TestParseLoopArgsFallthrough:
+    def test_every_followed_by_non_unit_falls_through(self):
+        seconds, prompt = agent._parse_loop_args("every status check now")
+        assert seconds == 600
+        assert prompt == "every status check now"
+
+    def test_every_foo_falls_through(self):
+        seconds, prompt = agent._parse_loop_args("every foo bar")
+        assert seconds == 600
+        assert prompt == "every foo bar"
+
+    def test_article_followed_by_non_unit_falls_through(self):
+        seconds, prompt = agent._parse_loop_args("a quick test")
+        assert seconds == 600
+        assert prompt == "a quick test"
+
+    def test_half_without_unit_falls_through(self):
+        seconds, prompt = agent._parse_loop_args("half a foo")
+        assert seconds == 600
+        assert prompt == "half a foo"
+
+
+class TestParseLoopArgsMalformed:
+    def test_natural_interval_only(self):
+        with pytest.raises(ValueError, match="no prompt"):
+            agent._parse_loop_args("1 min")
+
+    def test_every_hour_only(self):
+        with pytest.raises(ValueError, match="no prompt"):
+            agent._parse_loop_args("every hour")
+
+    def test_every_alone(self):
+        with pytest.raises(ValueError, match="every"):
+            agent._parse_loop_args("every")
+
+    def test_every_half_only(self):
+        with pytest.raises(ValueError, match="half"):
+            agent._parse_loop_args("every half foo")
+
+    def test_below_floor_natural(self):
+        with pytest.raises(ValueError, match="floor"):
+            agent._parse_loop_args("a second foo")
+
+    def test_multi_token_interval_only(self):
+        with pytest.raises(ValueError, match="no prompt"):
+            agent._parse_loop_args("2 hours 30 minutes")
+
+    def test_trailing_and(self):
+        with pytest.raises(ValueError, match="and"):
+            agent._parse_loop_args("1 minute and foo")
+
+    def test_trailing_and_eof(self):
+        with pytest.raises(ValueError, match="and"):
+            agent._parse_loop_args("1 minute and")
+
+    def test_doubled_and(self):
+        with pytest.raises(ValueError, match="and"):
+            agent._parse_loop_args("5 minutes and and 30 seconds foo")
+
+    def test_repeated_family_whitespace(self):
+        with pytest.raises(ValueError, match="repeats or reorders"):
+            agent._parse_loop_args("1h 1h foo")
+
+    def test_repeated_minutes(self):
+        with pytest.raises(ValueError, match="repeats or reorders"):
+            agent._parse_loop_args("30m 30m foo")
+
+    def test_out_of_order_whitespace(self):
+        with pytest.raises(ValueError, match="repeats or reorders"):
+            agent._parse_loop_args("30s 5m foo")
+
+    def test_compact_then_expanded_duplicate(self):
+        with pytest.raises(ValueError, match="repeats or reorders"):
+            agent._parse_loop_args("1h30m 5m foo")
+
+
 class TestFormatDuration:
     def test_seconds_only(self):
         assert agent._format_loop_duration(30) == "30s"
