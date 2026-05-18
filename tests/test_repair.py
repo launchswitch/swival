@@ -9,7 +9,7 @@ SCHEMA_READ_FILE = {
         "file_path": {"type": "string"},
         "offset": {"type": "integer", "default": 1},
         "limit": {"type": "integer", "default": 2000},
-        "tail": {"type": "integer", "minimum": 1},
+        "tail_lines": {"type": "integer", "minimum": 1},
     },
     "required": ["file_path"],
 }

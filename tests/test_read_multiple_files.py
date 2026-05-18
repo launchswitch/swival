@@ -73,7 +73,7 @@ class TestReadMultipleFilesOffsetLimit:
         f.write_text("\n".join(f"line{i}" for i in range(1, 11)) + "\n")
 
         result = _read_files(
-            [{"file_path": "data.txt", "tail": 3}],
+            [{"file_path": "data.txt", "tail_lines": 3}],
             str(tmp_path),
         )
         assert "request: tail=3" in result
@@ -147,11 +147,20 @@ class TestReadMultipleFilesErrors:
     def test_invalid_tail(self, tmp_path):
         (tmp_path / "a.txt").write_text("x\n")
         result = _read_files(
-            [{"file_path": "a.txt", "tail": "abc"}],
+            [{"file_path": "a.txt", "tail_lines": "abc"}],
             str(tmp_path),
         )
         assert "status: error" in result
-        assert "error: tail must be an integer" in result
+        assert "integer" in result
+
+    def test_boolean_tail(self, tmp_path):
+        (tmp_path / "a.txt").write_text("x\n")
+        result = _read_files(
+            [{"file_path": "a.txt", "tail_lines": True}],
+            str(tmp_path),
+        )
+        assert "status: error" in result
+        assert "boolean" in result
 
     def test_string_elements_coerced_to_dicts(self, tmp_path):
         (tmp_path / "a.txt").write_text("hello\n")

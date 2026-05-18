@@ -181,37 +181,46 @@ class TestReadFileTail:
             assert "1: line1" in result
 
     def test_tail_numeric_string_coerced(self, tmp_path):
-        """tail='5' (numeric string) is coerced to int and works."""
+        """tail_lines='5' (numeric string) is coerced to int and works."""
         self._make_file(tmp_path, 5)
         result = dispatch(
-            "read_file", {"file_path": "data.txt", "tail": "5"}, str(tmp_path)
+            "read_file", {"file_path": "data.txt", "tail_lines": "5"}, str(tmp_path)
         )
         assert "5: line5" in result
 
     def test_tail_non_numeric_string_returns_error(self, tmp_path):
-        """tail='abc' via dispatch returns an error string."""
+        """tail_lines='abc' via dispatch returns an error string."""
         self._make_file(tmp_path, 5)
         result = dispatch(
-            "read_file", {"file_path": "data.txt", "tail": "abc"}, str(tmp_path)
+            "read_file", {"file_path": "data.txt", "tail_lines": "abc"}, str(tmp_path)
         )
         assert result.startswith("error:")
         assert "integer" in result
+
+    def test_tail_boolean_returns_error(self, tmp_path):
+        """tail_lines=True (boolean) via dispatch returns an error string."""
+        self._make_file(tmp_path, 5)
+        result = dispatch(
+            "read_file", {"file_path": "data.txt", "tail_lines": True}, str(tmp_path)
+        )
+        assert result.startswith("error:")
+        assert "boolean" in result
 
     def test_tail_via_dispatch(self, tmp_path):
         """End-to-end through dispatch('read_file', ...)."""
         self._make_file(tmp_path, 10)
         result = dispatch(
-            "read_file", {"file_path": "data.txt", "tail": 3}, str(tmp_path)
+            "read_file", {"file_path": "data.txt", "tail_lines": 3}, str(tmp_path)
         )
         assert "8: line8" in result
         assert "10: line10" in result
 
     def test_dispatch_tail_ignores_offset(self, tmp_path):
-        """dispatch('read_file') with tail set should ignore a stray offset."""
+        """dispatch('read_file') with tail_lines set should ignore a stray offset."""
         self._make_file(tmp_path, 10)
         result = dispatch(
             "read_file",
-            {"file_path": "data.txt", "tail": 3, "offset": 1000},
+            {"file_path": "data.txt", "tail_lines": 3, "offset": 1000},
             str(tmp_path),
         )
         assert "8: line8" in result

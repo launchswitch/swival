@@ -50,14 +50,14 @@ TOOLS = [
                         ),
                         "default": 2000,
                     },
-                    "tail": {
+                    "tail_lines": {
                         "type": "integer",
                         "minimum": 1,
                         "description": (
-                            "Return the last N lines of the file. "
+                            "Number of lines to return from the end of the file. "
                             "When set, offset is ignored. "
                             "To paginate within the tail, use the offset from the continuation hint "
-                            "in a follow-up call (without tail)."
+                            "in a follow-up call (without tail_lines)."
                         ),
                     },
                 },
@@ -103,11 +103,11 @@ TOOLS = [
                                     ),
                                     "default": 2000,
                                 },
-                                "tail": {
+                                "tail_lines": {
                                     "type": "integer",
                                     "minimum": 1,
                                     "description": (
-                                        "Return the last N lines. When set, offset is ignored."
+                                        "Number of lines to return from the end of the file. When set, offset is ignored."
                                     ),
                                 },
                             },
@@ -1616,7 +1616,7 @@ def _read_files(
 
         offset = spec.get("offset", 1)
         limit = spec.get("limit", 2000)
-        tail = spec.get("tail")
+        tail = spec.get("tail_lines") or spec.get("tail")
 
         try:
             offset = int(offset)
@@ -1645,6 +1645,17 @@ def _read_files(
             files_with_errors += 1
             continue
         if tail is not None:
+            if isinstance(tail, bool):
+                sections.append(
+                    _build_read_multiple_files_section(
+                        file_path,
+                        "error",
+                        _format_read_request(offset, limit, None),
+                        "error: tail_lines must be an integer line count, not a boolean",
+                    )
+                )
+                files_with_errors += 1
+                continue
             try:
                 tail = int(tail)
             except (ValueError, TypeError):
@@ -1653,7 +1664,7 @@ def _read_files(
                         file_path,
                         "error",
                         _format_read_request(offset, limit, None),
-                        "error: tail must be an integer",
+                        "error: tail_lines must be an integer line count",
                     )
                 )
                 files_with_errors += 1
@@ -3010,13 +3021,15 @@ def dispatch(name: str, args: dict, base_dir: str, **kwargs) -> str:
             limit = int(args.get("limit", 2000))
         except (ValueError, TypeError):
             return "error: limit must be an integer"
-        tail = args.get("tail")
+        tail = args.get("tail_lines") or args.get("tail")
         if tail is not None:
+            if isinstance(tail, bool):
+                return "error: tail_lines must be an integer line count, not a boolean"
             try:
                 tail = int(tail)
             except (ValueError, TypeError):
-                return "error: tail must be an integer"
-            offset = 1  # tail takes precedence; ignore any offset the model sent
+                return "error: tail_lines must be an integer line count"
+            offset = 1  # tail_lines takes precedence; ignore any offset the model sent
         return _read_file(
             file_path=args["file_path"],
             base_dir=base_dir,
