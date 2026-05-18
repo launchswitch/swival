@@ -72,6 +72,7 @@ class TodoState:
         self.verbose = verbose
         self.add_count = 0
         self.done_count = 0
+        self.remove_count = 0
         self._total_actions = 0
 
     @property
@@ -91,6 +92,7 @@ class TodoState:
 
         if action == "clear":
             count = len(self.items)
+            self.remove_count += count
             self.items.clear()
             if self.verbose:
                 fmt.todo_list(self.items, action="clear", note=f"{count} items removed")
@@ -187,6 +189,7 @@ class TodoState:
                 errors.append({"task": task, "reason": match.removeprefix("error: ")})
                 continue
             self.items.remove(match)
+            self.remove_count += 1
             removed += 1
 
         if removed == 0 and errors:
@@ -278,13 +281,15 @@ class TodoState:
         self.items.clear()
         self.add_count = 0
         self.done_count = 0
+        self.remove_count = 0
         self._total_actions = 0
 
     def summary_line(self) -> str | None:
         """One-line usage summary, or None if todo was never called."""
         if self._total_actions == 0:
             return None
-        return (
-            f"todo: {self.add_count} added, {self.done_count} done, "
-            f"{self.remaining_count} remaining"
-        )
+        parts = [f"{self.add_count} added", f"{self.done_count} done"]
+        if self.remove_count:
+            parts.append(f"{self.remove_count} removed")
+        parts.append(f"{self.remaining_count} remaining")
+        return "todo: " + ", ".join(parts)

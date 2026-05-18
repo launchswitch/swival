@@ -297,8 +297,22 @@ class TestUsageCounters:
         assert state.items == []
         assert state.add_count == 0
         assert state.done_count == 0
+        assert state.remove_count == 0
         assert state._total_actions == 0
         assert state.summary_line() is None
+
+    def test_summary_line_with_removes(self):
+        state = TodoState()
+        state.process({"action": "add", "tasks": ["A", "B", "C", "D", "E", "F"]})
+        state.process({"action": "done", "task": "A"})
+        state.process({"action": "remove", "tasks": ["B", "C", "D", "E", "F"]})
+        assert state.summary_line() == "todo: 6 added, 1 done, 5 removed, 0 remaining"
+
+    def test_summary_line_clear_counts_as_removed(self):
+        state = TodoState()
+        state.process({"action": "add", "tasks": ["A", "B", "C"]})
+        state.process({"action": "clear"})
+        assert state.summary_line() == "todo: 3 added, 0 done, 3 removed, 0 remaining"
 
     def test_summary_line_all_done(self):
         state = TodoState()
