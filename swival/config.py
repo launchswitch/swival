@@ -543,7 +543,20 @@ def _load_single(path: Path, label: str) -> dict:
     if audit_section is not None:
         if not isinstance(audit_section, dict):
             raise ConfigError(f"{label}: 'audit' must be a table")
-        allowed_audit_keys = {"force_review", "patch_max_turns"}
+        # Top-level keys; the nested ``audit.reviewer`` and ``audit.hunt_task``
+        # are validated separately below.
+        allowed_audit_keys = {
+            "force_review",
+            "patch_max_turns",
+            "budget_tokens",
+            "max_gapfill_tasks",
+            "max_hunt_tasks",
+            "proof_strict",
+            "reviewer",
+            "hunt_task",
+            "workers",
+            "verify_workers",
+        }
         for key in audit_section:
             if key not in allowed_audit_keys:
                 allowed = ", ".join(sorted(allowed_audit_keys))
@@ -562,19 +575,62 @@ def _load_single(path: Path, label: str) -> dict:
                     f"{label}: audit.force_review[{i}]: expected string, "
                     f"got {type(glob).__name__}"
                 )
-        if "patch_max_turns" in audit_section:
-            patch_max_turns = audit_section["patch_max_turns"]
-            if isinstance(patch_max_turns, bool) or not isinstance(
-                patch_max_turns, int
-            ):
+        for int_key in (
+            "patch_max_turns",
+            "budget_tokens",
+            "max_gapfill_tasks",
+            "max_hunt_tasks",
+            "workers",
+            "verify_workers",
+        ):
+            if int_key in audit_section:
+                v = audit_section[int_key]
+                if isinstance(v, bool) or not isinstance(v, int):
+                    raise ConfigError(
+                        f"{label}: 'audit.{int_key}' must be an integer, "
+                        f"got {type(v).__name__}"
+                    )
+                if int_key == "patch_max_turns" and v < 1:
+                    raise ConfigError(
+                        f"{label}: 'audit.patch_max_turns' must be an integer >= 1"
+                    )
+                if v < 0:
+                    raise ConfigError(
+                        f"{label}: 'audit.{int_key}' must be non-negative"
+                    )
+        if "proof_strict" in audit_section and not isinstance(
+            audit_section["proof_strict"], bool
+        ):
+            raise ConfigError(
+                f"{label}: 'audit.proof_strict' must be a bool, "
+                f"got {type(audit_section['proof_strict']).__name__}"
+            )
+        if "reviewer" in audit_section:
+            r = audit_section["reviewer"]
+            if not isinstance(r, dict):
+                raise ConfigError(f"{label}: 'audit.reviewer' must be a table")
+            allowed_reviewer = {"profile", "model"}
+            for k in r:
+                if k not in allowed_reviewer:
+                    allowed = ", ".join(sorted(allowed_reviewer))
+                    raise ConfigError(
+                        f"{label}: unknown key 'audit.reviewer.{k}'. "
+                        f"Allowed keys: {allowed}"
+                    )
+                if not isinstance(r[k], str):
+                    raise ConfigError(
+                        f"{label}: 'audit.reviewer.{k}' must be a string, "
+                        f"got {type(r[k]).__name__}"
+                    )
+        if "hunt_task" in audit_section:
+            ht = audit_section["hunt_task"]
+            if not isinstance(ht, list):
                 raise ConfigError(
-                    f"{label}: 'audit.patch_max_turns' must be an integer >= 1, "
-                    f"got {type(patch_max_turns).__name__}"
+                    f"{label}: 'audit.hunt_task' must be an array of tables"
                 )
-            if patch_max_turns < 1:
-                raise ConfigError(
-                    f"{label}: 'audit.patch_max_turns' must be an integer >= 1"
-                )
+            for i, entry in enumerate(ht):
+                if not isinstance(entry, dict):
+                    raise ConfigError(f"{label}: audit.hunt_task[{i}] must be a table")
         known["audit"] = audit_section
 
     return known
@@ -689,6 +745,63 @@ def merge_audit_patch_max_turns(
     if global_audit and "patch_max_turns" in global_audit:
         return global_audit["patch_max_turns"]
     return None
+
+
+def merge_audit_int(
+    global_audit: dict | None,
+    project_audit: dict | None,
+    key: str,
+) -> int | None:
+    """Project-takes-precedence merge for a single integer ``[audit]`` key."""
+    if project_audit and key in project_audit:
+        return project_audit[key]
+    if global_audit and key in global_audit:
+        return global_audit[key]
+    return None
+
+
+def merge_audit_bool(
+    global_audit: dict | None,
+    project_audit: dict | None,
+    key: str,
+) -> bool | None:
+    if project_audit and key in project_audit:
+        return bool(project_audit[key])
+    if global_audit and key in global_audit:
+        return bool(global_audit[key])
+    return None
+
+
+def merge_audit_reviewer(
+    global_audit: dict | None,
+    project_audit: dict | None,
+) -> tuple[str, str]:
+    """Return ``(profile, model)`` from ``[audit.reviewer]``; project wins."""
+    profile = ""
+    model = ""
+    for section in (global_audit, project_audit):
+        if section and isinstance(section.get("reviewer"), dict):
+            r = section["reviewer"]
+            if r.get("profile"):
+                profile = r["profile"]
+            if r.get("model"):
+                model = r["model"]
+    return profile, model
+
+
+def merge_audit_hunt_tasks(
+    global_audit: dict | None,
+    project_audit: dict | None,
+) -> list[dict]:
+    """Concatenate ``[[audit.hunt_task]]`` arrays. Project entries come last so
+    later consumers can deduplicate keeping project wins."""
+    out: list[dict] = []
+    for section in (global_audit, project_audit):
+        if section:
+            entries = section.get("hunt_task", [])
+            if isinstance(entries, list):
+                out.extend(e for e in entries if isinstance(e, dict))
+    return out
 
 
 def merge_audit_force_review(

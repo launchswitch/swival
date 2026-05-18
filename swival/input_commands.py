@@ -49,6 +49,16 @@ INPUT_COMMANDS: dict[str, CommandInfo] = {
                 "Phase-5 patch-generation turn budget (default: 50)",
             ),
             (
+                "--hunt",
+                "Hunt mode: replace per-file triage with attacker-anchored "
+                "hunt tasks derived from Phase-1 scans plus [[audit.hunt_task]]",
+            ),
+            (
+                "--budget-tokens N",
+                "Global token budget for the whole run; underscores and "
+                "commas accepted (e.g. 2_000_000)",
+            ),
+            (
                 "--debug",
                 "Write a real-time JSONL debug log to .swival/audit/debug.jsonl",
             ),

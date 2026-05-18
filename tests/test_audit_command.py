@@ -2036,6 +2036,1369 @@ class TestStatePersistence:
 
 
 # ---------------------------------------------------------------------------
+# Hunt-harness foundation: HuntTask, coverage records, root-cause groups
+# ---------------------------------------------------------------------------
+
+
+class TestHuntTaskFoundation:
+    def _ssrf_task(self, **over):
+        from swival.audit import HuntTask
+
+        base = dict(
+            id="ssrf-abcd1234",
+            task_kind="hunt",
+            attack_class="ssrf",
+            attacker_position="unauthenticated remote client",
+            controlled_inputs=["callback_url POST body"],
+            trust_boundary_crossed="POST /webhook",
+            scope_hint="src/api/**",
+            seed_files=["src/api/webhook.py"],
+            seed_symbols=["handle_webhook"],
+            sink_files=["src/clients/fetch.py"],
+            source="phase1",
+            priority="high",
+        )
+        base.update(over)
+        return HuntTask(**base)
+
+    def test_validate_accepts_well_formed_task(self):
+        from swival.audit import _validate_hunt_task
+
+        _validate_hunt_task(self._ssrf_task())
+
+    def test_validate_rejects_missing_attacker_position(self):
+        from swival.audit import HuntTaskValidationError, _validate_hunt_task
+
+        with pytest.raises(HuntTaskValidationError) as exc:
+            _validate_hunt_task(self._ssrf_task(attacker_position=""))
+        assert "attacker_position" in str(exc.value)
+
+    def test_validate_rejects_missing_controlled_inputs(self):
+        from swival.audit import HuntTaskValidationError, _validate_hunt_task
+
+        with pytest.raises(HuntTaskValidationError) as exc:
+            _validate_hunt_task(self._ssrf_task(controlled_inputs=[]))
+        assert "controlled_inputs" in str(exc.value)
+
+        with pytest.raises(HuntTaskValidationError):
+            _validate_hunt_task(self._ssrf_task(controlled_inputs=["", "  "]))
+
+    def test_validate_rejects_missing_trust_boundary(self):
+        from swival.audit import HuntTaskValidationError, _validate_hunt_task
+
+        with pytest.raises(HuntTaskValidationError) as exc:
+            _validate_hunt_task(self._ssrf_task(trust_boundary_crossed=""))
+        assert "trust_boundary_crossed" in str(exc.value)
+
+    def test_validate_rejects_bad_task_kind(self):
+        from swival.audit import HuntTaskValidationError, _validate_hunt_task
+
+        with pytest.raises(HuntTaskValidationError) as exc:
+            _validate_hunt_task(self._ssrf_task(task_kind="bogus"))
+        assert "task_kind" in str(exc.value)
+
+    def test_validate_reachability_kind_accepted(self):
+        from swival.audit import _validate_hunt_task
+
+        _validate_hunt_task(self._ssrf_task(task_kind="reachability"))
+
+    def test_validate_unknown_attack_class_records_coverage_note(self):
+        from swival.audit import _validate_hunt_task
+
+        t = self._ssrf_task(attack_class="prompt_injection")
+        _validate_hunt_task(t)
+        assert any("unknown attack_class" in n for n in t.coverage_notes)
+
+    def test_hunt_task_id_is_deterministic(self):
+        from swival.audit import _hunt_task_id
+
+        a = _hunt_task_id(
+            "ssrf",
+            "unauthenticated remote client",
+            "src/api/**",
+            ["src/api/webhook.py"],
+        )
+        b = _hunt_task_id(
+            "ssrf",
+            "unauthenticated remote client",
+            "src/api/**",
+            ["src/api/webhook.py"],
+        )
+        assert a == b
+        assert a.startswith("ssrf-")
+
+    def test_hunt_task_id_changes_with_scope(self):
+        from swival.audit import _hunt_task_id
+
+        a = _hunt_task_id("ssrf", "x", "src/a/**", ["f1"])
+        b = _hunt_task_id("ssrf", "x", "src/b/**", ["f1"])
+        assert a != b
+
+    def test_hunt_task_id_order_insensitive(self):
+        from swival.audit import _hunt_task_id
+
+        a = _hunt_task_id("ssrf", "x", "src/a/**", ["f1", "f2"])
+        b = _hunt_task_id("ssrf", "x", "src/a/**", ["f2", "f1"])
+        assert a == b
+
+
+class TestHuntTaskGeneration:
+    """Deterministic hunt-task generation from Phase-1 + sink scans."""
+
+    def _state(self, tmp_path):
+        scope = AuditScope(
+            branch="m",
+            commit="c",
+            tracked_files=["src/api/webhook.py", "src/exec.py", "src/clients/fetch.py"],
+            mandatory_files=[
+                "src/api/webhook.py",
+                "src/exec.py",
+                "src/clients/fetch.py",
+            ],
+            focus=[],
+        )
+        state = AuditRunState(
+            run_id="r",
+            scope=scope,
+            queued_files=list(scope.mandatory_files),
+            state_dir=tmp_path,
+        )
+        state.repo_profile = {
+            "entry_points": ["src/api/main.py", "src/api/webhook.py"],
+            "trust_boundaries": ["HTTP API"],
+            "auth_surfaces": [],
+            "dangerous_operations": ["subprocess"],
+        }
+        state.attack_scores = {
+            "src/api/webhook.py": 7,
+            "src/exec.py": 9,
+            "src/clients/fetch.py": 5,
+        }
+        return state
+
+    def _cache(self):
+        return {
+            "src/api/webhook.py": (
+                "import requests\n"
+                "def handle_webhook(req):\n"
+                "    url = req.json['callback_url']\n"
+                "    return requests.get(url)\n"
+            ),
+            "src/exec.py": (
+                "import subprocess\n"
+                "def run_cmd(req):\n"
+                "    subprocess.run(req.body['cmd'], shell=True)\n"
+            ),
+            "src/clients/fetch.py": (
+                "import requests\n"
+                "def fetch_remote(url):\n"
+                "    return requests.get(url)\n"
+            ),
+        }
+
+    def test_generates_tasks_with_valid_attacker_model(self, tmp_path):
+        from swival.audit import _generate_hunt_tasks, _validate_hunt_task
+
+        tasks = _generate_hunt_tasks(self._state(tmp_path), self._cache())
+        assert tasks, "expected at least one task"
+        for t in tasks:
+            _validate_hunt_task(t)
+            assert t.attack_class
+            assert t.attacker_position
+            assert t.controlled_inputs
+            assert t.trust_boundary_crossed
+
+    def test_classes_include_command_and_ssrf(self, tmp_path):
+        from swival.audit import _generate_hunt_tasks
+
+        tasks = _generate_hunt_tasks(self._state(tmp_path), self._cache())
+        classes = {t.attack_class for t in tasks}
+        assert "command_execution" in classes
+        assert "ssrf" in classes
+
+    def test_id_is_stable_across_runs(self, tmp_path):
+        from swival.audit import _generate_hunt_tasks
+
+        a = _generate_hunt_tasks(self._state(tmp_path), self._cache())
+        b = _generate_hunt_tasks(self._state(tmp_path), self._cache())
+        assert [t.id for t in a] == [t.id for t in b]
+
+    def test_configured_tasks_come_first_and_survive_trim(self, tmp_path):
+        from swival.audit import _generate_hunt_tasks
+
+        configured = [
+            {
+                "attack_class": "authorization",
+                "attacker_position": "authenticated low-privileged user",
+                "controlled_inputs": ["tenant_id"],
+                "trust_boundary_crossed": "HTTP API handler",
+                "scope": "src/**",
+                "priority": "high",
+            }
+        ]
+        tasks = _generate_hunt_tasks(
+            self._state(tmp_path),
+            self._cache(),
+            configured=configured,
+            max_tasks=1,
+        )
+        assert len(tasks) == 1
+        assert tasks[0].source == "user"
+        assert tasks[0].attack_class == "authorization"
+
+    def test_invalid_configured_entry_is_dropped_not_raised(self, tmp_path):
+        from swival.audit import _generate_hunt_tasks
+
+        configured = [
+            # missing trust_boundary
+            {
+                "attack_class": "ssrf",
+                "attacker_position": "unauthenticated remote client",
+                "controlled_inputs": ["url"],
+                "scope": "src/**",
+            },
+            # well-formed
+            {
+                "attack_class": "authorization",
+                "attacker_position": "authenticated low-privileged user",
+                "controlled_inputs": ["tenant_id"],
+                "trust_boundary_crossed": "API handler",
+                "scope": "src/**",
+            },
+        ]
+        tasks = _generate_hunt_tasks(
+            self._state(tmp_path), self._cache(), configured=configured
+        )
+        configured_tasks = [t for t in tasks if t.source == "user"]
+        assert len(configured_tasks) == 1
+        assert configured_tasks[0].attack_class == "authorization"
+
+    def test_language_hint_is_set_from_seed_extensions(self, tmp_path):
+        from swival.audit import _generate_hunt_tasks
+
+        tasks = _generate_hunt_tasks(self._state(tmp_path), self._cache())
+        py_tasks = [t for t in tasks if any(s.endswith(".py") for s in t.seed_files)]
+        assert py_tasks
+        assert all(t.language_hint == "python" for t in py_tasks)
+
+    def test_high_attack_score_seeds_get_high_priority(self, tmp_path):
+        from swival.audit import _generate_hunt_tasks
+
+        tasks = _generate_hunt_tasks(self._state(tmp_path), self._cache())
+        # exec.py attack score is 9, so its command_execution task should be high
+        exec_tasks = [t for t in tasks if "src/exec.py" in t.seed_files]
+        assert exec_tasks
+        assert any(t.priority == "high" for t in exec_tasks)
+
+
+class TestHunterResponseParsing:
+    """The hunter LLM response parser splits findings from coverage and tolerates
+    malformed blocks (returning the partial result with a warning rather than
+    raising)."""
+
+    _SAMPLE = (
+        "@@ finding @@\n"
+        "title: callback_url reaches outbound fetch without host allowlist\n"
+        "severity: high\n"
+        "location: src/clients/fetch.py:42\n"
+        "local_bug: outbound HTTP GET trusts caller-supplied URL with no host or scheme check\n"
+        "source_boundary: POST /webhook handler\n"
+        "controlled_input: callback_url JSON field\n"
+        "reachability_step: POST /webhook\n"
+        "reachability_step: handle_webhook\n"
+        "reachability_step: client.fetch_remote\n"
+        "sink_operation: requests.get(url)\n"
+        "reachability_status: reachable\n"
+        "exploit_chain_step: attacker posts callback_url=http://169.254.169.254/\n"
+        "claim: SSRF: attacker controls callback_url end-to-end into requests.get\n"
+        "\n"
+        "@@ coverage @@\n"
+        "observed_file: src/api/webhook.py\n"
+        "observed_file: src/clients/fetch.py\n"
+        "observed_symbol: handle_webhook\n"
+        "observed_edge: src/api/webhook.py->src/clients/fetch.py\n"
+        "not_covered: did not inspect retry path in src/clients/retry.py\n"
+        "followup_task: ssrf | unauthenticated remote client | retry URL | retry uncovered\n"
+        "confidence: medium\n"
+    )
+
+    def test_parses_findings_and_coverage(self):
+        from swival.audit import _parse_hunt_response
+
+        metrics = {}
+        findings, coverage = _parse_hunt_response(self._SAMPLE, metrics)
+        assert len(findings) == 1
+        f = findings[0]
+        assert f["title"].startswith("callback_url reaches")
+        assert f["severity"] == "high"
+        assert f["reachability_status"] == "reachable"
+        assert f["controlled_inputs"] == ["callback_url JSON field"]
+        assert f["reachability_path"] == [
+            "POST /webhook",
+            "handle_webhook",
+            "client.fetch_remote",
+        ]
+        assert coverage is not None
+        assert coverage["confidence"] == "medium"
+        assert "src/api/webhook.py" in coverage["observed_files"]
+        assert (
+            "did not inspect retry path in src/clients/retry.py"
+            in coverage["not_covered"]
+        )
+
+    def test_none_response_still_returns_coverage(self):
+        from swival.audit import _parse_hunt_response
+
+        raw = (
+            "@@ none @@\n"
+            "\n"
+            "@@ coverage @@\n"
+            "observed_file: src/api/webhook.py\n"
+            "not_covered: did not inspect src/clients/fetch.py\n"
+            "confidence: low\n"
+        )
+        findings, coverage = _parse_hunt_response(raw, {})
+        assert findings == []
+        assert coverage is not None
+        assert coverage["confidence"] == "low"
+
+    def test_finding_to_record_carries_harness_fields(self, tmp_path):
+        from swival.audit import (
+            HuntTask,
+            _hunt_finding_to_record,
+            _parse_hunt_response,
+        )
+
+        findings, _coverage = _parse_hunt_response(self._SAMPLE, {})
+        task = HuntTask(
+            id="ssrf-x",
+            task_kind="hunt",
+            attack_class="ssrf",
+            attacker_position="unauthenticated remote client",
+            controlled_inputs=["callback_url"],
+            trust_boundary_crossed="POST /webhook",
+            scope_hint="src/**",
+            seed_files=["src/api/webhook.py", "src/clients/fetch.py"],
+            seed_symbols=[],
+            sink_files=["src/clients/fetch.py"],
+            source="phase1",
+            priority="high",
+        )
+        rec = _hunt_finding_to_record(findings[0], task)
+        assert rec.attack_class == "ssrf"
+        assert rec.attacker_position == "unauthenticated remote client"
+        assert rec.local_bug.startswith("outbound HTTP GET")
+        assert rec.reachability_status == "reachable"
+        assert rec.hunt_task_id == "ssrf-x"
+        assert rec.reachability_path == [
+            "POST /webhook",
+            "handle_webhook",
+            "client.fetch_remote",
+        ]
+        assert rec.sink_operation == "requests.get(url)"
+        assert rec.finding_type == "ssrf"
+        assert rec.controlled_inputs == ["callback_url JSON field"]
+
+    def test_coverage_record_ratios(self, tmp_path):
+        from swival.audit import (
+            CoverageRecord,
+            HuntTask,
+            _coverage_record_from_parsed,
+        )
+
+        task = HuntTask(
+            id="ssrf-x",
+            task_kind="hunt",
+            attack_class="ssrf",
+            attacker_position="unauthenticated remote client",
+            controlled_inputs=["callback_url"],
+            trust_boundary_crossed="POST /webhook",
+            scope_hint="src/**",
+            seed_files=["a.py", "b.py", "c.py"],
+            seed_symbols=[],
+            sink_files=["a.py", "b.py"],
+            source="phase1",
+            priority="high",
+        )
+        cov = _coverage_record_from_parsed(
+            task,
+            None,
+            {
+                "observed_files": ["a.py"],
+                "observed_symbols": [],
+                "observed_edges": [],
+                "not_covered": ["b.py", "c.py"],
+                "confidence": "low",
+            },
+        )
+        assert isinstance(cov, CoverageRecord)
+        assert cov.covered_fraction_of_seed_files == round(1 / 3, 3)
+        assert cov.covered_fraction_of_sink_hits == 0.5
+        assert cov.unobserved_high_priority_seeds == ["b.py", "c.py"]
+        assert cov.confidence == "low"
+
+    def test_invalid_reachability_status_normalises_to_unknown(self):
+        from swival.audit import HuntTask, _hunt_finding_to_record
+
+        task = HuntTask(
+            id="x",
+            task_kind="hunt",
+            attack_class="ssrf",
+            attacker_position="unauthenticated remote client",
+            controlled_inputs=["url"],
+            trust_boundary_crossed="POST /webhook",
+            scope_hint="",
+            seed_files=["a.py"],
+            seed_symbols=[],
+            sink_files=[],
+            source="phase1",
+            priority="high",
+        )
+        rec = _hunt_finding_to_record(
+            {
+                "title": "t",
+                "severity": "high",
+                "location": "a.py:1",
+                "local_bug": "x",
+                "source_boundary": "y",
+                "sink_operation": "z",
+                "reachability_status": "yes-please",
+                "claim": "c",
+            },
+            task,
+        )
+        assert rec.reachability_status == "unknown"
+
+
+class TestPhaseHuntOne:
+    """End-to-end exercise of the hunt phase for one task, with the LLM
+    mocked. Verifies that hunter output becomes a FindingRecord with the
+    harness fields populated, that the coverage record is persisted, and that
+    attack_class_metrics is bumped."""
+
+    def test_full_task_run(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+
+        from swival.audit import (
+            AuditRunState,
+            AuditScope,
+            HuntTask,
+            _phase_hunt_one,
+        )
+
+        scope = AuditScope(
+            branch="m",
+            commit="c",
+            tracked_files=["src/api/webhook.py"],
+            mandatory_files=["src/api/webhook.py"],
+            focus=[],
+        )
+        state = AuditRunState(
+            run_id="r",
+            scope=scope,
+            queued_files=["src/api/webhook.py"],
+            state_dir=tmp_path,
+        )
+        state.budget_tokens = 1_000_000
+        task = HuntTask(
+            id="ssrf-x",
+            task_kind="hunt",
+            attack_class="ssrf",
+            attacker_position="unauthenticated remote client",
+            controlled_inputs=["callback_url"],
+            trust_boundary_crossed="POST /webhook",
+            scope_hint="src/api/**",
+            seed_files=["src/api/webhook.py"],
+            seed_symbols=["handle_webhook"],
+            sink_files=["src/clients/fetch.py"],
+            source="phase1",
+            priority="high",
+        )
+
+        monkeypatch.setattr(
+            "swival.audit._git_show",
+            lambda path, base_dir: (
+                "def handle_webhook(req): return requests.get(req.json['callback_url'])"
+            ),
+        )
+
+        canned = (
+            "@@ finding @@\n"
+            "title: callback_url reaches outbound fetch without host allowlist\n"
+            "severity: high\n"
+            "location: src/clients/fetch.py:42\n"
+            "local_bug: outbound HTTP GET trusts caller-supplied URL with no host or scheme check\n"
+            "source_boundary: POST /webhook handler\n"
+            "controlled_input: callback_url JSON field\n"
+            "reachability_step: POST /webhook\n"
+            "reachability_step: handle_webhook\n"
+            "reachability_step: client.fetch_remote\n"
+            "sink_operation: requests.get(url)\n"
+            "reachability_status: reachable\n"
+            "claim: SSRF via webhook callback_url\n"
+            "\n"
+            "@@ coverage @@\n"
+            "observed_file: src/api/webhook.py\n"
+            "observed_symbol: handle_webhook\n"
+            "not_covered: did not check retry path\n"
+            "confidence: medium\n"
+        )
+
+        def fake_call(ctx, messages, temperature=0.0, trace_task=None):
+            assert trace_task and trace_task.startswith("audit: hunt ssrf-x")
+            return canned
+
+        monkeypatch.setattr("swival.audit._call_audit_llm", fake_call)
+
+        ctx = SimpleNamespace(base_dir=str(tmp_path), loop_kwargs={})
+        findings, coverage, error = _phase_hunt_one(task, state, ctx)
+        assert error is None
+        assert len(findings) == 1
+        f = findings[0]
+        assert f.attack_class == "ssrf"
+        assert f.reachability_status == "reachable"
+        assert f.hunt_task_id == "ssrf-x"
+        assert f.source_file == "src/api/webhook.py"
+        # Budget was charged
+        assert state.budget_used.get("hunt", 0) > 0
+        # Coverage record ratios populated against task scope
+        assert coverage.confidence == "medium"
+        assert coverage.observed_files == ["src/api/webhook.py"]
+        assert coverage.covered_fraction_of_seed_files == 1.0
+        # attack_class_metrics bumped
+        assert state.attack_class_metrics["ssrf"]["proposed"] == 1
+
+    def test_resume_picks_up_only_pending_tasks(self, tmp_path):
+        """When state is saved mid-batch, resume picks up tasks still
+        ``pending`` and leaves the ones already marked ``done`` alone."""
+        from swival.audit import AuditRunState, AuditScope, HuntTask
+
+        scope = AuditScope(
+            branch="m",
+            commit="c",
+            tracked_files=["a.py"],
+            mandatory_files=["a.py"],
+            focus=[],
+        )
+        state_dir = tmp_path / ".swival" / "audit"
+        state = AuditRunState(
+            run_id="r1",
+            scope=scope,
+            queued_files=["a.py"],
+            state_dir=state_dir,
+            hunt_mode=True,
+        )
+        state.phase = "hunt"
+        done_t = HuntTask(
+            id="ssrf-done",
+            task_kind="hunt",
+            attack_class="ssrf",
+            attacker_position="unauthenticated remote client",
+            controlled_inputs=["url"],
+            trust_boundary_crossed="POST /webhook",
+            scope_hint="",
+            seed_files=["a.py"],
+            seed_symbols=[],
+            sink_files=["a.py"],
+            source="phase1",
+            priority="high",
+            status="done",
+            attempts=1,
+        )
+        pending_t = HuntTask(
+            id="cmd-pending",
+            task_kind="hunt",
+            attack_class="command_execution",
+            attacker_position="unauthenticated remote client",
+            controlled_inputs=["cmd"],
+            trust_boundary_crossed="POST /run",
+            scope_hint="",
+            seed_files=["a.py"],
+            seed_symbols=[],
+            sink_files=["a.py"],
+            source="phase1",
+            priority="high",
+            status="pending",
+        )
+        state.hunt_tasks[done_t.id] = done_t
+        state.hunt_tasks[pending_t.id] = pending_t
+        state.save()
+
+        loaded = AuditRunState.load(state_dir, "r1")
+        pending = [t for t in loaded.hunt_tasks.values() if t.status == "pending"]
+        assert [t.id for t in pending] == ["cmd-pending"]
+        # done task survives with attempts intact
+        assert loaded.hunt_tasks["ssrf-done"].attempts == 1
+
+    def test_failed_tasks_block_advance_to_verification(self, tmp_path, monkeypatch):
+        """If any hunt task is still ``failed`` after the retry loop, the
+        phase must stay incomplete and return an actionable error rather than
+        silently advancing to verification (which would let a false 'no
+        findings' result through)."""
+        from swival.audit import (
+            AuditRunState,
+            AuditScope,
+            HuntTask,
+            _run_audit_phases,
+        )
+
+        _init_git(tmp_path)
+        _commit_file(tmp_path, "a.py", "x = 1\n")
+        commit = (
+            subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=tmp_path)
+            .decode()
+            .strip()
+        )
+
+        scope = AuditScope(
+            branch="main",
+            commit=commit,
+            tracked_files=["a.py"],
+            mandatory_files=["a.py"],
+            focus=[],
+        )
+        state_dir = tmp_path / ".swival" / "audit"
+        state = AuditRunState(
+            run_id="huntfail",
+            scope=scope,
+            queued_files=["a.py"],
+            state_dir=state_dir,
+            hunt_mode=True,
+        )
+        state.phase = "hunt"
+        state.repo_profile = {"summary": "tiny"}
+        state.hunt_tasks["t-fail"] = HuntTask(
+            id="t-fail",
+            task_kind="hunt",
+            attack_class="ssrf",
+            attacker_position="unauthenticated remote client",
+            controlled_inputs=["url"],
+            trust_boundary_crossed="POST /x",
+            scope_hint="",
+            seed_files=["a.py"],
+            seed_symbols=[],
+            sink_files=[],
+            source="phase1",
+            priority="high",
+        )
+        state.save()
+
+        # Hunter LLM always errors out, so the task stays in ``failed`` after
+        # all retries.
+        def fake_call(ctx, messages, temperature=0.0, trace_task=None):
+            raise RuntimeError("simulated transient failure")
+
+        monkeypatch.setattr("swival.audit._call_audit_llm", fake_call)
+        monkeypatch.setattr("swival.audit._git_show", lambda p, b: "x = 1")
+
+        result = _run_audit_phases(
+            "--resume",
+            _make_ctx(tmp_path),
+            str(tmp_path),
+            state_dir,
+            1,
+            True,
+            False,
+            None,
+            hunt_mode=True,
+        )
+        assert "Audit incomplete" in result
+        assert "hunt task" in result
+        assert "No provable" not in result
+
+        loaded = AuditRunState.load(state_dir, "huntfail")
+        assert loaded.phase == "hunt"
+        assert loaded.hunt_tasks["t-fail"].status == "failed"
+        # The retry loop did run multiple times before giving up.
+        assert loaded.hunt_tasks["t-fail"].attempts >= 2
+
+    def test_stale_running_tasks_reset_on_resume(self, tmp_path, monkeypatch):
+        """A previous run crashed mid-batch and left a task ``running``.
+        On resume the hunt phase resets it to ``pending`` and retries it."""
+        from swival.audit import (
+            AuditRunState,
+            AuditScope,
+            HuntTask,
+            _run_audit_phases,
+        )
+
+        _init_git(tmp_path)
+        _commit_file(tmp_path, "a.py", "x = 1\n")
+        commit = (
+            subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=tmp_path)
+            .decode()
+            .strip()
+        )
+
+        scope = AuditScope(
+            branch="main",
+            commit=commit,
+            tracked_files=["a.py"],
+            mandatory_files=["a.py"],
+            focus=[],
+        )
+        state_dir = tmp_path / ".swival" / "audit"
+        state = AuditRunState(
+            run_id="huntstale",
+            scope=scope,
+            queued_files=["a.py"],
+            state_dir=state_dir,
+            hunt_mode=True,
+        )
+        state.phase = "hunt"
+        state.repo_profile = {"summary": "tiny"}
+        state.hunt_tasks["t-stale"] = HuntTask(
+            id="t-stale",
+            task_kind="hunt",
+            attack_class="ssrf",
+            attacker_position="unauthenticated remote client",
+            controlled_inputs=["url"],
+            trust_boundary_crossed="POST /x",
+            scope_hint="",
+            seed_files=["a.py"],
+            seed_symbols=[],
+            sink_files=[],
+            source="phase1",
+            priority="high",
+            status="running",
+            attempts=1,
+        )
+        state.save()
+
+        canned = "@@ none @@\n\n@@ coverage @@\nobserved_file: a.py\nconfidence: low\n"
+
+        def fake_call(ctx, messages, temperature=0.0, trace_task=None):
+            return canned
+
+        monkeypatch.setattr("swival.audit._call_audit_llm", fake_call)
+        monkeypatch.setattr("swival.audit._git_show", lambda p, b: "x = 1")
+
+        result = _run_audit_phases(
+            "--resume",
+            _make_ctx(tmp_path),
+            str(tmp_path),
+            state_dir,
+            1,
+            True,
+            False,
+            None,
+            hunt_mode=True,
+        )
+        # task ran to completion → audit reports either no findings or
+        # advances cleanly; the key invariant is that the stale row no longer
+        # holds the phase incomplete.
+        assert "still marked running" not in result
+        loaded = AuditRunState.load(state_dir, "huntstale")
+        assert loaded.hunt_tasks["t-stale"].status == "done"
+        assert loaded.phase in ("verification", "artifacts", "done")
+
+    def test_low_priority_tasks_dropped_when_budget_throttled(
+        self, tmp_path, monkeypatch
+    ):
+        """When ``BudgetPlanner.should_throttle_low_priority()`` flips, the
+        hunt phase drops any task whose priority is ``low`` before the next
+        batch, leaving higher-priority tasks alone."""
+        from swival.audit import (
+            AuditRunState,
+            AuditScope,
+            HuntTask,
+            _run_audit_phases,
+        )
+
+        _init_git(tmp_path)
+        _commit_file(tmp_path, "a.py", "x = 1\n")
+        commit = (
+            subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=tmp_path)
+            .decode()
+            .strip()
+        )
+
+        scope = AuditScope(
+            branch="main",
+            commit=commit,
+            tracked_files=["a.py"],
+            mandatory_files=["a.py"],
+            focus=[],
+        )
+        state_dir = tmp_path / ".swival" / "audit"
+        state = AuditRunState(
+            run_id="huntthrottle",
+            scope=scope,
+            queued_files=["a.py"],
+            state_dir=state_dir,
+            hunt_mode=True,
+        )
+        state.phase = "hunt"
+        state.repo_profile = {"summary": "tiny"}
+        state.budget_tokens = 100
+        state.budget_used = {"hunt": 60}  # > 50% of global -> throttle
+
+        def _make_task(tid, priority):
+            return HuntTask(
+                id=tid,
+                task_kind="hunt",
+                attack_class="ssrf",
+                attacker_position="unauthenticated remote client",
+                controlled_inputs=["url"],
+                trust_boundary_crossed="POST /x",
+                scope_hint="",
+                seed_files=["a.py"],
+                seed_symbols=[],
+                sink_files=[],
+                source="phase1",
+                priority=priority,
+            )
+
+        state.hunt_tasks["high-1"] = _make_task("high-1", "high")
+        state.hunt_tasks["low-1"] = _make_task("low-1", "low")
+        state.hunt_tasks["low-2"] = _make_task("low-2", "low")
+        state.save()
+
+        canned = "@@ none @@\n\n@@ coverage @@\nobserved_file: a.py\nconfidence: low\n"
+
+        def fake_call(ctx, messages, temperature=0.0, trace_task=None):
+            return canned
+
+        monkeypatch.setattr("swival.audit._call_audit_llm", fake_call)
+        monkeypatch.setattr("swival.audit._git_show", lambda p, b: "x = 1")
+
+        result = _run_audit_phases(
+            "--resume",
+            _make_ctx(tmp_path),
+            str(tmp_path),
+            state_dir,
+            1,
+            True,
+            False,
+            None,
+            hunt_mode=True,
+        )
+        # Throttling marks dropped tasks ``failed`` with a clear reason, which
+        # under the new gate keeps the audit incomplete.
+        assert "Audit incomplete" in result
+        loaded = AuditRunState.load(state_dir, "huntthrottle")
+        assert loaded.hunt_tasks["high-1"].status == "done"
+        assert loaded.hunt_tasks["low-1"].status == "failed"
+        assert loaded.hunt_tasks["low-2"].status == "failed"
+        assert "budget throttle" in loaded.hunt_tasks["low-1"].last_error
+
+    def test_budget_exhaustion_short_circuits_before_llm(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+
+        from swival.audit import (
+            AuditRunState,
+            AuditScope,
+            HuntTask,
+            _phase_hunt_one,
+        )
+
+        scope = AuditScope(
+            branch="m",
+            commit="c",
+            tracked_files=["a.py"],
+            mandatory_files=["a.py"],
+            focus=[],
+        )
+        state = AuditRunState(
+            run_id="r",
+            scope=scope,
+            queued_files=["a.py"],
+            state_dir=tmp_path,
+        )
+        state.budget_tokens = 1000
+        state.budget_used = {"hunt": 1500}  # already over global cap
+
+        def boom(*a, **kw):
+            raise AssertionError("LLM should not be called when budget is exhausted")
+
+        monkeypatch.setattr("swival.audit._call_audit_llm", boom)
+        monkeypatch.setattr("swival.audit._git_show", lambda p, b: "x")
+
+        task = HuntTask(
+            id="x",
+            task_kind="hunt",
+            attack_class="ssrf",
+            attacker_position="unauthenticated remote client",
+            controlled_inputs=["url"],
+            trust_boundary_crossed="POST /x",
+            scope_hint="",
+            seed_files=["a.py"],
+            seed_symbols=[],
+            sink_files=[],
+            source="phase1",
+            priority="high",
+        )
+        ctx = SimpleNamespace(base_dir=str(tmp_path), loop_kwargs={})
+        findings, coverage, error = _phase_hunt_one(task, state, ctx)
+        assert findings == []
+        assert error and "budget exhausted" in error
+
+    def test_invalid_task_returns_error(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+
+        from swival.audit import (
+            AuditRunState,
+            AuditScope,
+            HuntTask,
+            _phase_hunt_one,
+        )
+
+        scope = AuditScope(
+            branch="m",
+            commit="c",
+            tracked_files=["a.py"],
+            mandatory_files=["a.py"],
+            focus=[],
+        )
+        state = AuditRunState(
+            run_id="r", scope=scope, queued_files=["a.py"], state_dir=tmp_path
+        )
+        task = HuntTask(
+            id="bad",
+            task_kind="hunt",
+            attack_class="ssrf",
+            attacker_position="",  # missing
+            controlled_inputs=["x"],
+            trust_boundary_crossed="x",
+            scope_hint="",
+            seed_files=[],
+            seed_symbols=[],
+            sink_files=[],
+            source="phase1",
+            priority="high",
+        )
+
+        # The mocked LLM must NOT be called for invalid tasks.
+        def boom(*a, **kw):
+            raise AssertionError("should not call LLM for invalid task")
+
+        monkeypatch.setattr("swival.audit._call_audit_llm", boom)
+        monkeypatch.setattr("swival.audit._git_show", lambda p, b: "")
+        ctx = SimpleNamespace(base_dir=str(tmp_path), loop_kwargs={})
+        findings, coverage, error = _phase_hunt_one(task, state, ctx)
+        assert findings == []
+        assert error is not None and "invalid task" in error
+        assert coverage.task_id == "bad"
+
+
+class TestBudgetPlanner:
+    def _state(self, tmp_path: Path, budget: int = 0):
+        scope = AuditScope(
+            branch="m",
+            commit="c",
+            tracked_files=["a.py"],
+            mandatory_files=["a.py"],
+            focus=[],
+        )
+        s = AuditRunState(
+            run_id="b1",
+            scope=scope,
+            queued_files=["a.py"],
+            state_dir=tmp_path / ".swival" / "audit",
+        )
+        s.budget_tokens = budget
+        return s
+
+    def test_disabled_when_total_is_zero(self, tmp_path):
+        from swival.audit import BudgetPlanner
+
+        b = BudgetPlanner(self._state(tmp_path, budget=0))
+        assert b.enabled is False
+        assert b.remaining() == float("inf")
+        assert b.remaining("hunt") == float("inf")
+        assert b.exhausted() is False
+        assert b.should_throttle_low_priority() is False
+        assert b.summary_line() is None
+        assert b.detail_lines() == []
+
+    def test_allocation_uses_default_shares(self, tmp_path):
+        from swival.audit import BudgetPlanner, _BUDGET_DEFAULT_SHARES
+
+        b = BudgetPlanner(self._state(tmp_path, budget=1_000_000))
+        for phase, share in _BUDGET_DEFAULT_SHARES.items():
+            assert b.allocation(phase) == 1_000_000 * share
+
+    def test_charge_and_remaining(self, tmp_path):
+        from swival.audit import BudgetPlanner
+
+        s = self._state(tmp_path, budget=1_000_000)
+        b = BudgetPlanner(s)
+        b.charge("hunt", 100_000)
+        assert s.budget_used == {"hunt": 100_000}
+        assert b.used("hunt") == 100_000
+        assert b.used() == 100_000
+        # hunt allocation is 30% = 300k
+        assert b.remaining("hunt") == 200_000
+        # global remaining is 900k
+        assert b.remaining() == 900_000
+        b.charge("hunt", 250_000)  # blows past its allocation
+        assert b.remaining("hunt") == 0
+        # global budget still has room, so the planner is not yet exhausted
+        assert b.exhausted() is False
+
+    def test_throttle_low_priority_at_half(self, tmp_path):
+        from swival.audit import BudgetPlanner
+
+        s = self._state(tmp_path, budget=1_000_000)
+        b = BudgetPlanner(s)
+        b.charge("hunt", 499_999)
+        assert b.should_throttle_low_priority() is False
+        b.charge("hunt", 2)
+        assert b.should_throttle_low_priority() is True
+
+    def test_exhausted_when_global_pool_drained(self, tmp_path):
+        from swival.audit import BudgetPlanner
+
+        s = self._state(tmp_path, budget=100_000)
+        b = BudgetPlanner(s)
+        b.charge("hunt", 100_000)
+        assert b.exhausted() is True
+
+    def test_summary_and_detail_lines(self, tmp_path):
+        from swival.audit import BudgetPlanner
+
+        s = self._state(tmp_path, budget=1_000_000)
+        b = BudgetPlanner(s)
+        b.charge("hunt", 50_000)
+        b.charge("profile", 5_000)
+        line = b.summary_line()
+        assert line is not None
+        assert "55,000" in line
+        assert "1,000,000" in line
+        details = b.detail_lines()
+        assert any("hunt" in d for d in details)
+        assert any("profile" in d for d in details)
+        # phases with zero usage are skipped
+        assert not any("dedupe" in d for d in details)
+
+    def test_charge_call_uses_token_estimator(self, tmp_path):
+        from swival.audit import BudgetPlanner
+
+        s = self._state(tmp_path, budget=1_000_000)
+        b = BudgetPlanner(s)
+        # 100 chars at len//4 = 25 tokens; pair adds to 50
+        b.charge_call("hunt", "a" * 100, "b" * 100)
+        assert s.budget_used == {"hunt": 50}
+        b.charge_call("hunt", "a" * 200, "")
+        assert s.budget_used["hunt"] == 100
+
+
+class TestAuditCliFlags:
+    """The new --hunt / --proof-strict / --trace-reachability / --budget-tokens flags."""
+
+    def _ctx(self, tmp_path):
+        return _make_ctx(tmp_path)
+
+    def _capture(self, monkeypatch) -> dict:
+        return _capture_run_audit_phases(monkeypatch)
+
+    def test_hunt_flag_passed_through(self, tmp_path, monkeypatch):
+        from swival.audit import run_audit_command
+
+        captured = self._capture(monkeypatch)
+        run_audit_command("--hunt", self._ctx(tmp_path))
+        assert captured["hunt_mode"] is True
+        assert captured["budget_tokens"] == 0
+
+    def test_proof_strict_flag_is_reserved(self, tmp_path):
+        from swival.audit import run_audit_command
+
+        out = run_audit_command("--proof-strict", self._ctx(tmp_path))
+        assert out.startswith("error:")
+        assert "--proof-strict is reserved" in out
+        assert "not yet implemented" in out
+
+    def test_trace_reachability_flag_is_reserved(self, tmp_path):
+        from swival.audit import run_audit_command
+
+        out = run_audit_command("--trace-reachability", self._ctx(tmp_path))
+        assert out.startswith("error:")
+        assert "--trace-reachability is reserved" in out
+        assert "not yet implemented" in out
+
+    def test_budget_tokens_accepts_underscore_separator(self, tmp_path, monkeypatch):
+        from swival.audit import run_audit_command
+
+        captured = self._capture(monkeypatch)
+        run_audit_command("--hunt --budget-tokens 2_000_000", self._ctx(tmp_path))
+        assert captured["budget_tokens"] == 2_000_000
+
+    def test_budget_tokens_accepts_comma_separator(self, tmp_path, monkeypatch):
+        from swival.audit import run_audit_command
+
+        captured = self._capture(monkeypatch)
+        run_audit_command("--budget-tokens 1,500,000", self._ctx(tmp_path))
+        assert captured["budget_tokens"] == 1_500_000
+
+    def test_gapfill_flag_is_reserved(self, tmp_path):
+        from swival.audit import run_audit_command
+
+        out = run_audit_command("--gapfill 25", self._ctx(tmp_path))
+        assert out.startswith("error:")
+        assert "--gapfill is reserved" in out
+        assert "not yet implemented" in out
+
+    def test_proof_strict_config_key_is_reserved(self, tmp_path, monkeypatch):
+        from swival.audit import run_audit_command
+
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+        (tmp_path / "swival.toml").write_text("[audit]\nproof_strict = true\n")
+        out = run_audit_command("", self._ctx(tmp_path))
+        assert out.startswith("error:")
+        assert "proof_strict" in out
+        assert "not yet implemented" in out
+
+    def test_max_gapfill_tasks_config_key_is_reserved(self, tmp_path, monkeypatch):
+        from swival.audit import run_audit_command
+
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+        (tmp_path / "swival.toml").write_text("[audit]\nmax_gapfill_tasks = 10\n")
+        out = run_audit_command("", self._ctx(tmp_path))
+        assert out.startswith("error:")
+        assert "max_gapfill_tasks" in out
+        assert "not yet implemented" in out
+
+    def test_budget_tokens_requires_value(self, tmp_path):
+        from swival.audit import run_audit_command
+
+        out = run_audit_command("--budget-tokens", _make_ctx(tmp_path))
+        assert out.startswith("error:") and "--budget-tokens" in out
+
+    def test_budget_tokens_rejects_negative(self, tmp_path):
+        from swival.audit import run_audit_command
+
+        out = run_audit_command("--budget-tokens -1", _make_ctx(tmp_path))
+        assert out.startswith("error:")
+
+    def test_unknown_flag_message_lists_new_flags(self, tmp_path):
+        from swival.audit import run_audit_command
+
+        out = run_audit_command("--unknown-flag", _make_ctx(tmp_path))
+        assert out.startswith("error: unknown option")
+        assert "--hunt" in out
+        assert "--budget-tokens" in out
+        assert "--budget-tokens" in out
+
+
+class TestHarnessStateRoundtrip:
+    def test_harness_fields_roundtrip(self, tmp_path):
+        from swival.audit import (
+            AuditRunState,
+            AuditScope,
+            CoverageRecord,
+            HuntTask,
+            RootCauseGroup,
+            VerifiedFinding,
+        )
+
+        scope = AuditScope(
+            branch="main",
+            commit="abc123",
+            tracked_files=["a.py"],
+            mandatory_files=["a.py"],
+            focus=[],
+        )
+        state_dir = tmp_path / ".swival" / "audit"
+        state = AuditRunState(
+            run_id="r1",
+            scope=scope,
+            queued_files=["a.py"],
+            state_dir=state_dir,
+        )
+        state.hunt_mode = True
+        state.proof_strict = True
+        state.trace_reachability = True
+        state.budget_tokens = 2_000_000
+        state.budget_used = {"phase1": 1024, "hunt": 50_000}
+        state.attack_class_metrics = {"ssrf": {"proposed": 4, "verified": 1}}
+
+        t = HuntTask(
+            id="ssrf-x",
+            task_kind="hunt",
+            attack_class="ssrf",
+            attacker_position="unauthenticated remote client",
+            controlled_inputs=["callback_url"],
+            trust_boundary_crossed="POST /webhook",
+            scope_hint="src/api/**",
+            seed_files=["a.py"],
+            seed_symbols=["h"],
+            sink_files=["b.py"],
+            source="phase1",
+            priority="high",
+            language_hint="python",
+        )
+        state.hunt_tasks[t.id] = t
+        state.coverage_records[t.id] = CoverageRecord(
+            task_id=t.id,
+            observed_files=["a.py"],
+            observed_symbols=["h"],
+            observed_edges=["a.py->b.py"],
+            covered_fraction_of_seed_files=1.0,
+            covered_fraction_of_sink_hits=0.5,
+            unobserved_high_priority_seeds=["c.py"],
+            explicit_not_covered=["retry path"],
+            followup_task_ids=["ssrf-y"],
+            confidence="medium",
+        )
+        state.adversarial_state["k1"] = {
+            "status": "plausible",
+            "attempts": 1,
+            "review_model": "reviewer-mini",
+        }
+
+        finding = FindingRecord(
+            title="ssrf via webhook",
+            finding_type="vulnerability",
+            severity="high",
+            locations=["a.py:1"],
+            preconditions=[],
+            proof=[],
+            fix_outline="guard host",
+            source_file="a.py",
+            local_bug="unguarded fetch",
+            source_boundary="POST /webhook",
+            reachability_path=["POST /webhook", "handle_webhook"],
+            sink_operation="outbound HTTP GET",
+            exploit_chain=["attacker controls callback_url"],
+            reachability_status="reachable",
+            hunt_task_id=t.id,
+            attack_class="ssrf",
+            attacker_position="unauthenticated remote client",
+            controlled_inputs=["callback_url"],
+        )
+        state.proposed_findings.append(finding)
+        state.verified_findings.append(
+            VerifiedFinding(
+                finding=finding,
+                correctness_reason="ok",
+                rebuttal_reason="n/a",
+                reproducer={"proof_kind": "runtime"},
+                adversarial={"verdict": "PLAUSIBLE", "review_model": "reviewer-mini"},
+                trace={"reachable": True},
+                root_cause_group_id="g1",
+            )
+        )
+        state.root_cause_groups.append(
+            RootCauseGroup(
+                id="g1",
+                primary_finding_key="k1",
+                variant_finding_keys=[],
+                root_cause_summary="ssrf",
+                source_boundaries=["POST /webhook"],
+                affected_locations=["a.py:1"],
+                finding_type="vulnerability",
+                attack_class="ssrf",
+            )
+        )
+        state.save()
+
+        loaded = AuditRunState.load(state_dir, "r1")
+        assert loaded.hunt_mode is True
+        assert loaded.proof_strict is True
+        assert loaded.trace_reachability is True
+        assert loaded.budget_tokens == 2_000_000
+        assert loaded.budget_used == {"phase1": 1024, "hunt": 50_000}
+        assert loaded.attack_class_metrics == {"ssrf": {"proposed": 4, "verified": 1}}
+        assert loaded.hunt_tasks[t.id].language_hint == "python"
+        assert loaded.coverage_records[t.id].followup_task_ids == ["ssrf-y"]
+        assert loaded.adversarial_state["k1"]["review_model"] == "reviewer-mini"
+        rf = loaded.proposed_findings[0]
+        assert rf.local_bug == "unguarded fetch"
+        assert rf.reachability_status == "reachable"
+        assert rf.hunt_task_id == t.id
+        rvf = loaded.verified_findings[0]
+        assert rvf.adversarial == {
+            "verdict": "PLAUSIBLE",
+            "review_model": "reviewer-mini",
+        }
+        assert rvf.trace == {"reachable": True}
+        assert rvf.root_cause_group_id == "g1"
+        assert loaded.root_cause_groups[0].id == "g1"
+
+    def test_load_state_without_harness_fields_uses_defaults(self, tmp_path):
+        import json
+
+        state_dir = tmp_path / ".swival" / "audit"
+        run_dir = state_dir / "legacy"
+        run_dir.mkdir(parents=True)
+        blob = {
+            "run_id": "legacy",
+            "scope": {
+                "branch": "main",
+                "commit": "abc1234",
+                "tracked_files": ["a.py"],
+                "mandatory_files": ["a.py"],
+                "focus": [],
+            },
+            "queued_files": ["a.py"],
+            "reviewed_files": ["a.py"],
+            "triage_records": {},
+            "candidate_files": [],
+            "deep_reviewed_files": [],
+            "proposed_findings": [
+                {
+                    "title": "t",
+                    "finding_type": "vulnerability",
+                    "severity": "high",
+                    "locations": [],
+                    "preconditions": [],
+                    "proof": [],
+                    "fix_outline": "",
+                    "source_file": "a.py",
+                }
+            ],
+            "verified_findings": [
+                {
+                    "finding": {
+                        "title": "t",
+                        "finding_type": "vulnerability",
+                        "severity": "high",
+                        "locations": [],
+                        "preconditions": [],
+                        "proof": [],
+                        "fix_outline": "",
+                        "source_file": "a.py",
+                    },
+                    "correctness_reason": "ok",
+                    "rebuttal_reason": "n/a",
+                    "reproducer": None,
+                }
+            ],
+            "repo_profile": None,
+            "import_index": {},
+            "caller_index": {},
+            "attack_scores": {},
+            "verification_state": {},
+            "artifact_state": {},
+            "phase": "init",
+            "metrics": {},
+            "select_all": False,
+            "measure_triage": False,
+            "measurement_escalated_paths": [],
+        }
+        (run_dir / "state.json").write_text(json.dumps(blob))
+
+        loaded = AuditRunState.load(state_dir, "legacy")
+        assert loaded.hunt_mode is False
+        assert loaded.hunt_tasks == {}
+        assert loaded.coverage_records == {}
+        assert loaded.adversarial_state == {}
+        assert loaded.root_cause_groups == []
+        assert loaded.trace_state == {}
+        assert loaded.proof_strict is False
+        assert loaded.trace_reachability is False
+        assert loaded.budget_tokens == 0
+        assert loaded.budget_used == {}
+        assert loaded.attack_class_metrics == {}
+        assert loaded.proposed_findings[0].local_bug == ""
+        assert loaded.proposed_findings[0].reachability_status == "unknown"
+        assert loaded.proposed_findings[0].hunt_task_id == ""
+        assert loaded.verified_findings[0].adversarial is None
+        assert loaded.verified_findings[0].trace is None
+        assert loaded.verified_findings[0].root_cause_group_id == ""
+
+
+# ---------------------------------------------------------------------------
 # Verification gates
 # ---------------------------------------------------------------------------
 
@@ -5483,8 +6846,8 @@ class TestForceReviewConfig:
         ]
         from swival.audit import _load_audit_config
 
-        _globs, sources, _turns = _load_audit_config(str(tmp_path))
-        assert sources["swival/audit.py"] == "project"
+        audit_cfg = _load_audit_config(str(tmp_path))
+        assert audit_cfg["force_review_sources"]["swival/audit.py"] == "project"
         assert "_force_review_sources" not in cfg["audit"]
 
     def test_merges_global_and_project(self, tmp_path, monkeypatch):
@@ -5502,9 +6865,9 @@ class TestForceReviewConfig:
 
         cfg = load_config(tmp_path)
         assert set(cfg["audit"]["force_review"]) == {"always.py", "here.py"}
-        _globs, sources, _turns = _load_audit_config(str(tmp_path))
-        assert sources["always.py"] == "global"
-        assert sources["here.py"] == "project"
+        audit_cfg = _load_audit_config(str(tmp_path))
+        assert audit_cfg["force_review_sources"]["always.py"] == "global"
+        assert audit_cfg["force_review_sources"]["here.py"] == "project"
 
     def test_unknown_audit_subkey_raises(self, tmp_path, monkeypatch):
         from swival.config import load_config, ConfigError
@@ -5536,8 +6899,8 @@ class TestForceReviewConfig:
 
         cfg = load_config(tmp_path)
         assert cfg["audit"]["patch_max_turns"] == 75
-        _globs, _sources, turns = _load_audit_config(str(tmp_path))
-        assert turns == 75
+        audit_cfg = _load_audit_config(str(tmp_path))
+        assert audit_cfg["patch_max_turns"] == 75
 
     def test_patch_max_turns_rejects_invalid(self, tmp_path, monkeypatch):
         from swival.config import load_config, ConfigError
@@ -5546,6 +6909,74 @@ class TestForceReviewConfig:
         (tmp_path / "swival.toml").write_text("[audit]\npatch_max_turns = 0\n")
         with pytest.raises(ConfigError, match="patch_max_turns"):
             load_config(tmp_path)
+
+    def test_harness_audit_keys_load(self, tmp_path, monkeypatch):
+        from swival.audit import _load_audit_config
+
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+        (tmp_path / "swival.toml").write_text(
+            "[audit]\n"
+            "budget_tokens = 2_000_000\n"
+            "max_gapfill_tasks = 40\n"
+            "max_hunt_tasks = 150\n"
+            "proof_strict = true\n"
+            "\n"
+            "[audit.reviewer]\n"
+            'profile = "reviewer"\n'
+            'model = "claude-haiku-mini"\n'
+            "\n"
+            "[[audit.hunt_task]]\n"
+            'attack_class = "ssrf"\n'
+            'attacker_position = "unauthenticated remote client"\n'
+        )
+        audit_cfg = _load_audit_config(str(tmp_path))
+        assert audit_cfg["budget_tokens"] == 2_000_000
+        assert audit_cfg["max_gapfill_tasks"] == 40
+        assert audit_cfg["max_hunt_tasks"] == 150
+        assert audit_cfg["proof_strict"] is True
+        assert audit_cfg["reviewer_profile"] == "reviewer"
+        assert audit_cfg["reviewer_model"] == "claude-haiku-mini"
+        assert audit_cfg["hunt_tasks"][0]["attack_class"] == "ssrf"
+
+    def test_reviewer_subkey_rejects_unknown(self, tmp_path, monkeypatch):
+        from swival.config import ConfigError, load_config
+
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+        (tmp_path / "swival.toml").write_text('[audit.reviewer]\nbogus = "x"\n')
+        with pytest.raises(ConfigError, match="audit.reviewer.bogus"):
+            load_config(tmp_path)
+
+    def test_proof_strict_must_be_bool(self, tmp_path, monkeypatch):
+        from swival.config import ConfigError, load_config
+
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+        (tmp_path / "swival.toml").write_text("[audit]\nproof_strict = 1\n")
+        with pytest.raises(ConfigError, match="proof_strict"):
+            load_config(tmp_path)
+
+    def test_budget_tokens_must_be_non_negative(self, tmp_path, monkeypatch):
+        from swival.config import ConfigError, load_config
+
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+        (tmp_path / "swival.toml").write_text("[audit]\nbudget_tokens = -5\n")
+        with pytest.raises(ConfigError, match="budget_tokens"):
+            load_config(tmp_path)
+
+    def test_project_reviewer_overrides_global(self, tmp_path, monkeypatch):
+        from swival.audit import _load_audit_config
+
+        xdg = tmp_path / "xdg"
+        (xdg / "swival").mkdir(parents=True)
+        (xdg / "swival" / "config.toml").write_text(
+            '[audit.reviewer]\nprofile = "g-rev"\nmodel = "g-model"\n'
+        )
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+        (tmp_path / "swival.toml").write_text('[audit.reviewer]\nprofile = "p-rev"\n')
+        audit_cfg = _load_audit_config(str(tmp_path))
+        # project profile wins; model falls back to global because project did
+        # not set it
+        assert audit_cfg["reviewer_profile"] == "p-rev"
+        assert audit_cfg["reviewer_model"] == "g-model"
 
 
 class TestForceReviewMatching:

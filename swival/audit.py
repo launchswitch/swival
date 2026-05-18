@@ -28,6 +28,10 @@ AUDIT_PROVENANCE_URL = "https://swival.dev"
 _AUDIT_TRUNCATION_MARKER = "\n\n[truncated — file too large for context window]"
 _AUDIT_TRUNCATION_FLOOR = 200
 
+# Per-file cap on hunter seed-file evidence. Keeps a single huge generated file
+# from blowing the global budget across a batch of parallel tasks.
+_HUNT_SEED_FILE_CAP = 16_384
+
 _LARGE_SCOPE_THRESHOLD = 500
 _DEFAULT_PATCH_MAX_TURNS = 50
 
@@ -203,6 +207,16 @@ class FindingRecord:
     fix_outline: str
     source_file: str
     triage_decision: str | None = None  # "escalated" | "skipped" | None
+    local_bug: str = ""
+    source_boundary: str = ""
+    reachability_path: list[str] = field(default_factory=list)
+    sink_operation: str = ""
+    exploit_chain: list[str] = field(default_factory=list)
+    reachability_status: str = "unknown"
+    hunt_task_id: str = ""
+    attack_class: str = ""
+    attacker_position: str = ""
+    controlled_inputs: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -211,6 +225,9 @@ class VerifiedFinding:
     correctness_reason: str
     rebuttal_reason: str
     reproducer: dict | None = None
+    adversarial: dict | None = None
+    trace: dict | None = None
+    root_cause_group_id: str = ""
 
 
 @dataclass
@@ -234,6 +251,748 @@ class PatchGenerationResult:
     patch_text: str | None = None
     error_code: str | None = None
     error: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Hunt task model
+# ---------------------------------------------------------------------------
+
+# Recognised attack classes. Adding new ones is the cheapest path to broaden
+# coverage; deletions affect persisted state, so retire by mapping at load time.
+_HUNT_ATTACK_CLASSES = (
+    "command_execution",
+    "authorization",
+    "path_traversal",
+    "ssrf",
+    "sqli",
+    "xxe",
+    "xss",
+    "deserialization",
+    "parser_differential",
+    "cryptography",
+    "memory_safety",
+    "policy_bypass",
+    "toctou",
+    "open_redirect",
+    "secret_exposure",
+    "logic_flaw",
+)
+
+# Attacker positions that make a task concrete enough to act on. Free-form
+# strings outside this set are allowed but emit a warning at validation time so
+# the operator sees that the task may be too generic.
+_HUNT_ATTACKER_POSITIONS = (
+    "unauthenticated remote client",
+    "authenticated low-privileged user",
+    "authenticated peer tenant",
+    "malicious peer",
+    "attacker-controlled backend",
+    "crafted file author",
+    "lower-privileged local user",
+    "compromised dependency",
+    "sandboxed workload",
+)
+
+_HUNT_TASK_KINDS = ("hunt", "reachability")
+_HUNT_TASK_STATUSES = ("pending", "running", "done", "failed")
+_HUNT_REACHABILITY_STATUSES = ("reachable", "local_only", "not_reachable", "unknown")
+_HUNT_CONFIDENCE_LEVELS = ("high", "medium", "low")
+
+
+@dataclass
+class HuntTask:
+    """A narrow attacker-anchored research task.
+
+    Generated from the repo profile + sink/source scans (and optionally from
+    triage records when hunt-mode fallback triage runs). The hunter prompt is
+    expected to address exactly one attack class for exactly one attacker model.
+    """
+
+    id: str
+    task_kind: str
+    attack_class: str
+    attacker_position: str
+    controlled_inputs: list[str]
+    trust_boundary_crossed: str
+    scope_hint: str
+    seed_files: list[str]
+    seed_symbols: list[str]
+    sink_files: list[str]
+    source: str
+    priority: str
+    status: str = "pending"
+    coverage_notes: list[str] = field(default_factory=list)
+    parent_task_id: str = ""
+    parent_finding_key: str = ""
+    attempts: int = 0
+    last_error: str = ""
+    language_hint: str = ""
+
+
+@dataclass
+class CoverageRecord:
+    task_id: str
+    observed_files: list[str] = field(default_factory=list)
+    observed_symbols: list[str] = field(default_factory=list)
+    observed_edges: list[str] = field(default_factory=list)
+    covered_fraction_of_seed_files: float = 0.0
+    covered_fraction_of_sink_hits: float = 0.0
+    unobserved_high_priority_seeds: list[str] = field(default_factory=list)
+    explicit_not_covered: list[str] = field(default_factory=list)
+    followup_task_ids: list[str] = field(default_factory=list)
+    confidence: str = "low"
+
+
+@dataclass
+class RootCauseGroup:
+    id: str
+    primary_finding_key: str
+    variant_finding_keys: list[str]
+    root_cause_summary: str
+    source_boundaries: list[str] = field(default_factory=list)
+    affected_locations: list[str] = field(default_factory=list)
+    finding_type: str = ""
+    attack_class: str = ""
+
+
+class HuntTaskValidationError(ValueError):
+    """Raised when a HuntTask is missing one of the attacker-model fields."""
+
+
+def _validate_hunt_task(task: HuntTask) -> None:
+    """Reject a HuntTask before execution if attacker-model fields are missing.
+
+    `attacker_position`, `controlled_inputs`, and `trust_boundary_crossed` are
+    load-bearing: without them the generator falls back to generic per-class
+    prompts that motivated the plan.
+    """
+    missing: list[str] = []
+    if task.task_kind not in _HUNT_TASK_KINDS:
+        raise HuntTaskValidationError(
+            f"task {task.id}: task_kind must be one of "
+            f"{_HUNT_TASK_KINDS}, got {task.task_kind!r}"
+        )
+    if task.attack_class not in _HUNT_ATTACK_CLASSES:
+        task.coverage_notes.append(f"unknown attack_class={task.attack_class!r}")
+    if not task.attacker_position.strip():
+        missing.append("attacker_position")
+    if not task.controlled_inputs or not any(c.strip() for c in task.controlled_inputs):
+        missing.append("controlled_inputs")
+    if not task.trust_boundary_crossed.strip():
+        missing.append("trust_boundary_crossed")
+    if missing:
+        raise HuntTaskValidationError(
+            f"task {task.id} ({task.attack_class}): missing attacker-model fields: "
+            + ", ".join(missing)
+        )
+
+
+_BUDGET_PHASES: tuple[str, ...] = (
+    "profile",
+    "triage",
+    "deep_review",
+    "hunt",
+    "reachability",
+    "proof",
+    "disproof",
+    "gapfill",
+    "dedupe",
+    "trace",
+    "report",
+)
+
+# Default proportional allocation across phases. Hunt + proof + disproof get
+# the bulk because they are the new dominant cost centers; triage and profile
+# stay small because they run once and feed the rest. The fractions sum to 1.
+_BUDGET_DEFAULT_SHARES: dict[str, float] = {
+    "profile": 0.03,
+    "triage": 0.07,
+    "deep_review": 0.10,
+    "hunt": 0.30,
+    "reachability": 0.10,
+    "proof": 0.15,
+    "disproof": 0.10,
+    "gapfill": 0.07,
+    "dedupe": 0.02,
+    "trace": 0.03,
+    "report": 0.03,
+}
+
+
+class BudgetPlanner:
+    """Global token budget for an audit run.
+
+    The planner is wholly stateless except for the references it holds: all
+    persistent state lives in ``state.budget_tokens`` (the cap) and
+    ``state.budget_used`` (per-phase consumption). That keeps resume cheap and
+    lets ``--quiet`` final output read straight from state.
+
+    When ``state.budget_tokens == 0`` the planner is effectively disabled —
+    ``remaining`` returns ``float('inf')`` so callers never have to special-case
+    "no budget set". This is the default for bare ``/audit`` runs.
+    """
+
+    def __init__(self, state: AuditRunState):
+        self._state = state
+
+    @property
+    def total(self) -> int:
+        return self._state.budget_tokens
+
+    @property
+    def enabled(self) -> bool:
+        return self._state.budget_tokens > 0
+
+    def allocation(self, phase: str) -> float:
+        if self.total <= 0:
+            return float("inf")
+        share = _BUDGET_DEFAULT_SHARES.get(phase, 0.05)
+        return self.total * share
+
+    def used(self, phase: str | None = None) -> int:
+        if phase is None:
+            return sum(self._state.budget_used.values())
+        return int(self._state.budget_used.get(phase, 0))
+
+    def remaining(self, phase: str | None = None) -> float:
+        if not self.enabled:
+            return float("inf")
+        if phase is None:
+            return max(0, self.total - self.used())
+        return max(0.0, self.allocation(phase) - self.used(phase))
+
+    def charge(self, phase: str, tokens: int) -> None:
+        if tokens <= 0:
+            return
+        cur = int(self._state.budget_used.get(phase, 0))
+        self._state.budget_used[phase] = cur + int(tokens)
+
+    def exhausted(self) -> bool:
+        """True only when the global pool is gone.
+
+        Per-phase allocations are soft hints used by ``should_throttle_low_priority``
+        and verbose accounting. A phase that has blown past its allocation can
+        still spend so long as the global pool has room, because every audit has
+        cheap phases ``hunt`` can borrow from.
+        """
+        if not self.enabled:
+            return False
+        return self.remaining(None) <= 0
+
+    def should_throttle_low_priority(self) -> bool:
+        if not self.enabled:
+            return False
+        return self.used() >= 0.5 * self.total
+
+    def charge_call(self, phase: str, request_text: str, response_text: str) -> None:
+        """Estimate input+output tokens for one LLM call and charge ``phase``.
+
+        Uses ``_msg._estimate_tokens`` so all in-process accounting (planner,
+        snapshot, compaction) agrees on the same rough ``len // 4`` heuristic.
+        """
+        from ._msg import _estimate_tokens
+
+        self.charge(
+            phase, _estimate_tokens(request_text) + _estimate_tokens(response_text)
+        )
+
+    def summary_line(self) -> str | None:
+        """Concise one-line budget summary for ``--quiet`` final output."""
+        if not self.enabled:
+            return None
+        total = self.total
+        used = self.used()
+        pct = 100.0 * used / total if total else 0.0
+        return f"budget: {used:,}/{total:,} tokens used ({pct:.1f}%)"
+
+    def detail_lines(self) -> list[str]:
+        """Per-phase breakdown for verbose/debug output."""
+        if not self.enabled:
+            return []
+        lines: list[str] = []
+        for phase in _BUDGET_PHASES:
+            used = self.used(phase)
+            if used <= 0:
+                continue
+            alloc = self.allocation(phase)
+            pct = 100.0 * used / alloc if alloc else 0.0
+            lines.append(f"  {phase:>12}: {used:,} / {int(alloc):,} ({pct:.1f}%)")
+        return lines
+
+
+# ---------------------------------------------------------------------------
+# Hunt sink/source catalog
+# ---------------------------------------------------------------------------
+
+# Sink-pattern suggestions are starting points; the generator overrides them
+# when Phase 1 evidence is stronger (e.g. when an HTTP entry point clearly
+# applies).
+_HUNT_SINK_CATALOG: dict[str, list[tuple[re.Pattern, str, tuple[str, ...]]]] = {
+    "command_execution": [
+        (
+            re.compile(
+                r"\b(?:os\.system|subprocess\.(?:run|call|check_output|Popen)|shell_exec|exec[lv]?p?|popen)\b",
+                re.I,
+            ),
+            "unauthenticated remote client",
+            ("request body", "query parameter", "header value"),
+        ),
+        (
+            re.compile(r"\b(?:Runtime\.exec|ProcessBuilder|child_process\.exec)\b"),
+            "unauthenticated remote client",
+            ("request body", "query parameter"),
+        ),
+    ],
+    "path_traversal": [
+        (
+            re.compile(
+                r"\b(?:os\.path\.join|open|Path|fopen|readFile|writeFile|sendfile|send_file|serve_file)\b",
+                re.I,
+            ),
+            "unauthenticated remote client",
+            ("file path parameter", "uploaded archive entry", "template name"),
+        ),
+        (
+            re.compile(r"\b(?:ZipFile|TarFile|tarfile\.open|zipfile\.ZipFile)\b"),
+            "crafted file author",
+            ("uploaded archive entry path",),
+        ),
+    ],
+    "ssrf": [
+        (
+            re.compile(
+                r"\b(?:requests\.(?:get|post|put|head|delete)|urllib\.request|httpx\.|fetch|aiohttp\.)\b",
+                re.I,
+            ),
+            "unauthenticated remote client",
+            ("URL parameter", "callback URL", "webhook target"),
+        ),
+        (
+            re.compile(r"\b(?:urlopen|urlretrieve|http\.Client|net/http)\b"),
+            "unauthenticated remote client",
+            ("URL parameter",),
+        ),
+    ],
+    "sqli": [
+        (
+            re.compile(
+                r"\b(?:cursor\.execute|conn\.execute|raw_query|db\.query|prepare)\b",
+                re.I,
+            ),
+            "unauthenticated remote client",
+            ("query parameter", "JSON body field"),
+        ),
+    ],
+    "xxe": [
+        (
+            re.compile(
+                r"\b(?:etree\.parse|xml\.etree|XMLReader|DocumentBuilder|libxml2)\b"
+            ),
+            "unauthenticated remote client",
+            ("uploaded XML payload",),
+        ),
+    ],
+    "deserialization": [
+        (
+            re.compile(r"\b(?:pickle\.loads?|yaml\.load|cPickle|marshal\.loads)\b"),
+            "unauthenticated remote client",
+            ("serialized payload",),
+        ),
+        (
+            re.compile(r"\bObjectInputStream|readObject|unserialize\b"),
+            "unauthenticated remote client",
+            ("serialized payload",),
+        ),
+    ],
+    "xss": [
+        (
+            re.compile(
+                r"\b(?:render_template_string|innerHTML|dangerouslySetInnerHTML|Markup|safe_html|format_html)\b",
+                re.I,
+            ),
+            "unauthenticated remote client",
+            ("HTML body", "search parameter"),
+        ),
+    ],
+    "cryptography": [
+        (
+            re.compile(
+                r"\b(?:verify(?:_signature|_mac)?|hmac\.compare|hashlib\.compare|jwt\.decode|verify_jwt|verify_token)\b",
+                re.I,
+            ),
+            "malicious peer",
+            ("forged signature", "forged JWT", "tampered MAC"),
+        ),
+    ],
+    "memory_safety": [
+        (
+            re.compile(
+                r"\bunsafe\s*\{|memcpy\b|memmove\b|strcpy\b|strncpy\b|sprintf\b|alloca\b"
+            ),
+            "malicious peer",
+            ("length field", "size header", "offset field"),
+        ),
+    ],
+    "parser_differential": [
+        (
+            re.compile(
+                r"\b(?:parse_request|parse_header|HTTP\d?Parser|chunked|content_length|protocol_)\b",
+                re.I,
+            ),
+            "malicious peer",
+            ("framing field", "header value", "chunk size"),
+        ),
+    ],
+    "authorization": [
+        (
+            re.compile(
+                r"\b(?:require_role|has_permission|check_permission|is_admin|@authorize|@requires_role|tenant_id)\b",
+                re.I,
+            ),
+            "authenticated low-privileged user",
+            ("user-controlled identifier", "tenant id in URL"),
+        ),
+    ],
+    "policy_bypass": [
+        (
+            re.compile(
+                r"\b(?:seccomp|capabilit|namespace|chroot|setuid|setgid|prctl)\b",
+                re.I,
+            ),
+            "lower-privileged local user",
+            ("syscall arguments",),
+        ),
+    ],
+    "toctou": [
+        (
+            re.compile(r"\b(?:lstat|stat|access|open|rename|symlink)\b"),
+            "lower-privileged local user",
+            ("symlink target", "racing rename"),
+        ),
+    ],
+    "open_redirect": [
+        (
+            re.compile(
+                r"\b(?:redirect|Location|HttpResponseRedirect|res\.redirect)\b",
+                re.I,
+            ),
+            "unauthenticated remote client",
+            ("return-to parameter",),
+        ),
+    ],
+    "secret_exposure": [
+        (
+            re.compile(r"\b(?:log(?:ger)?\.(?:info|debug|warning|error)|print)\b"),
+            "compromised dependency",
+            ("logged response",),
+        ),
+    ],
+}
+
+
+_LANGUAGE_HINTS: dict[str, str] = {
+    ".py": "python",
+    ".js": "javascript",
+    ".ts": "typescript",
+    ".tsx": "typescript",
+    ".jsx": "javascript",
+    ".go": "go",
+    ".rs": "rust",
+    ".java": "java",
+    ".kt": "kotlin",
+    ".rb": "ruby",
+    ".php": "php",
+    ".c": "c",
+    ".cc": "cpp",
+    ".cpp": "cpp",
+    ".h": "c",
+    ".hpp": "cpp",
+    ".cs": "csharp",
+    ".swift": "swift",
+    ".scala": "scala",
+    ".sh": "shell",
+    ".zig": "zig",
+}
+
+
+def _detect_language(files: list[str]) -> str:
+    """Pick the dominant language extension across ``files``."""
+    counts: dict[str, int] = {}
+    for f in files:
+        for ext, lang in _LANGUAGE_HINTS.items():
+            if f.endswith(ext):
+                counts[lang] = counts.get(lang, 0) + 1
+                break
+    if not counts:
+        return ""
+    return max(counts, key=counts.get)
+
+
+def _build_sink_class_unions() -> dict[
+    str, tuple[re.Pattern, tuple[tuple[re.Pattern, str, tuple[str, ...]], ...]]
+]:
+    """For each attack class, build one union regex plus the per-pattern lookup
+    table needed to recover the matching pattern's suggested attacker position
+    and controlled inputs.
+
+    The union is what gets searched per file: a single ``re.search`` per
+    class per file decides whether to recurse into per-pattern matching
+    (which only happens on files that actually hit). For a repo where most
+    files are inert, the union catches that with one regex op.
+    """
+    out: dict[
+        str, tuple[re.Pattern, tuple[tuple[re.Pattern, str, tuple[str, ...]], ...]]
+    ] = {}
+    for attack_class, entries in _HUNT_SINK_CATALOG.items():
+        union_src = "|".join(f"(?:{e[0].pattern})" for e in entries)
+        flags = entries[0][0].flags if entries else 0
+        union = re.compile(union_src, flags)
+        out[attack_class] = (union, tuple(entries))
+    return out
+
+
+_HUNT_SINK_CLASS_UNIONS = _build_sink_class_unions()
+
+
+def _scan_sink_hits(
+    content_cache: dict[str, str],
+) -> dict[str, list[tuple[str, str, tuple[str, ...]]]]:
+    """Run the sink catalog against the file content cache.
+
+    Returns ``{attack_class: [(file, suggested_position, suggested_inputs), ...]}``.
+    Each file is visited once per class via a unioned regex; on a hit the
+    per-pattern entries are consulted to recover the matching pattern's
+    suggested attacker position and controlled inputs.
+    """
+    by_class: dict[str, list[tuple[str, str, tuple[str, ...]]]] = {}
+    for attack_class, (union, entries) in _HUNT_SINK_CLASS_UNIONS.items():
+        bucket: list[tuple[str, str, tuple[str, ...]]] = []
+        for path, body in content_cache.items():
+            if not body or not union.search(body):
+                continue
+            for pat, pos, inputs in entries:
+                if pat.search(body):
+                    bucket.append((path, pos, inputs))
+                    break
+        if bucket:
+            by_class[attack_class] = bucket
+    return by_class
+
+
+_BOUNDARY_HINT_REGEXES: dict[str, re.Pattern] = {
+    "remote client": re.compile(r"\b(?:api|route|handler|webhook|http)\b", re.I),
+    "peer": re.compile(r"\b(?:peer|protocol|wire|tls|ssl|p2p)\b", re.I),
+    "crafted file": re.compile(r"\b(?:upload|file|archive|zip)\b", re.I),
+}
+
+
+def _infer_trust_boundary(
+    repo_profile: dict | None,
+    suggested_position: str,
+    sink_file: str,
+) -> str:
+    """Pick a concrete trust boundary string from Phase 1 evidence.
+
+    Falls back to the suggested position when Phase 1 does not list anything
+    obviously matching. Reachability is settled later — this is only the
+    *starting* boundary the hunter prompt should orient around.
+    """
+    if not repo_profile:
+        return f"caller of {sink_file}"
+    boundaries = [
+        b for b in repo_profile.get("trust_boundaries", []) if isinstance(b, str)
+    ]
+    auth = [a for a in repo_profile.get("auth_surfaces", []) if isinstance(a, str)]
+    entries = [e for e in repo_profile.get("entry_points", []) if isinstance(e, str)]
+
+    pos = suggested_position.lower()
+    # Each row: (substring trigger, candidate list, hint key). First row whose
+    # substring is in `pos` and whose candidate list is non-empty wins.
+    dispatch = (
+        ("remote client", entries, "remote client"),
+        ("peer", boundaries, "peer"),
+        ("low-privileged", auth, None),
+        ("crafted file", boundaries, "crafted file"),
+    )
+    for trigger, candidates, hint_key in dispatch:
+        if trigger in pos and candidates:
+            if hint_key is None:
+                return candidates[0]
+            hint_re = _BOUNDARY_HINT_REGEXES[hint_key]
+            return min(candidates, key=lambda c, r=hint_re: 0 if r.search(c) else 1)
+    if boundaries:
+        return boundaries[0]
+    if entries:
+        return entries[0]
+    return f"caller of {sink_file}"
+
+
+def _generate_hunt_tasks(
+    state: AuditRunState,
+    content_cache: dict[str, str],
+    *,
+    configured: list[dict] | None = None,
+    max_tasks: int = 0,
+) -> list[HuntTask]:
+    """Build the hunt task queue from Phase 1 evidence plus configured tasks.
+
+    Generation is fully deterministic: same content cache + same configured
+    tasks always produce the same task IDs, which makes resume a no-op and
+    makes test goldens stable.
+
+    Configured tasks (from ``[[audit.hunt_task]]``) come first and never get
+    dropped by ``max_tasks``; they represent operator intent. Scan-derived
+    tasks fill the remainder.
+    """
+    tasks: list[HuntTask] = []
+    task_ids: set[str] = set()
+
+    def _push(task: HuntTask) -> None:
+        try:
+            _validate_hunt_task(task)
+        except HuntTaskValidationError as e:
+            _debug_log("hunt_task_rejected", error=str(e), task_id=task.id)
+            return
+        if task.id in task_ids:
+            return
+        task_ids.add(task.id)
+        tasks.append(task)
+
+    # 1) Configured tasks (operator intent first).
+    for entry in configured or []:
+        attack_class = str(entry.get("attack_class", "")).strip()
+        attacker_position = str(entry.get("attacker_position", "")).strip()
+        if not attack_class or not attacker_position:
+            continue
+        controlled_inputs = entry.get("controlled_inputs") or []
+        if isinstance(controlled_inputs, str):
+            controlled_inputs = [controlled_inputs]
+        trust_boundary = str(entry.get("trust_boundary_crossed", "")).strip()
+        if not trust_boundary:
+            trust_boundary = str(entry.get("trust_boundary", "")).strip()
+        scope_hint = str(entry.get("scope", entry.get("scope_hint", ""))).strip()
+        seed_files = [
+            f
+            for f in state.scope.mandatory_files
+            if not scope_hint or _match_path_glob(f, scope_hint)
+        ]
+        seed_files = seed_files[:20]
+        priority = str(entry.get("priority", "high")).strip() or "high"
+        tid = _hunt_task_id(
+            attack_class, attacker_position, scope_hint, seed_files, "cfg"
+        )
+        _push(
+            HuntTask(
+                id=tid,
+                task_kind="hunt",
+                attack_class=attack_class,
+                attacker_position=attacker_position,
+                controlled_inputs=list(controlled_inputs),
+                trust_boundary_crossed=trust_boundary,
+                scope_hint=scope_hint,
+                seed_files=seed_files,
+                seed_symbols=[],
+                sink_files=list(seed_files[:5]),
+                source="user",
+                priority=priority,
+                language_hint=_detect_language(seed_files),
+            )
+        )
+
+    # 2) Scan-derived tasks from Phase 1 + sink catalog.
+    sink_hits = _scan_sink_hits(content_cache)
+    for attack_class, hits in sink_hits.items():
+        # Group sink hits by inferred entry boundary so we get one task per
+        # boundary rather than one per file (the latter would explode in
+        # large repos and produce hundreds of effectively-identical prompts).
+        groups: dict[str, list[tuple[str, str, tuple[str, ...]]]] = {}
+        for path, pos, inputs in hits:
+            boundary = _infer_trust_boundary(state.repo_profile, pos, path)
+            key = f"{pos}|{boundary}"
+            groups.setdefault(key, []).append((path, pos, inputs))
+
+        for key, items in groups.items():
+            pos, boundary = key.split("|", 1)
+            seed_files = [p for p, _, _ in items[:10]]
+            controlled: list[str] = []
+            for _p, _pos, inputs in items[:3]:
+                for c in inputs:
+                    if c and c not in controlled:
+                        controlled.append(c)
+            seed_symbols: list[str] = []
+            for f in seed_files[:3]:
+                body = content_cache.get(f, "")
+                if not body:
+                    continue
+                for s in _extract_exports(body):
+                    if s not in seed_symbols:
+                        seed_symbols.append(s)
+                        if len(seed_symbols) >= 6:
+                            break
+                if len(seed_symbols) >= 6:
+                    break
+            scope_hint = ""
+            if len(seed_files) == 1:
+                scope_hint = seed_files[0]
+            tid = _hunt_task_id(attack_class, pos, boundary, seed_files)
+            priority = (
+                "high" if state.attack_scores.get(seed_files[0], 0) >= 5 else "medium"
+            )
+            _push(
+                HuntTask(
+                    id=tid,
+                    task_kind="hunt",
+                    attack_class=attack_class,
+                    attacker_position=pos,
+                    controlled_inputs=controlled or ["attacker-controlled input"],
+                    trust_boundary_crossed=boundary,
+                    scope_hint=scope_hint,
+                    seed_files=seed_files,
+                    seed_symbols=seed_symbols,
+                    sink_files=seed_files,
+                    source="phase1",
+                    priority=priority,
+                    language_hint=_detect_language(seed_files),
+                )
+            )
+
+    if max_tasks and len(tasks) > max_tasks:
+        # Keep configured tasks (which were pushed first) and trim the tail.
+        kept_configured = [t for t in tasks if t.source == "user"]
+        rest = [t for t in tasks if t.source != "user"]
+        # Prefer ``high`` over ``medium`` over ``low`` when trimming.
+        priority_rank = {"high": 0, "medium": 1, "low": 2}
+        rest.sort(key=lambda t: (priority_rank.get(t.priority, 3), t.id))
+        room = max(0, max_tasks - len(kept_configured))
+        tasks = kept_configured + rest[:room]
+
+    return tasks
+
+
+def _hunt_task_id(
+    attack_class: str,
+    attacker_position: str,
+    scope_hint: str,
+    seed_files: list[str],
+    suffix: str = "",
+) -> str:
+    """Deterministic, short, human-readable task id.
+
+    Format: ``{class}-{first8(hash)}``. Inputs are normalised so that the same
+    logical task produced on different runs gets the same id, which keeps the
+    resume path stable.
+    """
+    payload = "|".join(
+        [
+            attack_class.strip().lower(),
+            attacker_position.strip().lower(),
+            scope_hint.strip(),
+            ",".join(sorted(s.strip() for s in seed_files if s.strip())),
+            suffix.strip(),
+        ]
+    )
+    h = hashlib.sha256(payload.encode()).hexdigest()[:8]
+    return f"{attack_class}-{h}"
 
 
 @dataclass
@@ -268,6 +1027,22 @@ class AuditRunState:
     # mandatory set; findings whose source path is not in this set are
     # tagged as having been a triage SKIP.
     measurement_escalated_paths: set[str] = field(default_factory=set)
+    # Hunt-harness state. All optional; bare ``/audit`` does not populate these
+    # unless ``--hunt`` is set.
+    hunt_mode: bool = False
+    hunt_tasks: dict[str, HuntTask] = field(default_factory=dict)
+    coverage_records: dict[str, CoverageRecord] = field(default_factory=dict)
+    adversarial_state: dict[str, dict] = field(default_factory=dict)
+    root_cause_groups: list[RootCauseGroup] = field(default_factory=list)
+    trace_state: dict[str, dict] = field(default_factory=dict)
+    proof_strict: bool = False
+    trace_reachability: bool = False
+    budget_tokens: int = 0
+    # Token consumption is tallied per top-level phase; the keys are the same
+    # phase labels we already use in `state.phase` plus a few sub-buckets.
+    budget_used: dict[str, int] = field(default_factory=dict)
+    # Per-attack-class metrics: ``{class: {"proposed": int, "verified": int}}``.
+    attack_class_metrics: dict[str, dict[str, int]] = field(default_factory=dict)
 
     @property
     def dependency_index(self) -> dict[str, list[str]]:
@@ -297,6 +1072,9 @@ class AuditRunState:
                     "correctness_reason": vf.correctness_reason,
                     "rebuttal_reason": vf.rebuttal_reason,
                     "reproducer": vf.reproducer,
+                    "adversarial": vf.adversarial,
+                    "trace": vf.trace,
+                    "root_cause_group_id": vf.root_cause_group_id,
                 }
                 for vf in self.verified_findings
             ],
@@ -311,6 +1089,19 @@ class AuditRunState:
             "select_all": self.select_all,
             "measure_triage": self.measure_triage,
             "measurement_escalated_paths": sorted(self.measurement_escalated_paths),
+            "hunt_mode": self.hunt_mode,
+            "hunt_tasks": {k: asdict(v) for k, v in self.hunt_tasks.items()},
+            "coverage_records": {
+                k: asdict(v) for k, v in self.coverage_records.items()
+            },
+            "adversarial_state": self.adversarial_state,
+            "root_cause_groups": [asdict(g) for g in self.root_cause_groups],
+            "trace_state": self.trace_state,
+            "proof_strict": self.proof_strict,
+            "trace_reachability": self.trace_reachability,
+            "budget_tokens": self.budget_tokens,
+            "budget_used": self.budget_used,
+            "attack_class_metrics": self.attack_class_metrics,
         }
         state_path = d / "state.json"
         tmp = state_path.with_suffix(".tmp")
@@ -334,6 +1125,9 @@ class AuditRunState:
                     correctness_reason=vf["correctness_reason"],
                     rebuttal_reason=vf["rebuttal_reason"],
                     reproducer=vf.get("reproducer"),
+                    adversarial=vf.get("adversarial"),
+                    trace=vf.get("trace"),
+                    root_cause_group_id=vf.get("root_cause_group_id", ""),
                 )
             )
         if "artifact_state" not in blob:
@@ -341,6 +1135,14 @@ class AuditRunState:
                 f"audit state file at {state_dir / run_id / 'state.json'} predates "
                 "the artifact_state field. Re-run /audit from scratch."
             )
+
+        hunt_tasks = {k: HuntTask(**v) for k, v in blob.get("hunt_tasks", {}).items()}
+        coverage_records = {
+            k: CoverageRecord(**v) for k, v in blob.get("coverage_records", {}).items()
+        }
+        root_cause_groups = [
+            RootCauseGroup(**g) for g in blob.get("root_cause_groups", [])
+        ]
 
         state = cls(
             run_id=blob["run_id"],
@@ -366,6 +1168,17 @@ class AuditRunState:
             measurement_escalated_paths=set(
                 blob.get("measurement_escalated_paths", [])
             ),
+            hunt_mode=bool(blob.get("hunt_mode", False)),
+            hunt_tasks=hunt_tasks,
+            coverage_records=coverage_records,
+            adversarial_state=blob.get("adversarial_state", {}),
+            root_cause_groups=root_cause_groups,
+            trace_state=blob.get("trace_state", {}),
+            proof_strict=bool(blob.get("proof_strict", False)),
+            trace_reachability=bool(blob.get("trace_reachability", False)),
+            budget_tokens=int(blob.get("budget_tokens", 0)),
+            budget_used=blob.get("budget_used", {}),
+            attack_class_metrics=blob.get("attack_class_metrics", {}),
         )
         return state
 
@@ -1648,6 +2461,156 @@ Explicitly out of scope — emit nothing for these even when the bug is real:
 
 Only report bugs where the structured fields specifically answer attacker / trigger / gain — for example "unauthenticated open redirect on failed form auth" or "out-of-bounds read on attacker-supplied trailing CR" — or where the security_control_failure carve-out lets the cited function's own job (an Ed25519 verifier, a seccomp policy enforcer) supply the security context."""
 
+# ---------------------------------------------------------------------------
+# Phase Hunt prompts (replaces Phase 3a for `/audit --hunt`)
+# ---------------------------------------------------------------------------
+
+_PHASE_HUNT_FINDING_SCHEMA = PhaseSchema(
+    record=RecordSchema(
+        name="finding",
+        required=(
+            "title",
+            "severity",
+            "location",
+            "local_bug",
+            "source_boundary",
+            "sink_operation",
+            "reachability_status",
+            "claim",
+        ),
+        enums={
+            "severity": _SEVERITIES,
+            "reachability_status": (
+                "reachable",
+                "local_only",
+                "unknown",
+                "not_reachable",
+            ),
+        },
+        repeated={
+            "controlled_input": "controlled_inputs",
+            "reachability_step": "reachability_path",
+            "exploit_chain_step": "exploit_chain",
+        },
+    ),
+    cardinality="zero_or_more",
+    allow_none=True,
+)
+
+_PHASE_HUNT_COVERAGE_SCHEMA = PhaseSchema(
+    record=RecordSchema(
+        name="coverage",
+        required=("confidence",),
+        enums={"confidence": ("high", "medium", "low")},
+        repeated={
+            "observed_file": "observed_files",
+            "observed_symbol": "observed_symbols",
+            "observed_edge": "observed_edges",
+            "not_covered": "not_covered",
+            "followup_task": "followup_tasks",
+        },
+    ),
+    cardinality="zero_or_one",
+    allow_none=True,
+)
+
+_PHASE_HUNT_WORKED_EXAMPLE = """\
+@@ finding @@
+title: callback_url reaches outbound fetch without host allowlist
+severity: high
+location: src/clients/fetch.py:42
+local_bug: outbound HTTP GET trusts caller-supplied URL with no host or scheme check
+source_boundary: POST /webhook handler
+controlled_input: callback_url JSON field
+reachability_step: POST /webhook
+reachability_step: handle_webhook
+reachability_step: client.fetch_remote
+sink_operation: requests.get(url)
+reachability_status: reachable
+exploit_chain_step: attacker sends POST /webhook with callback_url=http://169.254.169.254/
+exploit_chain_step: server retrieves cloud metadata
+claim: SSRF: attacker controls callback_url end-to-end into requests.get
+
+@@ coverage @@
+observed_file: src/api/webhook.py
+observed_file: src/clients/fetch.py
+observed_symbol: handle_webhook
+observed_symbol: fetch_remote
+observed_edge: src/api/webhook.py->src/clients/fetch.py
+not_covered: did not inspect retry path in src/clients/retry.py
+followup_task: ssrf | unauthenticated remote client | retry URL parameter | retry path uncovered
+confidence: medium"""
+
+_PHASE_HUNT_SYSTEM = f"""\
+You are a vulnerability hunter running one narrow task in a staged audit.
+
+Each task gives you exactly one attack class, one attacker model, and a small
+evidence bundle. Do not broaden the search. Do not look for other bug classes
+on this task; that work belongs to other tasks.
+
+You have no tools, no shell access, and no ability to run commands.
+All the source code you need is included below. Do not request additional information.
+
+Output format:
+- Zero, one, two, or three `@@ finding @@` blocks. If you find no bug, emit the
+  single line `@@ none @@` in place of any finding blocks.
+- Then exactly one `@@ coverage @@` block, even when you emitted `@@ none @@`.
+
+Each `@@ finding @@` block has these keys, one per line. Use exactly the keys
+shown. Do not quote, escape, or wrap values. Each value runs to the end of its
+line. Omit repeated keys entirely when there is nothing to add for them.
+
+- title: short attacker-anchored title
+- severity: low | medium | high | critical
+- location: path:line of the sink
+- local_bug: one short sentence describing the invariant break or unsafe sink
+- source_boundary: where attacker-controlled data first enters the code, exact
+  named entry point or trust boundary
+- controlled_input: each attacker-controlled input (parameter, header, file,
+  field) on its own line
+- reachability_step: each step in the data path from source to sink on its own
+  line, in order; aim for one line per file or function
+- sink_operation: the exact dangerous operation reached (e.g. `requests.get`,
+  `subprocess.run`, `pickle.loads`)
+- reachability_status: reachable | local_only | unknown | not_reachable
+- exploit_chain_step: each concrete attacker action on its own line, in order
+- claim: one-line bug statement under 20 words
+
+Rules:
+- Investigate exactly one attack class for exactly one attacker model.
+- Use the supplied seed files and symbols first; only follow bounded edges
+  from the dependency graph.
+- Every finding must answer: who is the attacker, what input do they control,
+  what is the reachable security-relevant outcome.
+- Report zero findings rather than a speculative finding.
+- At most three findings per task.
+- If you cannot prove attacker reachability from the named source boundary,
+  set `reachability_status: local_only` and let the harness queue a reachability
+  task. Do not invent reachability.
+
+The `@@ coverage @@` block has these keys, one per line:
+- observed_file: each file you actually inspected, one per line
+- observed_symbol: each symbol or function you examined, one per line
+- observed_edge: dataflow or import edges you followed, as `src->dst`, one per
+  line
+- not_covered: each scope item you did not inspect, one per line; use this
+  field aggressively — under-claiming coverage is safer than overclaiming
+- followup_task: each suggested next task as
+  `attack_class | attacker_position | controlled_input | scope_hint | reason`,
+  one per line; omit when nothing comes to mind
+- confidence: high | medium | low — your own honest read of how much of the
+  task scope you actually examined
+
+Do not certify broad coverage in prose. The `not_covered` and `confidence`
+fields are the only coverage signal the harness trusts.
+
+Worked example:
+
+{_PHASE_HUNT_WORKED_EXAMPLE}
+
+End of example. Now run the real hunt for the task below."""
+
+
 _PHASE3B_OUT_OF_SCOPE_TYPE = "out-of-scope"
 _PHASE3B_SECURITY_CONTROL_FAILURE_TYPE = "security_control_failure"
 
@@ -2415,6 +3378,268 @@ def _phase3a_inventory(
     )
 
 
+def _build_hunt_user_prompt(
+    task: HuntTask,
+    state: AuditRunState,
+    file_evidence: dict[str, str],
+) -> str:
+    """Assemble the per-task user prompt for a hunter call."""
+    profile_json = _repo_profile_json(state)
+    seed_lines = []
+    for f in task.seed_files[:5]:
+        body = file_evidence.get(f, "")
+        if not body:
+            continue
+        if len(body) > _HUNT_SEED_FILE_CAP:
+            body = body[:_HUNT_SEED_FILE_CAP] + _AUDIT_TRUNCATION_MARKER
+        seed_lines.append(f"--- {f} ---\n{body}")
+    related = "\n\n".join(seed_lines) if seed_lines else "(seed file evidence missing)"
+
+    sinks = ", ".join(task.sink_files[:8]) or "(none)"
+    syms = ", ".join(task.seed_symbols[:8]) or "(none)"
+    controlled = "\n".join(f"  - {c}" for c in task.controlled_inputs)
+    language = task.language_hint or "(unknown)"
+
+    language_note = ""
+    if task.language_hint == "rust":
+        language_note = (
+            "Rust-specific hints: pay attention to `unsafe` blocks, FFI boundaries, "
+            "lifetime extensions, `Pin`/`Send`/`Sync` violations, and unchecked "
+            "transmutes. Index/slice operations are bounds-checked unless `unchecked` "
+            "is used; report only when the unsafe path is actually reached.\n"
+        )
+    elif task.language_hint in ("c", "cpp"):
+        language_note = (
+            "C/C++-specific hints: focus on length math, allocator return checks, "
+            "`memcpy`/`memmove` size arguments, return-value misuse, and signed/"
+            "unsigned conversions. Treat undefined behavior as a finding only when "
+            "an attacker can supply the triggering input.\n"
+        )
+    elif task.language_hint in ("python", "javascript", "typescript", "ruby", "php"):
+        language_note = (
+            f"{task.language_hint.title()}-specific hints: focus on framework "
+            "decorators (route handlers, permission gates), serializer/loader APIs, "
+            "and shell-out helpers. Report only when an external request boundary "
+            "actually controls the input.\n"
+        )
+
+    return (
+        f"Hunt task: {task.id}\n"
+        f"Attack class: {task.attack_class}\n"
+        f"Attacker model: {task.attacker_position}\n"
+        f"Controlled inputs:\n{controlled}\n"
+        f"Trust boundary crossed: {task.trust_boundary_crossed}\n"
+        f"Scope hint: {task.scope_hint or '(unbounded — use seed files)'}\n"
+        f"Seed files: {', '.join(task.seed_files) or '(none)'}\n"
+        f"Seed symbols: {syms}\n"
+        f"Candidate sink files: {sinks}\n"
+        f"Dominant language: {language}\n\n"
+        f"{language_note}"
+        f"Repository profile:\n{profile_json}\n\n"
+        f"Committed seed-file evidence:\n{related}\n\n"
+        f"Now perform the hunt. Emit at most three `@@ finding @@` blocks (or `@@ none @@`) "
+        f"followed by exactly one `@@ coverage @@` block."
+    )
+
+
+def _parse_hunt_response(
+    raw: str, metrics: dict[str, int]
+) -> tuple[list[dict], dict | None]:
+    """Split a hunter response into (finding_dicts, coverage_dict or None).
+
+    The hunter emits ``@@ finding @@`` blocks (≤3) followed by exactly one
+    ``@@ coverage @@`` block, or ``@@ none @@`` plus the coverage block when
+    there is nothing to report. The two record families share the ``@@ ... @@``
+    delimiter so we parse them via the standard ``_parse_records`` helper after
+    splitting on the coverage marker.
+    """
+    # Split on the coverage header. The coverage section is always last.
+    parts = re.split(r"^\s*@@\s*coverage\s*@@\s*$", raw, maxsplit=1, flags=re.M)
+    finding_part = parts[0]
+    coverage_part = parts[1] if len(parts) == 2 else ""
+
+    try:
+        findings = _parse_records(
+            finding_part, _PHASE_HUNT_FINDING_SCHEMA, metrics=metrics
+        )
+    except ValueError:
+        findings = []
+
+    coverage: dict | None = None
+    if coverage_part.strip():
+        # Re-prefix so _parse_records sees the standard ``@@ coverage @@`` line
+        try:
+            records = _parse_records(
+                "@@ coverage @@\n" + coverage_part,
+                _PHASE_HUNT_COVERAGE_SCHEMA,
+                metrics=metrics,
+            )
+            coverage = records[0] if records else None
+        except ValueError:
+            coverage = None
+
+    return findings, coverage
+
+
+def _hunt_finding_to_record(
+    raw: dict,
+    task: HuntTask,
+) -> FindingRecord:
+    """Normalise one hunter ``@@ finding @@`` block into a FindingRecord."""
+    severity = (raw.get("severity") or "low").strip().lower()
+    if severity not in _SEVERITIES:
+        severity = "low"
+
+    location = raw.get("location") or (task.seed_files[0] if task.seed_files else "")
+    locations = [location] if isinstance(location, str) else list(location or [])
+    controlled = raw.get("controlled_inputs", []) or list(task.controlled_inputs)
+    path = raw.get("reachability_path", []) or []
+    chain = raw.get("exploit_chain", []) or []
+    status = (raw.get("reachability_status") or "unknown").strip().lower()
+    if status not in ("reachable", "local_only", "not_reachable", "unknown"):
+        status = "unknown"
+
+    proof_lines = [
+        f"local_bug: {raw.get('local_bug', '')}",
+        f"source_boundary: {raw.get('source_boundary', '')}",
+        f"sink_operation: {raw.get('sink_operation', '')}",
+        f"reachability_status: {status}",
+        f"claim: {raw.get('claim', '')}",
+    ]
+    if path:
+        proof_lines.append("reachability_path: " + " -> ".join(path))
+    if chain:
+        proof_lines.append("exploit_chain: " + " -> ".join(chain))
+
+    if task.seed_files:
+        source_file = task.seed_files[0]
+    elif locations:
+        source_file = locations[0]
+    else:
+        source_file = ""
+
+    return FindingRecord(
+        title=raw.get("title", "untitled"),
+        finding_type=task.attack_class or "vulnerability",
+        severity=severity,
+        locations=locations,
+        preconditions=[],
+        proof=[p for p in proof_lines if not p.endswith(": ")],
+        fix_outline="",
+        source_file=source_file,
+        local_bug=raw.get("local_bug", ""),
+        source_boundary=raw.get("source_boundary", ""),
+        reachability_path=list(path),
+        sink_operation=raw.get("sink_operation", ""),
+        exploit_chain=list(chain),
+        reachability_status=status,
+        hunt_task_id=task.id,
+        attack_class=task.attack_class,
+        attacker_position=task.attacker_position,
+        controlled_inputs=list(controlled),
+    )
+
+
+def _coverage_record_from_parsed(
+    task: HuntTask,
+    state: AuditRunState,
+    parsed: dict | None,
+) -> CoverageRecord:
+    """Build a CoverageRecord from the parsed coverage block plus task scope.
+
+    The observed-coverage signal comes only from what the hunter actually
+    reported; we never derive coverage from prompt content or seed files alone,
+    per the plan ("Self-reported coverage is unreliable. ... Coverage must be
+    derived from observable evidence where possible.")
+    """
+    parsed = parsed or {}
+    observed_files = list(parsed.get("observed_files", []) or [])
+    observed_symbols = list(parsed.get("observed_symbols", []) or [])
+    observed_edges = list(parsed.get("observed_edges", []) or [])
+    not_covered = list(parsed.get("not_covered", []) or [])
+    confidence = (parsed.get("confidence") or "low").strip().lower()
+    if confidence not in ("high", "medium", "low"):
+        confidence = "low"
+
+    # Map observed signals back to the task seed/sink set for user-facing ratios.
+    seed_set = {f for f in task.seed_files if f}
+    sink_set = {f for f in task.sink_files if f}
+    observed_set = {f for f in observed_files if f}
+    seed_hits = observed_set & seed_set
+    sink_hits = observed_set & sink_set
+    covered_seed = (
+        len(seed_hits) / len(seed_set) if seed_set else (1.0 if observed_set else 0.0)
+    )
+    covered_sink = (
+        len(sink_hits) / len(sink_set) if sink_set else (1.0 if observed_set else 0.0)
+    )
+    unobserved_seeds = sorted(seed_set - observed_set)
+
+    return CoverageRecord(
+        task_id=task.id,
+        observed_files=observed_files,
+        observed_symbols=observed_symbols,
+        observed_edges=observed_edges,
+        covered_fraction_of_seed_files=round(covered_seed, 3),
+        covered_fraction_of_sink_hits=round(covered_sink, 3),
+        unobserved_high_priority_seeds=unobserved_seeds,
+        explicit_not_covered=not_covered,
+        followup_task_ids=[],
+        confidence=confidence,
+    )
+
+
+def _phase_hunt_one(
+    task: HuntTask,
+    state: AuditRunState,
+    ctx: InputContext,
+) -> tuple[list[FindingRecord], CoverageRecord, str | None]:
+    """Run a single hunter task. Returns ``(findings, coverage, error)``.
+
+    The function never raises: failures are reported in the third tuple slot so
+    the parallel batch executor can keep going.
+    """
+    try:
+        _validate_hunt_task(task)
+    except HuntTaskValidationError as e:
+        return ([], CoverageRecord(task_id=task.id), f"invalid task: {e}")
+
+    budget = BudgetPlanner(state)
+    if budget.exhausted():
+        return (
+            [],
+            CoverageRecord(task_id=task.id),
+            "budget exhausted before task started",
+        )
+
+    # Read the committed snapshot via the batched git-cat-file helper instead
+    # of one shell-out per file.
+    file_evidence = _load_file_contents(task.seed_files[:5], ctx.base_dir)
+
+    user_prompt = _build_hunt_user_prompt(task, state, file_evidence)
+    messages = [
+        {"role": "system", "content": _PHASE_HUNT_SYSTEM},
+        {"role": "user", "content": user_prompt},
+    ]
+    try:
+        raw = _call_audit_llm(ctx, messages, trace_task=f"audit: hunt {task.id}")
+    except Exception as e:
+        return ([], CoverageRecord(task_id=task.id), f"llm error: {e}")
+
+    budget.charge_call("hunt", user_prompt, raw)
+
+    findings_raw, coverage_raw = _parse_hunt_response(raw, state.metrics)
+    findings = [_hunt_finding_to_record(f, task) for f in findings_raw[:3]]
+    coverage = _coverage_record_from_parsed(task, state, coverage_raw)
+
+    bucket = state.attack_class_metrics.setdefault(
+        task.attack_class, {"proposed": 0, "verified": 0}
+    )
+    bucket["proposed"] = int(bucket.get("proposed", 0)) + len(findings)
+
+    return (findings, coverage, None)
+
+
 def _phase3b_expand_one(
     item: tuple[dict, str, str, AuditRunState, InputContext],
 ) -> dict | None:
@@ -3076,21 +4301,38 @@ def _mark_artifact_failed(
 # ---------------------------------------------------------------------------
 
 
-def _load_audit_config(
-    base_dir: str,
-) -> tuple[list[str], dict[str, str], int | None]:
+def _load_audit_config(base_dir: str) -> dict:
     """Load merged ``[audit]`` settings from global+project config.
 
-    Returns ``(force_review_globs, sources, patch_max_turns)``. Errors loading
-    config are non-fatal here: the rest of swival has already validated the file
-    at startup, so failures are reported as warnings and treated as defaults.
+    Returns a dict with keys ``force_review``, ``force_review_sources``,
+    ``patch_max_turns``, ``budget_tokens``, ``max_gapfill_tasks``,
+    ``max_hunt_tasks``, ``proof_strict``, ``reviewer_profile``,
+    ``reviewer_model``, ``hunt_tasks``. Errors loading config are non-fatal: the
+    rest of swival has already validated the file at startup, so failures are
+    reported as warnings and treated as defaults.
     """
+    empty = {
+        "force_review": [],
+        "force_review_sources": {},
+        "patch_max_turns": None,
+        "budget_tokens": None,
+        "max_gapfill_tasks": None,
+        "max_hunt_tasks": None,
+        "proof_strict": None,
+        "reviewer_profile": "",
+        "reviewer_model": "",
+        "hunt_tasks": [],
+    }
     try:
         from .config import (
             _load_single,
             global_config_dir,
+            merge_audit_bool,
             merge_audit_force_review,
+            merge_audit_hunt_tasks,
+            merge_audit_int,
             merge_audit_patch_max_turns,
+            merge_audit_reviewer,
         )
 
         global_path = global_config_dir() / "config.toml"
@@ -3099,10 +4341,25 @@ def _load_audit_config(
         project_audit = _load_single(project_path, str(project_path)).get("audit")
     except Exception as e:
         fmt.warning(f"audit: ignoring swival.toml audit config (load failed: {e})")
-        return [], {}, None
+        return empty
     globs, sources = merge_audit_force_review(global_audit, project_audit)
-    patch_max_turns = merge_audit_patch_max_turns(global_audit, project_audit)
-    return globs, sources, patch_max_turns
+    profile, model = merge_audit_reviewer(global_audit, project_audit)
+    return {
+        "force_review": globs,
+        "force_review_sources": sources,
+        "patch_max_turns": merge_audit_patch_max_turns(global_audit, project_audit),
+        "budget_tokens": merge_audit_int(global_audit, project_audit, "budget_tokens"),
+        "max_gapfill_tasks": merge_audit_int(
+            global_audit, project_audit, "max_gapfill_tasks"
+        ),
+        "max_hunt_tasks": merge_audit_int(
+            global_audit, project_audit, "max_hunt_tasks"
+        ),
+        "proof_strict": merge_audit_bool(global_audit, project_audit, "proof_strict"),
+        "reviewer_profile": profile,
+        "reviewer_model": model,
+        "hunt_tasks": merge_audit_hunt_tasks(global_audit, project_audit),
+    }
 
 
 def _resolve_force_review(
@@ -3145,7 +4402,12 @@ def run_audit_command(cmd_arg: str, ctx: InputContext) -> str:
     debug = False
     select_all = False
     measure_triage = False
+    hunt_mode = False
+    proof_strict = False
+    trace_reachability = False
     patch_max_turns_cli: int | None = None
+    budget_tokens_cli: int | None = None
+    gapfill_cli: int | None = None
     finding_selector: str | None = None
     focus: list[str] | None = None
 
@@ -3163,6 +4425,12 @@ def run_audit_command(cmd_arg: str, ctx: InputContext) -> str:
             select_all = True
         elif parts[i] == "--measure-triage":
             measure_triage = True
+        elif parts[i] == "--hunt":
+            hunt_mode = True
+        elif parts[i] == "--proof-strict":
+            proof_strict = True
+        elif parts[i] == "--trace-reachability":
+            trace_reachability = True
         elif parts[i] == "--workers":
             if i + 1 >= len(parts):
                 return "error: --workers requires an integer"
@@ -3181,6 +4449,26 @@ def run_audit_command(cmd_arg: str, ctx: InputContext) -> str:
                 return f"error: --patch-max-turns requires an integer, got {parts[i]!r}"
             if patch_max_turns_cli < 1:
                 return "error: --patch-max-turns must be at least 1"
+        elif parts[i] == "--budget-tokens":
+            if i + 1 >= len(parts):
+                return "error: --budget-tokens requires an integer"
+            i += 1
+            try:
+                budget_tokens_cli = int(parts[i].replace("_", "").replace(",", ""))
+            except ValueError:
+                return f"error: --budget-tokens requires an integer, got {parts[i]!r}"
+            if budget_tokens_cli < 0:
+                return "error: --budget-tokens must be non-negative"
+        elif parts[i] == "--gapfill":
+            if i + 1 >= len(parts):
+                return "error: --gapfill requires an integer"
+            i += 1
+            try:
+                gapfill_cli = int(parts[i])
+            except ValueError:
+                return f"error: --gapfill requires an integer, got {parts[i]!r}"
+            if gapfill_cli < 0:
+                return "error: --gapfill must be non-negative"
         elif parts[i] == "--finding":
             if finding_selector is not None:
                 return "error: --finding may only be provided once; use --finding 2,5"
@@ -3192,8 +4480,8 @@ def run_audit_command(cmd_arg: str, ctx: InputContext) -> str:
             return (
                 f"error: unknown option {parts[i]!r}. "
                 f"Known flags: --resume, --regen, --debug, --all, "
-                f"--measure-triage, --workers N, --patch-max-turns N, "
-                f"--finding N."
+                f"--measure-triage, --hunt, --workers N, --patch-max-turns N, "
+                f"--budget-tokens N, --finding N."
             )
         else:
             filtered.append(parts[i])
@@ -3204,14 +4492,48 @@ def run_audit_command(cmd_arg: str, ctx: InputContext) -> str:
     if finding_selector is not None and not regen:
         return "error: --finding requires --regen"
 
-    force_review, force_review_sources, config_patch_max_turns = _load_audit_config(
-        base_dir
-    )
+    if proof_strict:
+        return (
+            "error: --proof-strict is reserved for the upcoming adversarial "
+            "disproof gate; not yet implemented."
+        )
+    if trace_reachability:
+        return (
+            "error: --trace-reachability is reserved for the upcoming in-repo "
+            "reachability trace phase; not yet implemented."
+        )
+    if gapfill_cli is not None:
+        return (
+            "error: --gapfill is reserved for the upcoming observable-coverage "
+            "gapfill phase; not yet implemented."
+        )
+
+    audit_cfg = _load_audit_config(base_dir)
+    force_review = audit_cfg["force_review"]
+    force_review_sources = audit_cfg["force_review_sources"]
+    config_patch_max_turns = audit_cfg["patch_max_turns"]
     patch_max_turns = (
         patch_max_turns_cli
         if patch_max_turns_cli is not None
         else config_patch_max_turns or _DEFAULT_PATCH_MAX_TURNS
     )
+    budget_tokens = (
+        budget_tokens_cli
+        if budget_tokens_cli is not None
+        else int(audit_cfg.get("budget_tokens") or 0)
+    )
+    if audit_cfg.get("proof_strict") is True:
+        return (
+            "error: [audit] proof_strict = true is reserved for the upcoming "
+            "adversarial disproof gate; not yet implemented."
+        )
+    if int(audit_cfg.get("max_gapfill_tasks") or 0) > 0:
+        return (
+            "error: [audit] max_gapfill_tasks is reserved for the upcoming "
+            "observable-coverage gapfill phase; not yet implemented."
+        )
+    max_hunt_tasks = int(audit_cfg.get("max_hunt_tasks") or 0)
+    configured_hunt_tasks = list(audit_cfg.get("hunt_tasks") or [])
 
     if debug:
         log_dir = Path(base_dir) / ".swival" / "audit"
@@ -3240,6 +4562,10 @@ def run_audit_command(cmd_arg: str, ctx: InputContext) -> str:
             measure_triage=measure_triage,
             patch_max_turns=patch_max_turns,
             finding_selector=finding_selector,
+            hunt_mode=hunt_mode,
+            budget_tokens=budget_tokens,
+            max_hunt_tasks=max_hunt_tasks,
+            configured_hunt_tasks=configured_hunt_tasks,
         )
     finally:
         _debug_log_path = None
@@ -3261,7 +4587,12 @@ def _run_audit_phases(
     measure_triage: bool = False,
     patch_max_turns: int = _DEFAULT_PATCH_MAX_TURNS,
     finding_selector: str | None = None,
+    hunt_mode: bool = False,
+    budget_tokens: int = 0,
+    max_hunt_tasks: int = 0,
+    configured_hunt_tasks: list[dict] | None = None,
 ) -> str:
+    configured_hunt_tasks = list(configured_hunt_tasks or [])
     force_review = list(force_review or [])
     force_review_sources = dict(force_review_sources or {})
     selected_indexes: set[int] | None = None
@@ -3285,6 +4616,17 @@ def _run_audit_phases(
                 f"{'measure-triage' if measure_triage else 'normal'}. "
                 f"Start a fresh run instead of resuming."
             )
+        if hunt_mode != state.hunt_mode:
+            return (
+                f"error: --hunt mismatch. saved run was "
+                f"{'hunt' if state.hunt_mode else 'file-centric'}; "
+                f"this invocation is {'hunt' if hunt_mode else 'file-centric'}. "
+                f"Start a fresh run instead of resuming."
+            )
+        # Budget override on resume is opt-in: 0 (the default when no flag is
+        # passed) keeps the saved cap. To disable, start a fresh run.
+        if budget_tokens is not None and int(budget_tokens) > 0:
+            state.budget_tokens = int(budget_tokens)
         if regen:
             if not state.verified_findings:
                 return "error: no verified findings to regenerate artifacts for."
@@ -3325,13 +4667,22 @@ def _run_audit_phases(
             state_dir=state_dir,
             select_all=select_all,
             measure_triage=measure_triage,
+            hunt_mode=hunt_mode,
+            budget_tokens=int(budget_tokens or 0),
         )
-        all_marker = " --all" if state.select_all else ""
-        measure_marker = " --measure-triage" if state.measure_triage else ""
+        mode_flags = []
+        if state.select_all:
+            mode_flags.append("--all")
+        if state.measure_triage:
+            mode_flags.append("--measure-triage")
+        if state.hunt_mode:
+            mode_flags.append("--hunt")
+        if state.budget_tokens:
+            mode_flags.append(f"--budget-tokens {state.budget_tokens}")
+        mode_tail = (" " + " ".join(mode_flags)) if mode_flags else ""
         fmt.info(
             f"audit {state.run_id}: {len(scope.mandatory_files)} files, "
-            f"branch={scope.branch}, commit={scope.commit[:8]}"
-            f"{all_marker}{measure_marker}"
+            f"branch={scope.branch}, commit={scope.commit[:8]}{mode_tail}"
         )
         if len(scope.mandatory_files) > _LARGE_SCOPE_THRESHOLD:
             n = len(scope.mandatory_files)
@@ -3367,10 +4718,158 @@ def _run_audit_phases(
         )
         fmt.info("phase 1: calling LLM for repo profile...")
         state.repo_profile = _phase1_repo_profile(state, ctx)
-        state.phase = "triage"
+        if state.hunt_mode:
+            fmt.info("phase 1: generating hunt tasks from sink/source scan...")
+            effective_max = max_hunt_tasks
+            # Soft budget cap: assume each hunt task spends roughly its average
+            # allocation share. If a configured max would blow past the global
+            # hunt budget, lower it. Falls back to ``max_hunt_tasks`` when no
+            # budget is set (planner returns inf there).
+            if state.budget_tokens > 0:
+                hunt_alloc = BudgetPlanner(state).allocation("hunt")
+                est_per_task = 20_000  # conservative; revised by per-task accounting
+                budget_cap = max(1, int(hunt_alloc // est_per_task))
+                if effective_max <= 0 or budget_cap < effective_max:
+                    effective_max = budget_cap
+            tasks = _generate_hunt_tasks(
+                state,
+                content_cache,
+                configured=configured_hunt_tasks,
+                max_tasks=effective_max,
+            )
+            for t in tasks:
+                state.hunt_tasks[t.id] = t
+            fmt.info(
+                f"phase 1: {len(tasks)} hunt tasks queued across "
+                f"{len({t.attack_class for t in tasks})} attack classes"
+            )
+            state.phase = "hunt"
+        else:
+            state.phase = "triage"
         state.save()
         fmt.info(
             f"phase 1 complete. profile: {state.repo_profile.get('summary', '')[:80]}"
+        )
+
+    if state.phase == "hunt":
+        # Reset stale `running` rows so a previous crash mid-batch retries.
+        for t in state.hunt_tasks.values():
+            if t.status == "running":
+                t.status = "pending"
+
+        budget = BudgetPlanner(state)
+        max_hunt_attempts = 3
+
+        for hunt_attempt in range(max_hunt_attempts):
+            pending_tasks = [
+                t
+                for t in state.hunt_tasks.values()
+                if t.status in ("pending", "failed")
+            ]
+            if not pending_tasks:
+                break
+
+            if budget.should_throttle_low_priority():
+                dropped = [t for t in pending_tasks if t.priority == "low"]
+                for t in dropped:
+                    t.status = "failed"
+                    t.last_error = "budget throttle: low-priority tasks dropped"
+                pending_tasks = [t for t in pending_tasks if t.priority != "low"]
+                if dropped:
+                    fmt.warning(
+                        f"phase hunt: budget over 50% used, dropped "
+                        f"{len(dropped)} low-priority task(s)"
+                    )
+
+            if budget.exhausted():
+                for t in pending_tasks:
+                    t.status = "failed"
+                    t.last_error = "budget exhausted before task started"
+                fmt.warning("phase hunt: global token budget exhausted; halting")
+                pending_tasks = []
+                state.save()
+                break
+
+            if hunt_attempt == 0:
+                fmt.info(
+                    f"phase hunt: running {len(pending_tasks)} hunter task(s) "
+                    f"with {workers} worker(s)..."
+                )
+            else:
+                fmt.info(
+                    f"phase hunt: retrying {len(pending_tasks)} task(s) "
+                    f"(attempt {hunt_attempt + 1}/{max_hunt_attempts})..."
+                )
+
+            def _hunt(task):
+                return (task, _phase_hunt_one(task, state, ctx))
+
+            for batch_start in range(0, len(pending_tasks), workers * 2):
+                batch = pending_tasks[batch_start : batch_start + workers * 2]
+                for t in batch:
+                    t.status = "running"
+                    t.attempts += 1
+                state.save()
+
+                results = _run_batch(_hunt, batch, max_workers=workers)
+                for entry in results:
+                    if entry is None:
+                        continue
+                    task, (findings, coverage, error) = entry
+                    if error is not None:
+                        task.status = "failed"
+                        task.last_error = error
+                        fmt.warning(
+                            f"  task {task.id} ({task.attack_class}) failed: {error[:120]}"
+                        )
+                        continue
+                    task.status = "done"
+                    task.last_error = ""
+                    state.coverage_records[task.id] = coverage
+                    if findings:
+                        state.proposed_findings.extend(findings)
+                    fmt.info(
+                        f"  task {task.id} {task.attack_class}: "
+                        f"{len(findings)} finding(s) "
+                        f"(coverage confidence={coverage.confidence})"
+                    )
+                state.save()
+
+        # Do not advance to verification while any task is failed or running:
+        # a false "no findings" answer is worse than asking the operator to
+        # resume.
+        stuck = [t for t in state.hunt_tasks.values() if t.status == "failed"]
+        if stuck:
+            n_attempted = sum(t.attempts for t in stuck)
+            state.save()
+            return (
+                f"Audit incomplete: {len(stuck)} hunt task(s) failed after "
+                f"{n_attempted} attempt(s). Use /audit --resume to retry. "
+                f"First failure: {stuck[0].id} ({stuck[0].attack_class}): "
+                f"{stuck[0].last_error[:120] or 'unknown error'}"
+            )
+
+        running = [t for t in state.hunt_tasks.values() if t.status == "running"]
+        if running:
+            state.save()
+            return (
+                f"Audit incomplete: {len(running)} hunt task(s) still marked "
+                f"running. Use /audit --resume to retry."
+            )
+
+        # Satisfy the file-centric completion guards so the safety nets at the
+        # end of the audit accept this run.
+        state.reviewed_files.update(state.scope.mandatory_files)
+        covered = {f for t in state.hunt_tasks.values() for f in t.seed_files}
+        state.candidate_files = sorted(covered)
+        state.deep_reviewed_files.update(state.candidate_files)
+        state.deep_reviewed_files.update(state.scope.mandatory_files)
+        state.phase = "verification"
+        state.save()
+        fmt.info(
+            f"phase hunt complete. {len(state.proposed_findings)} proposed "
+            f"finding(s) from {sum(1 for t in state.hunt_tasks.values() if t.status == 'done')}/"
+            f"{len(state.hunt_tasks)} task(s)."
         )
 
     # Resume rule: if force_review changed since the run was saved, apply
@@ -3839,13 +5338,20 @@ def _run_audit_phases(
     else:
         _failed, _pending, written = _artifact_summary(state)
 
+    budget = BudgetPlanner(state)
+    budget_tail = ""
+    if budget.enabled:
+        line = budget.summary_line()
+        if line:
+            budget_tail = f"\n{line}"
+
     if written == 0:
         return (
             "No provable security bugs or security-control failures found "
-            "in Git-tracked files."
+            "in Git-tracked files." + budget_tail
         )
 
     return (
         f"Audit complete. {written} finding(s) written to {state.artifact_dir}/. "
-        f"Run `ls {state.artifact_dir}/` to review."
+        f"Run `ls {state.artifact_dir}/` to review." + budget_tail
     )

@@ -5,7 +5,7 @@ The `/audit` command runs a multi-phase security audit over committed Git-tracke
 It triages files by attack surface, performs deep review on escalated files, verifies each finding with an isolated proof-of-concept agent, generates patches, and writes structured reports. Only provable bugs survive to the final output.
 
 ```text
-/audit [path|glob ...] [--resume] [--regen] [--finding N[,M-R]] [--all] [--measure-triage] [--workers N] [--patch-max-turns N] [--debug]
+/audit [path|glob ...] [--resume] [--regen] [--finding N[,M-R]] [--all] [--measure-triage] [--hunt] [--budget-tokens N] [--workers N] [--patch-max-turns N] [--debug]
 ```
 
 Works in both interactive (REPL) and one-shot mode (requires `--oneshot-commands`). Runs against `HEAD`, so dirty working-directory changes are ignored.
@@ -220,11 +220,40 @@ patch_max_turns = 50
 swival> /audit --debug
 ```
 
+### Hunt mode
+
+`--hunt` replaces the file-centric Phase 2 with a queue of attacker-anchored hunt tasks. Phase 1 runs as usual; the hunter then scans the repo for sink patterns across roughly fifteen attack classes (command execution, SSRF, path traversal, deserialization, authorization, cryptography, memory safety, parser differential, and so on), cross-references them against Phase 1 entry points and trust boundaries, and emits one task per `(attacker_position, trust_boundary)` group. Each task carries a concrete attacker model and the controlled inputs the hunter prompt should treat as untrusted. Tasks marked `pending` in `.swival/audit/<run_id>/state.json` are picked up by `/audit --resume`; failed tasks block advance to verification until they retry successfully or are dropped.
+
+```text
+swival> /audit --hunt src/api/
+```
+
+You can pre-load tasks from `swival.toml` so an operator-chosen attacker model always runs:
+
+```toml
+[[audit.hunt_task]]
+attack_class = "authorization"
+attacker_position = "authenticated low-privileged user"
+controlled_inputs = ["route parameters", "JSON body"]
+trust_boundary_crossed = "HTTP API handler"
+scope = "src/api/**"
+priority = "high"
+```
+
+`--budget-tokens N` sets a global token cap for the whole run. Underscores and commas in the value are accepted (`--budget-tokens 2_000_000` or `--budget-tokens 2,000,000`). The planner allocates proportional slices to each phase and tallies consumption; once the global pool is past 50% spent, low-priority hunt tasks are dropped before any other corner is cut.
+
+```text
+swival> /audit --hunt --budget-tokens 2_000_000 src/api/
+```
+
+Several harness flags are recognised by the parser but reserved for upcoming work and currently return an explicit `not yet implemented` error: `--proof-strict` (adversarial disproof gate), `--trace-reachability` (in-repo reachability trace), and `--gapfill N` (observable-coverage gapfill). The corresponding `[audit]` config keys (`proof_strict`, `max_gapfill_tasks`) are similarly refused. These will land in subsequent releases.
+
 All options can be combined with a focus path:
 
 ```text
 swival> /audit src/api/ --resume --workers 6
 swival> /audit src/api/ --regen
+swival> /audit src/api/ --hunt --budget-tokens 1_500_000
 ```
 
 ## Configuration
@@ -243,6 +272,16 @@ Matching files are unconditionally promoted into Phase 3, regardless of what tri
 A glob in the project file that matches zero paths in scope produces a warning, since it usually means a stale entry after a rename. Globs in the global file are silent on zero matches, on the assumption that a global glob like `swival/audit.py` will trivially miss in unrelated repositories. Globs from both files are merged: project entries layer on top of global entries.
 
 Adding a glob between runs takes effect on resume: if a saved run has a SKIP record for a path that now matches `force_review`, the resume promotes that record before Phase 3 sees it. Removing a glob is *not* honored on resume; rescinding mid-audit is more confusing than it is worth, so re-run from scratch instead.
+
+Hunt mode and budget planner settings can also be set in config:
+
+```toml
+[audit]
+budget_tokens = 2_000_000     # same effect as --budget-tokens
+max_hunt_tasks = 200          # ceiling on generated hunt tasks
+```
+
+`[[audit.hunt_task]]` entries are concatenated across global and project config; project entries come last so a project-level operator intent is the source of truth on the queue. The keys `max_gapfill_tasks` and `proof_strict`, plus the `[audit.reviewer]` table, are parsed but currently refused with an explicit `not yet implemented` error; they are scaffolded for the upcoming disproof / gapfill phases.
 
 ## Scope
 
