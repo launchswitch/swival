@@ -2,6 +2,16 @@
 
 All notable user-facing changes to Swival.
 
+## 1.0.18
+
+- Assistant responses now stream to the terminal as they are produced, so you see tokens arrive in real time instead of waiting for the full turn to complete.
+- The REPL bottom toolbar now surfaces your next pending todo item in the slot previously occupied by the wall clock, making it easier to keep the active work item in view.
+- Tool error messages have been substantially improved across the standard library so the model can recover from mistakes on its own. Notable cases include clearer guidance when `write_file` is called without `file_path`, better resilience against misuse of `read_file` and `read_multiple_files`, and more actionable diagnostics from `edit_file`.
+- Swival now detects when an LLM emits tool-call markup as plain assistant text (for example `</parameter></function></tool_call>` fragments from weak or misconfigured models) and asks the model to retry with a proper structured tool call rather than treating the malformed output as a final answer.
+- The `read_file` tool parameter `tail` has been renamed to `tail_lines` for clarity, and `offset` and `tail_lines` are now mutually exclusive so the two reading modes cannot be combined by accident.
+- Tool descriptions advertised to the model have been tightened to reduce prompt overhead without losing semantic information, which helps small-context models.
+- The todo summary line no longer drops removed items from its accounting, so completion counts stay accurate after items are deleted.
+
 ## 1.0.17
 
 - The REPL now has a status toolbar at the bottom of the input area. It shows token usage, context window fill percentage, git dirty file count, running subagents, remaining todo items, active goal, and session elapsed time. When the toolbar is otherwise sparse, it cycles through randomized tips about available commands and shortcuts.
