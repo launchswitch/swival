@@ -6905,6 +6905,7 @@ def run_agent_loop(
     goal_launch_turn: bool = False,
     metaskills_policy: str = "local",
     enabled_metaskills: set | None = None,
+    repl_input_text: str | None = None,
 ) -> tuple[str | None, bool]:
     """Run the tool-calling loop until a final answer or max turns.
 
@@ -7277,11 +7278,14 @@ def run_agent_loop(
 
             if "command_tool_kwargs" in llm_kwargs:
                 llm_kwargs["command_tool_kwargs"]["outer_turn"] = turns
-            with (
-                fmt.llm_spinner(f"Thinking (turn {turns}/{max_turns})")
-                if verbose
-                else nullcontext()
-            ):
+            if verbose and repl_input_text is not None:
+                _waiting_cm = fmt.input_marquee(repl_input_text)
+                repl_input_text = None
+            elif verbose:
+                _waiting_cm = fmt.llm_spinner(f"Thinking (turn {turns}/{max_turns})")
+            else:
+                _waiting_cm = nullcontext()
+            with _waiting_cm:
                 _llm_result = call_llm(*_llm_args, **llm_kwargs)
                 msg, finish_reason = _llm_result[0], _llm_result[1]
                 cmd_activity = _llm_result[2] if len(_llm_result) > 2 else []
@@ -10793,7 +10797,12 @@ def repl_loop(
             if report is not None:
                 report.record_repl_turn(parsed.raw)
 
-            result = execute_input(parsed, ctx, mode="repl")
+            if parsed.is_plain_text:
+                ctx.loop_kwargs["repl_input_text"] = parsed.raw
+            try:
+                result = execute_input(parsed, ctx, mode="repl")
+            finally:
+                ctx.loop_kwargs.pop("repl_input_text", None)
 
             if result.kind == "agent_turn" and report is not None:
                 _repl_loop_kwargs["turn_offset"] = report.max_turn_seen

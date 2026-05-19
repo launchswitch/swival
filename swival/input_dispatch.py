@@ -66,6 +66,10 @@ class ParsedInput:
     is_command: bool = False
     is_custom_command: bool = False
 
+    @property
+    def is_plain_text(self) -> bool:
+        return bool(self.raw) and not self.is_command and not self.is_custom_command
+
 
 @dataclass
 class StepResult:

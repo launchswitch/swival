@@ -6,6 +6,7 @@ import threading
 import time
 
 from rich.console import Console
+from rich.live import Live
 from rich.markdown import Markdown
 from rich.markup import escape
 from rich.panel import Panel
@@ -166,6 +167,56 @@ def llm_spinner(label: str = "Thinking"):
         finally:
             stop.set()
             t.join(timeout=1)
+
+
+@contextlib.contextmanager
+def input_marquee(text: str):
+    """Context manager showing a scrolling marquee of ``text`` on stderr.
+
+    Used by the REPL as visual feedback while the LLM is processing the
+    user's prompt. The line is cleared as soon as the context exits.
+    """
+    if not _console.is_terminal:
+        yield
+        return
+
+    flat = " ".join(text.split())
+    base = flat + "   ·   "
+    width = max(_console.width - 6, 20)
+    buffer = base + base[:width]
+
+    def _frame(offset: int) -> Text:
+        start = offset % len(base)
+        line = Text("  > ", style="bold cyan")
+        line.append(buffer[start : start + width], style="cyan")
+        return line
+
+    stop = threading.Event()
+    live = Live(
+        _frame(0),
+        console=_console,
+        auto_refresh=False,
+        transient=True,
+    )
+
+    def _scroll():
+        offset = 0
+        while not stop.wait(0.06):
+            offset += 1
+            try:
+                live.update(_frame(offset), refresh=True)
+            except Exception:
+                break
+
+    live.start()
+    t = threading.Thread(target=_scroll, daemon=True)
+    t.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        t.join(timeout=1)
+        live.stop()
 
 
 def completion(turns: int, exit_code: str) -> None:

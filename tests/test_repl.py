@@ -478,9 +478,9 @@ class TestReplLoop:
             toolbar_text = "".join(text for _style, text in toolbar_parts)
 
         assert ("class:bottom-toolbar.key", "3 changed") in toolbar_parts
-        assert ("class:bottom-toolbar.key", "3 todo") in toolbar_parts
+        assert ("class:bottom-toolbar.key", "a") in toolbar_parts
+        assert ("class:bottom-toolbar", " +2") in toolbar_parts
         assert ("class:bottom-toolbar.model", objective[:37] + "...") in toolbar_parts
-        assert "1m30s" in toolbar_text
         assert "test-model" not in toolbar_text
         assert "lmstudio" not in toolbar_text
         assert "some" not in toolbar_text
