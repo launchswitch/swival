@@ -29,7 +29,8 @@ class TestReadFilePositive:
         f.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
 
         result = _read_file("hello.txt", str(tmp_path))
-        assert result == "1: alpha\n2: beta\n3: gamma"
+        assert result.startswith("1: alpha\n2: beta\n3: gamma")
+        assert "\n[checksum=" in result
 
     def test_read_directory_listing(self, tmp_path):
         """Reading a directory lists entries with / suffix for subdirs."""

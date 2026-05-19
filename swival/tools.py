@@ -3,6 +3,7 @@
 import base64
 import contextlib
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -25,7 +26,10 @@ TOOLS = [
             "description": (
                 "Read a file as numbered lines. Use offset/limit to paginate "
                 "forward, or tail_lines=N for the file end. Truncated output "
-                "shows the next offset. Also lists directories."
+                "shows the next offset. Also lists directories. A "
+                "[checksum=...] trailer is appended for files; pass that "
+                "checksum to a later edit_file call to guard against the "
+                "file changing between read and edit."
             ),
             "parameters": {
                 "type": "object",
@@ -181,6 +185,14 @@ TOOLS = [
                         "description": (
                             "1-based line number from read_file. When old_string matches "
                             "multiple times, only replace the match that touches this line."
+                        ),
+                    },
+                    "checksum": {
+                        "type": "string",
+                        "description": (
+                            "Optional. The checksum trailer reported by your most recent "
+                            "read_file on this path. If supplied, the edit fails unless the "
+                            "file still hashes to that value, catching changes since you read it."
                         ),
                     },
                 },
@@ -753,6 +765,53 @@ def get_tool_schema(name: str) -> dict | None:
 MAX_OUTPUT_BYTES = 50 * 1024  # 50 KB
 MAX_LINE_LENGTH = 2000
 BINARY_CHECK_BYTES = 8 * 1024  # 8 KB
+
+CHECKSUM_HEX_LEN = 8
+CHECKSUM_VALUE_RE = re.compile(rf"^[0-9a-f]{{{CHECKSUM_HEX_LEN}}}$")
+CHECKSUM_TRAILER_RE = re.compile(
+    rf"^\[checksum=([0-9a-f]{{{CHECKSUM_HEX_LEN}}})\]$"
+)
+
+
+def _compute_checksum(resolved: Path) -> str | None:
+    """Return SHA-256 of *resolved* truncated to CHECKSUM_HEX_LEN lowercase hex chars, or None on IO error."""
+    try:
+        data = resolved.read_bytes()
+    except OSError:
+        return None
+    return hashlib.sha256(data).hexdigest()[:CHECKSUM_HEX_LEN]
+
+
+def _verify_checksum(
+    resolved: Path,
+    expected_hash,
+    file_path: str,
+    tool_name: str,
+) -> str | None:
+    """Return an error string if *expected_hash* is well-formed and doesn't match the file.
+
+    No-op when *expected_hash* is None, empty, or syntactically not a checksum
+    value: the guard is opt-in, and weak models routinely pass placeholders like
+    0 or "1" that should be treated as "no checksum supplied" rather than as a
+    mismatch.
+    """
+    if expected_hash in (None, ""):
+        return None
+    if not isinstance(expected_hash, str):
+        return None
+    expected = expected_hash.strip().lower()
+    if not CHECKSUM_VALUE_RE.fullmatch(expected):
+        return None
+    actual = _compute_checksum(resolved)
+    if actual is None:
+        return f"error: {tool_name}: cannot compute checksum for {file_path}"
+    if expected != actual:
+        return (
+            f"error: {tool_name}: checksum mismatch on {file_path}. "
+            f"Expected {expected}, but the file currently hashes to {actual}. "
+            "The file changed since you last read it. Re-read and retry."
+        )
+    return None
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 IMAGE_MIME = {
@@ -1423,6 +1482,10 @@ def _read_file(
     if remaining > 0:
         next_offset = start + lines_emitted + 1  # 1-based
         result += f"\n[{remaining} more lines, use offset={next_offset} to continue]"
+    checksum = _compute_checksum(resolved)
+    if checksum is not None:
+        suffix = f"[checksum={checksum}]"
+        result = f"{result}\n{suffix}" if result else suffix
     return result
 
 
@@ -1444,10 +1507,16 @@ def _offset_tail_conflict(offset: int, tail: int) -> str:
     )
 
 
-def _split_read_result(result: str) -> tuple[str, bool, str | None]:
+def _split_read_result(result: str) -> tuple[str, bool, str | None, str | None]:
     lines = result.splitlines()
     next_offset = None
     content_truncated = False
+    checksum: str | None = None
+    if lines:
+        match = CHECKSUM_TRAILER_RE.match(lines[-1])
+        if match:
+            checksum = match.group(1)
+            lines = lines[:-1]
     if lines and lines[-1].startswith("[") and lines[-1].endswith("]"):
         trailer = lines[-1]
         if "use offset=" in trailer:
@@ -1457,7 +1526,7 @@ def _split_read_result(result: str) -> tuple[str, bool, str | None]:
                 next_offset = match.group(1)
             lines = lines[:-1]
     content = "\n".join(lines)
-    return content, content_truncated, next_offset
+    return content, content_truncated, next_offset, checksum
 
 
 def _build_read_multiple_files_section(
@@ -1468,6 +1537,7 @@ def _build_read_multiple_files_section(
     *,
     content_truncated: bool | None = None,
     next_offset: str | None = None,
+    checksum: str | None = None,
 ) -> str:
     parts = [
         f"=== FILE: {title} ===",
@@ -1476,6 +1546,8 @@ def _build_read_multiple_files_section(
     ]
     if status == "ok":
         parts.append(f"content_truncated: {'true' if content_truncated else 'false'}")
+        if checksum is not None:
+            parts.append(f"checksum: {checksum}")
         if body:
             parts.append(body)
         if next_offset is not None:
@@ -1722,7 +1794,9 @@ def _read_files(
             )
             files_with_errors += 1
         else:
-            content, content_truncated, next_offset = _split_read_result(result)
+            content, content_truncated, next_offset, checksum = _split_read_result(
+                result
+            )
             section = _build_read_multiple_files_section(
                 file_path,
                 "ok",
@@ -1730,6 +1804,7 @@ def _read_files(
                 content,
                 content_truncated=content_truncated,
                 next_offset=next_offset,
+                checksum=checksum,
             )
             files_succeeded += 1
 
@@ -1883,6 +1958,7 @@ def _edit_file(
     base_dir: str,
     replace_all: bool = False,
     line_number: int | None = None,
+    checksum: str | None = None,
     extra_write_roots: list[Path] = (),
     files_mode: str = "some",
     tracker=None,
@@ -1915,6 +1991,10 @@ def _edit_file(
         error = tracker.check_write_allowed(str(resolved), exists=True)
         if error:
             return error
+
+    checksum_error = _verify_checksum(resolved, checksum, file_path, "edit_file")
+    if checksum_error is not None:
+        return checksum_error
 
     if not old_string:
         return (
@@ -3119,6 +3199,7 @@ def dispatch(name: str, args: dict, base_dir: str, **kwargs) -> str:
             base_dir=base_dir,
             replace_all=args.get("replace_all", False),
             line_number=args.get("line_number"),
+            checksum=args.get("checksum"),
             extra_write_roots=extra_write_roots,
             files_mode=files_mode,
             tracker=file_tracker,
