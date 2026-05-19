@@ -569,6 +569,169 @@ Some reasoning text.
 
 
 # ---------------------------------------------------------------------------
+# _classify_malformed_swival_call_text
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyMalformedSwivalCallText:
+    def test_no_swival_call_returns_none(self):
+        from swival.agent import _classify_malformed_swival_call_text
+
+        assert _classify_malformed_swival_call_text(None) is None
+        assert _classify_malformed_swival_call_text("") is None
+        assert _classify_malformed_swival_call_text("Just prose.") is None
+
+    def test_opening_tag_without_closing(self):
+        from swival.agent import _classify_malformed_swival_call_text
+
+        text = '<swival:call id="c1" name="tool">\n{"a": 1}\n'
+        assert _classify_malformed_swival_call_text(text) == "missing closing tag"
+
+    def test_closed_block_missing_id(self):
+        from swival.agent import _classify_malformed_swival_call_text
+
+        text = '<swival:call name="tool">{"a": 1}</swival:call>'
+        assert _classify_malformed_swival_call_text(text) == "missing id or name"
+
+    def test_closed_block_missing_name(self):
+        from swival.agent import _classify_malformed_swival_call_text
+
+        text = '<swival:call id="c1">{"a": 1}</swival:call>'
+        assert _classify_malformed_swival_call_text(text) == "missing id or name"
+
+    def test_array_body_treated_as_json_shape(self):
+        """Body starting with [ is JSON-shaped but bypasses the strict regex."""
+        from swival.agent import _classify_malformed_swival_call_text
+
+        text = '<swival:call id="c1" name="tool">[1, 2, 3]</swival:call>'
+        result = _classify_malformed_swival_call_text(text)
+        assert result == "unparseable JSON body"
+
+    def test_ignores_fenced_code_block(self):
+        from swival.agent import _classify_malformed_swival_call_text
+
+        text = (
+            "Here is the call format Swival expects:\n"
+            "```xml\n"
+            '<swival:call id="c1" name="tool">{"a": 1}\n'
+            "```\n"
+            "End of explanation."
+        )
+        assert _classify_malformed_swival_call_text(text) is None
+
+    def test_ignores_inline_backticks(self):
+        from swival.agent import _classify_malformed_swival_call_text
+
+        text = "Emit a `<swival:call>` block when needed."
+        assert _classify_malformed_swival_call_text(text) is None
+
+    def test_valid_block_returns_none(self):
+        from swival.agent import _classify_malformed_swival_call_text
+
+        text = '<swival:call id="c1" name="tool">{"a": 1}</swival:call>'
+        assert _classify_malformed_swival_call_text(text) is None
+
+
+# ---------------------------------------------------------------------------
+# _call_command_with_tools malformed-block recovery
+# ---------------------------------------------------------------------------
+
+
+class TestCommandProviderMalformedRecovery:
+    def _setup(self, monkeypatch, responses):
+        """Drive _call_command_with_tools with a controlled response sequence."""
+        from swival import agent
+
+        idx = {"i": 0}
+
+        def fake_run_once(parts, transcript, verbose, command_str):
+            i = idx["i"]
+            idx["i"] += 1
+            assert i < len(responses), "exceeded scripted responses"
+            return responses[i]
+
+        monkeypatch.setattr(agent, "_run_command_once", fake_run_once)
+        return idx
+
+    def _invoke(self, tmp_path):
+        from swival.agent import _call_command_with_tools
+
+        def _emit(*_a, **_k):
+            pass
+
+        return _call_command_with_tools(
+            "fake-cmd",
+            [{"role": "user", "content": "q"}],
+            {},
+            outer_turn=1,
+            outer_turn_offset=0,
+            report=None,
+            snapshot_state=None,
+            verbose=False,
+            _emit=_emit,
+        )
+
+    def test_malformed_then_clean(self, tmp_path, monkeypatch):
+        """Malformed block triggers retry; clean response on next round ends loop."""
+        self._setup(
+            monkeypatch,
+            [
+                # Round 1: missing closing tag
+                '<swival:call id="c1" name="tool">{"x": 1}\n',
+                # Round 2: clean prose, no call
+                "Here is the answer: 42.",
+            ],
+        )
+        msg, reason, activity = self._invoke(tmp_path)
+        assert reason == "stop"
+        assert "42" in msg.content
+        assert activity == []
+
+    def test_repeated_malformed_raises(self, tmp_path, monkeypatch):
+        from swival.report import AgentError
+
+        self._setup(
+            monkeypatch,
+            [
+                '<swival:call id="c1" name="tool">{"x": 1}\n',
+                '<swival:call id="c1" name="tool">{"x": 2}\n',
+                '<swival:call id="c1" name="tool">{"x": 3}\n',
+            ],
+        )
+        with pytest.raises(AgentError, match="malformed <swival:call>"):
+            self._invoke(tmp_path)
+
+    def test_parseable_call_resets_counter(self, tmp_path, monkeypatch):
+        """One malformed round, one parseable round, one malformed round must not raise."""
+        self._setup(
+            monkeypatch,
+            [
+                '<swival:call id="c1" name="echo">{"x": 1}\n',
+                '<swival:call id="c2" name="bogus_tool">{}</swival:call>',
+                '<swival:call id="c3" name="echo">{"x": 1}\n',
+                "All done.",
+            ],
+        )
+        from swival import agent
+
+        def fake_handle_tool_call(tc, **kw):
+            return (
+                {"role": "tool", "tool_call_id": tc.id, "content": "error: nope"},
+                {
+                    "name": tc.function.name,
+                    "arguments": {},
+                    "elapsed": 0.0,
+                    "succeeded": False,
+                },
+            )
+
+        monkeypatch.setattr(agent, "handle_tool_call", fake_handle_tool_call)
+        msg, reason, activity = self._invoke(tmp_path)
+        assert reason == "stop"
+        assert "All done" in msg.content
+
+
+# ---------------------------------------------------------------------------
 # _render_swival_tool_catalog
 # ---------------------------------------------------------------------------
 

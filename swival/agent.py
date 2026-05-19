@@ -634,6 +634,120 @@ _LEAKED_THINK_HEAD_RE = re.compile(r"\A\s*</?think>\s*\n+", re.IGNORECASE)
 
 TRUNCATED_REASON_LENGTH = "length"
 TRUNCATED_REASON_MALFORMED = "malformed_args"
+TRUNCATED_REASON_TEXTUAL_TOOL_CALL = "textual_tool_call_leak"
+
+
+_STRONG_LEAKED_TOOL_TEXT_RE = re.compile(
+    r"</?tool_call\b"
+    r"|<function=[^>\n]+>"
+    r"|<parameter=[^>\n]+>"
+)
+
+_HEADER_LEAKED_TOOL_TEXT_RE = re.compile(
+    r"<\|python_tag\|>"
+    r"|\[TOOL_CALLS\]"
+    r"|<[｜|]tool[▁_ ]calls[▁_ ]begin[｜|]>"
+    r"|<[｜|]tool[▁_ ]call[▁_ ]begin[｜|]>"
+    r"|✿FUNCTION✿:"
+    r"|✿ARGS✿:"
+)
+
+_WEAK_LEAKED_TOOL_TEXT_RE = re.compile(
+    r"</function\s*>"
+    r"|</parameter\s*>"
+    r"|<function\b(?![=>])"
+    r"|<parameter\b(?![=>])"
+)
+
+_FENCED_CODE_SPAN_RE = re.compile(r"```.*?```", re.DOTALL)
+_INLINE_CODE_SPAN_RE = re.compile(r"`[^`\n]*`")
+
+
+def _strip_code_spans(text: str) -> str:
+    """Replace fenced/inline code with same-length whitespace so indices survive."""
+    if "`" not in text:
+        return text
+
+    def _mask(m: "re.Match[str]") -> str:
+        return " " * (m.end() - m.start())
+
+    text = _FENCED_CODE_SPAN_RE.sub(_mask, text)
+    text = _INLINE_CODE_SPAN_RE.sub(_mask, text)
+    return text
+
+
+def _classify_textual_tool_call_leak(
+    content: str | None,
+) -> tuple[str, int] | None:
+    """Detect tool-call markup emitted as plain assistant text.
+
+    Returns (reason, leak_start_index) when the content looks like a leaked
+    native-template tool call, else None. leak_start_index is the offset in
+    the original content of the first sentinel that drove the heuristic so
+    callers can trim from there.
+    """
+    if not content:
+        return None
+    if "<" not in content and "[TOOL_CALLS]" not in content and "✿" not in content:
+        return None
+    masked = _strip_code_spans(content)
+    if not masked.strip():
+        return None
+
+    length = len(masked)
+    tail_start = max(0, length - 200)
+
+    strong_matches = list(_STRONG_LEAKED_TOOL_TEXT_RE.finditer(masked))
+    header_matches = list(_HEADER_LEAKED_TOOL_TEXT_RE.finditer(masked))
+    weak_matches = list(_WEAK_LEAKED_TOOL_TEXT_RE.finditer(masked))
+
+    tail_strong = [m for m in strong_matches if m.start() >= tail_start]
+    if tail_strong:
+        tail_positions = (
+            [m.start() for m in tail_strong]
+            + [m.start() for m in header_matches if m.start() >= tail_start]
+            + [m.start() for m in weak_matches if m.start() >= tail_start]
+        )
+        return (TRUNCATED_REASON_TEXTUAL_TOOL_CALL, min(tail_positions))
+
+    for m in header_matches:
+        if m.start() < 200 or m.start() >= tail_start:
+            after = masked[m.end() :].lstrip()
+            if after[:1] == "{" or (after[:1] == "[" and after[1:].lstrip()[:1] == "{"):
+                return (TRUNCATED_REASON_TEXTUAL_TOOL_CALL, m.start())
+
+    strong_pos = sorted({m.start() for m in strong_matches})
+    header_pos = sorted({m.start() for m in header_matches})
+    weak_pos = sorted({m.start() for m in weak_matches})
+    all_pos = sorted(set(strong_pos) | set(header_pos) | set(weak_pos))
+    for anchor in all_pos:
+        end = anchor + 200
+        in_window_strong = [p for p in strong_pos if anchor <= p < end]
+        in_window_header = [p for p in header_pos if anchor <= p < end]
+        in_window_weak = [p for p in weak_pos if anchor <= p < end]
+        total = (
+            len(in_window_strong)
+            + min(1, len(in_window_header))
+            + min(1, len(in_window_weak))
+        )
+        if total >= 2:
+            candidates = list(in_window_strong)
+            if in_window_header:
+                candidates.append(in_window_header[0])
+            if in_window_weak:
+                candidates.append(in_window_weak[0])
+            return (TRUNCATED_REASON_TEXTUAL_TOOL_CALL, min(candidates))
+
+    return None
+
+
+def _make_textual_tool_call_repair_prompt() -> str:
+    return (
+        "Your previous response emitted tool-call markup as plain text, so "
+        "no tool was executed. Continue the task. Use the available tools "
+        "through the proper tool-calling interface, or give a final answer "
+        "only if no tool call is needed."
+    )
 
 
 def _normalize_tool_call_args(raw):
@@ -2919,6 +3033,57 @@ _SWIVAL_BLOCK_RE = re.compile(
 _ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
 
 
+_SWIVAL_OPEN_RE = re.compile(r"<swival:call\b")
+_SWIVAL_BLOCK_LOOSE_RE = re.compile(
+    r"<swival:call([^>]*)>(.*?)</swival:call>", re.DOTALL
+)
+
+
+def _classify_malformed_swival_call_text(text: str | None) -> str | None:
+    """Detect malformed <swival:call> attempts that _parse_swival_calls() drops.
+
+    Returns a short reason string if the text contains an attempted but
+    unparseable <swival:call> block, else None. Spans already covered by a
+    valid strict parse (id + name + brace-shaped body) are ignored; those
+    are handled by `_parse_swival_calls`. Examples inside fenced code or
+    inline backticks are ignored.
+    """
+    if not text:
+        return None
+    masked = _strip_code_spans(text)
+    if _SWIVAL_OPEN_RE.search(masked) is None:
+        return None
+
+    handled = []
+    for m in _SWIVAL_BLOCK_RE.finditer(masked):
+        attrs = dict(_ATTR_RE.findall(m.group(1)))
+        if attrs.get("id") and attrs.get("name"):
+            handled.append((m.start(), m.end()))
+
+    def _in_handled(pos: int) -> bool:
+        return any(s <= pos < e for s, e in handled)
+
+    loose_matches = list(_SWIVAL_BLOCK_LOOSE_RE.finditer(masked))
+    for m in loose_matches:
+        if _in_handled(m.start()):
+            continue
+        attr_str, body = m.group(1), m.group(2)
+        attrs = dict(_ATTR_RE.findall(attr_str))
+        if not attrs.get("id") or not attrs.get("name"):
+            return "missing id or name"
+        body_stripped = body.strip()
+        if body_stripped[:1] in ("{", "["):
+            return "unparseable JSON body"
+
+    for m in _SWIVAL_OPEN_RE.finditer(masked):
+        if _in_handled(m.start()):
+            continue
+        if any(lm.start() <= m.start() < lm.end() for lm in loose_matches):
+            continue
+        return "missing closing tag"
+    return None
+
+
 def _parse_swival_calls(text):
     """Extract (call_id, tool_name, args_dict) tuples from agent output.
 
@@ -3120,6 +3285,7 @@ def _call_command(command_str, messages, verbose, max_output_tokens=None):
 
 
 _COMMAND_TOOL_MAX_ROUNDS = 20
+_COMMAND_TOOL_MALFORMED_MAX_CONSECUTIVE = 1
 
 
 def _run_command_once(parts, transcript, verbose, command_str):
@@ -3182,6 +3348,7 @@ def _call_command_with_tools(
     consecutive_errors: dict[str, tuple[str, int]] = {}
     tool_activity: list[dict] = []
     response_text = ""
+    malformed_consecutive = 0
 
     for _ in range(_COMMAND_TOOL_MAX_ROUNDS):
         transcript = _render_transcript(transcript_messages)
@@ -3193,7 +3360,35 @@ def _call_command_with_tools(
 
         calls = _parse_swival_calls(response_text)
         if not calls:
-            break
+            malformed_reason = _classify_malformed_swival_call_text(response_text)
+            if malformed_reason is None:
+                break
+            malformed_consecutive += 1
+            if malformed_consecutive > _COMMAND_TOOL_MALFORMED_MAX_CONSECUTIVE:
+                raise AgentError(
+                    "command provider emitted malformed <swival:call> "
+                    f"blocks repeatedly: {malformed_reason}"
+                )
+            if verbose:
+                fmt.warning(
+                    f"command provider emitted malformed <swival:call> "
+                    f"({malformed_reason}), requesting a clean block"
+                )
+            transcript_messages.append({"role": "assistant", "content": response_text})
+            transcript_messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Your previous response looked like an attempted "
+                        "<swival:call> block, but it was malformed and no tool "
+                        f"was executed ({malformed_reason}). Emit a complete "
+                        "block with id, name, JSON arguments, and a closing "
+                        "</swival:call>, or answer normally if no tool is needed."
+                    ),
+                }
+            )
+            continue
+        malformed_consecutive = 0
 
         transcript_messages.append({"role": "assistant", "content": response_text})
 
@@ -6799,6 +6994,7 @@ def run_agent_loop(
     # when deciding to suppress further continuations after a no-tool-call turn.
     _last_turn_was_continuation = False
     _last_turn_used_tools = False
+    _textual_tool_call_repair_pending = False
     # One-shot: a goal-launch turn (synthetic start_prompt appended by /goal)
     # is treated as a continuation for *its own* turn only. Consumed when the
     # first LLM response arrives, regardless of whether tools were called.
@@ -7578,6 +7774,58 @@ def run_agent_loop(
 
         messages.append(_msg_to_dict(msg))
 
+        # Recover from native tool-call markup leaked as plain text. Some weak
+        # or poorly configured servers emit a tool call as assistant content
+        # with no structured tool_calls; left alone, the loop would treat the
+        # template fragments as a final answer.
+        if (
+            not msg.tool_calls
+            and finish_reason != "length"
+            and effective_tools is not None
+        ):
+            leak = _classify_textual_tool_call_leak(msg.content)
+            if leak is not None:
+                leak_reason, leak_start = leak
+                prefix = msg.content[:leak_start].rstrip()
+                trimmed = (
+                    prefix + "\n\n" if prefix else ""
+                ) + "[discarded malformed textual tool-call markup]"
+                _set_msg_content(messages[-1], trimmed)
+                if report:
+                    report.record_truncated_response(
+                        turns + turn_offset, reason=leak_reason
+                    )
+                if verbose:
+                    fmt.warning(
+                        f"detected textual tool-call leak (reason={leak_reason}), "
+                        "requesting a proper tool call"
+                    )
+                if _textual_tool_call_repair_pending:
+                    if continue_here:
+                        from .continue_here import write_continue_file
+
+                        write_continue_file(
+                            base_dir,
+                            messages,
+                            todo_state=todo_state,
+                            snapshot_state=snapshot_state,
+                            thinking_state=thinking_state,
+                            goal_state=goal_state,
+                        )
+                    raise AgentError(
+                        "model emitted tool-call markup as plain text again "
+                        "after a repair prompt"
+                    )
+                _textual_tool_call_repair_pending = True
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": _make_textual_tool_call_repair_prompt(),
+                        "_swival_synthetic": True,
+                    }
+                )
+                continue
+
         # Emit events for streaming consumers: text_chunk for final answers only,
         # status_update for intermediate reasoning (before tool calls).
         if msg.content and not msg.tool_calls and finish_reason != "length":
@@ -7702,6 +7950,7 @@ def run_agent_loop(
         image_stash: list[dict] = []
         _last_turn_used_tools = True
         _goal_launch_pending = False
+        _textual_tool_call_repair_pending = False
         for tool_call in msg.tool_calls:
             # Check cancellation before each tool call
             if cancel_flag is not None and cancel_flag.is_set():
