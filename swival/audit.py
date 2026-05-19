@@ -369,8 +369,6 @@ class RootCauseGroup:
     root_cause_summary: str
     source_boundaries: list[str] = field(default_factory=list)
     affected_locations: list[str] = field(default_factory=list)
-    finding_type: str = ""
-    attack_class: str = ""
 
 
 class HuntTaskValidationError(ValueError):
@@ -1164,8 +1162,10 @@ class AuditRunState:
         coverage_records = {
             k: CoverageRecord(**v) for k, v in blob.get("coverage_records", {}).items()
         }
+        rcg_fields = {f.name for f in fields(RootCauseGroup)}
         root_cause_groups = [
-            RootCauseGroup(**g) for g in blob.get("root_cause_groups", [])
+            RootCauseGroup(**{kk: vv for kk, vv in g.items() if kk in rcg_fields})
+            for g in blob.get("root_cause_groups", [])
         ]
 
         state = cls(
@@ -4345,6 +4345,339 @@ def _finding_key(finding: FindingRecord) -> str:
     return hashlib.sha256(blob.encode()).hexdigest()[:12]
 
 
+_SEVERITY_RANK: dict[str, int] = {
+    s: i for i, s in enumerate(reversed(_SEVERITIES))
+}
+_DEDUPE_LOCAL_BUG_PREFIX = 80
+_DEDUPE_SUMMARY_MAX = 300
+_DEDUPE_SENTINEL = "swival-audit-dedupe-v1"
+_DEDUPE_BLOCK_RE = re.compile(
+    r"```" + _DEDUPE_SENTINEL + r"\s*\n(.*?)\n```",
+    re.DOTALL,
+)
+_DEDUPE_ACTION_MERGE = "MERGE"
+_DEDUPE_ACTION_KEEP = "KEEP"
+_DEDUPE_ACTIONS = (_DEDUPE_ACTION_MERGE, _DEDUPE_ACTION_KEEP)
+_DEDUPE_MAX_PAIRS = 50
+_ROOT_CAUSE_GROUP_ID_PREFIX = "rcg_"
+
+
+def _severity_rank(severity: str) -> int:
+    return _SEVERITY_RANK.get((severity or "").lower().strip(), 99)
+
+
+def _normalize_dedupe_field(s: str) -> str:
+    return " ".join((s or "").lower().split())[:200]
+
+
+def _heuristic_dedupe_key(finding: FindingRecord) -> tuple[str, ...]:
+    """Boundary-sensitive root-cause key.
+
+    Different ``source_boundary`` or different first reachability step
+    keep findings apart, even when they share a sink: one helper reached
+    from two exposed boundaries is two reportable exposures, not one.
+    """
+    first_reach = finding.reachability_path[0] if finding.reachability_path else ""
+    return (
+        _normalize_dedupe_field(finding.attack_class),
+        _normalize_dedupe_field(finding.finding_type),
+        _normalize_dedupe_field(finding.source_boundary),
+        _normalize_dedupe_field(first_reach),
+        _normalize_dedupe_field(finding.attacker_position),
+        _normalize_dedupe_field(finding.sink_operation),
+        _normalize_dedupe_field(finding.local_bug)[:_DEDUPE_LOCAL_BUG_PREFIX],
+    )
+
+
+def _ambiguity_key(finding: FindingRecord) -> tuple[str, ...]:
+    return _heuristic_dedupe_key(finding)[:-1]
+
+
+def _root_cause_summary(primary: FindingRecord) -> str:
+    parts: list[str] = []
+    if primary.local_bug:
+        parts.append(primary.local_bug.strip().splitlines()[0])
+    elif primary.title:
+        parts.append(primary.title.strip())
+    if primary.sink_operation:
+        parts.append(f"sink: {primary.sink_operation.strip()}")
+    return " | ".join(parts)[:_DEDUPE_SUMMARY_MAX]
+
+
+def _root_cause_group_id(primary_key: str) -> str:
+    return f"{_ROOT_CAUSE_GROUP_ID_PREFIX}{primary_key[:10]}"
+
+
+def _build_root_cause_groups(state: AuditRunState) -> list[RootCauseGroup]:
+    """Cluster verified findings into root-cause groups.
+
+    Ordering is deterministic: groups sort by primary severity then by
+    group id so resume/regen produce stable artifact indexes.
+    """
+    key_by_id: dict[int, str] = {
+        id(vf): _finding_key(vf.finding) for vf in state.verified_findings
+    }
+    buckets: dict[tuple[str, ...], list[VerifiedFinding]] = {}
+    for vf in state.verified_findings:
+        buckets.setdefault(_heuristic_dedupe_key(vf.finding), []).append(vf)
+
+    groups: list[RootCauseGroup] = []
+    for members in buckets.values():
+        members.sort(
+            key=lambda m: (_severity_rank(m.finding.severity), key_by_id[id(m)])
+        )
+        primary = members[0]
+        primary_key = key_by_id[id(primary)]
+        variant_keys = [
+            key_by_id[id(m)]
+            for m in members
+            if key_by_id[id(m)] != primary_key
+        ]
+        boundaries = list(
+            dict.fromkeys(m.finding.source_boundary for m in members if m.finding.source_boundary)
+        )
+        affected = list(
+            dict.fromkeys(loc for m in members for loc in m.finding.locations)
+        )
+        groups.append(
+            RootCauseGroup(
+                id=_root_cause_group_id(primary_key),
+                primary_finding_key=primary_key,
+                variant_finding_keys=variant_keys,
+                root_cause_summary=_root_cause_summary(primary.finding),
+                source_boundaries=boundaries,
+                affected_locations=affected,
+            )
+        )
+
+    primary_severity = {
+        key_by_id[id(vf)]: vf.finding.severity for vf in state.verified_findings
+    }
+    groups.sort(
+        key=lambda g: (
+            _severity_rank(primary_severity.get(g.primary_finding_key, "low")),
+            g.id,
+        )
+    )
+    return groups
+
+
+def _apply_group_membership(state: AuditRunState) -> None:
+    """Stamp ``root_cause_group_id`` on every verified finding."""
+    key_to_gid: dict[str, str] = {}
+    for g in state.root_cause_groups:
+        key_to_gid[g.primary_finding_key] = g.id
+        for v in g.variant_finding_keys:
+            key_to_gid[v] = g.id
+    for vf in state.verified_findings:
+        vf.root_cause_group_id = key_to_gid.get(_finding_key(vf.finding), "")
+
+
+def _artifact_target_findings(state: AuditRunState) -> list[VerifiedFinding]:
+    """Verified findings that should receive their own artifact entry.
+
+    Post-dedupe only the primary of each root-cause group renders; variants
+    appear inside the primary's report. When dedupe has not run yet
+    (older state, or before the dedupe phase fires) every verified
+    finding is its own target.
+    """
+    if not state.root_cause_groups:
+        return list(state.verified_findings)
+    primaries = {g.primary_finding_key for g in state.root_cause_groups}
+    return [
+        vf for vf in state.verified_findings
+        if _finding_key(vf.finding) in primaries
+    ]
+
+
+def _group_variants(
+    state: AuditRunState, group: RootCauseGroup
+) -> list[VerifiedFinding]:
+    by_key = {_finding_key(vf.finding): vf for vf in state.verified_findings}
+    return [by_key[k] for k in group.variant_finding_keys if k in by_key]
+
+
+def _parse_dedupe_body(body: str) -> list[dict[str, str]]:
+    directives: list[dict[str, str]] = []
+    for entry in body.split("\n---\n"):
+        parsed = _parse_kv_block(entry, ("action", "keep", "drop"), ())
+        action = parsed["action"].upper()
+        if action not in _DEDUPE_ACTIONS:
+            continue
+        keep = parsed["keep"]
+        drop = parsed["drop"]
+        if not keep or not drop or keep == drop:
+            continue
+        directives.append({"action": action, "keep": keep, "drop": drop})
+    return directives
+
+
+def _parse_dedupe_block(raw: str) -> list[dict[str, str]]:
+    """Parse the dedupe LLM response into merge directives.
+
+    Unknown keys are dropped so an over-eager LLM cannot invent a
+    finding the harness never proposed. Multiple fenced blocks favour
+    the last one so command output captured into the response cannot
+    poison the verdict.
+    """
+    matches = list(_DEDUPE_BLOCK_RE.finditer(raw or ""))
+    if not matches:
+        return []
+    return _parse_dedupe_body(matches[-1].group(1))
+
+
+_DEDUPE_SYSTEM = """\
+You merge near-duplicate verified security findings. You will receive
+pairs that share attacker model, attack class, finding type, source
+boundary, first reachability step, attacker position, and sink operation,
+but whose local-bug descriptions differ in wording.
+
+For each pair, decide MERGE if both descriptions point at the same
+underlying invariant break, otherwise KEEP. You must not invent new
+findings.
+
+Respond with one ```swival-audit-dedupe-v1 fenced block. Inside the
+block, separate directives with a line containing exactly `---`. Each
+directive has lines `action: MERGE|KEEP`, `keep: <finding_key>`, and
+`drop: <finding_key>` (the key whose finding will be folded into
+`keep`)."""
+
+
+def _prompt_assisted_dedupe(
+    state: AuditRunState,
+    ctx: InputContext | None,
+    groups: list[RootCauseGroup],
+) -> list[RootCauseGroup]:
+    """Optionally collapse ambiguous group pairs via a small LLM call.
+
+    Two groups are ambiguous when their primaries share
+    ``_ambiguity_key`` but differ on ``_heuristic_dedupe_key``: same
+    attacker model and sink, but the free-text invariant disagrees.
+    The LLM only chooses MERGE or KEEP per pair, and the total pair
+    count is hard-capped at ``_DEDUPE_MAX_PAIRS`` so a pathological
+    bucket cannot blow the dedupe prompt context.
+    """
+    if ctx is None or len(groups) < 2:
+        return groups
+    by_key = {_finding_key(vf.finding): vf for vf in state.verified_findings}
+    buckets: dict[tuple[str, ...], list[str]] = {}
+    for g in groups:
+        primary_vf = by_key.get(g.primary_finding_key)
+        if primary_vf is None:
+            continue
+        buckets.setdefault(_ambiguity_key(primary_vf.finding), []).append(
+            g.primary_finding_key
+        )
+    pairs: list[tuple[str, str]] = []
+    truncated = 0
+    for keys in buckets.values():
+        if len(keys) < 2:
+            continue
+        ordered = sorted(keys)
+        for i in range(len(ordered)):
+            for j in range(i + 1, len(ordered)):
+                if len(pairs) >= _DEDUPE_MAX_PAIRS:
+                    truncated += 1
+                    continue
+                pairs.append((ordered[i], ordered[j]))
+    if truncated:
+        state.metrics["root_cause_dedupe_pairs_truncated"] = (
+            state.metrics.get("root_cause_dedupe_pairs_truncated", 0) + truncated
+        )
+    if not pairs:
+        return groups
+
+    pair_blocks: list[str] = []
+    for a, b in pairs:
+        va = by_key[a]
+        vb = by_key[b]
+        pair_blocks.append(
+            json.dumps(
+                {
+                    "finding_a_key": a,
+                    "finding_a_local_bug": va.finding.local_bug,
+                    "finding_a_title": va.finding.title,
+                    "finding_b_key": b,
+                    "finding_b_local_bug": vb.finding.local_bug,
+                    "finding_b_title": vb.finding.title,
+                    "shared_source_boundary": va.finding.source_boundary,
+                    "shared_sink_operation": va.finding.sink_operation,
+                    "shared_attack_class": va.finding.attack_class,
+                },
+                indent=2,
+            )
+        )
+    user = "Ambiguous pairs to rule on:\n\n" + "\n\n---\n\n".join(pair_blocks)
+    messages = [
+        {"role": "system", "content": _DEDUPE_SYSTEM},
+        {"role": "user", "content": user},
+    ]
+    try:
+        raw = _call_audit_llm(ctx, messages, trace_task="audit: dedupe")
+    except Exception as e:
+        _debug_log("dedupe_llm_failed", error=str(e))
+        return groups
+
+    directives = _parse_dedupe_block(raw)
+    if not directives:
+        return groups
+
+    valid_keys = {g.primary_finding_key for g in groups}
+    merged_into: dict[str, str] = {}
+    for d in directives:
+        if d["action"] != _DEDUPE_ACTION_MERGE:
+            continue
+        keep = d["keep"]
+        drop = d["drop"]
+        if keep not in valid_keys or drop not in valid_keys or keep == drop:
+            continue
+        keep = merged_into.get(keep, keep)
+        if keep == drop:
+            continue
+        merged_into[drop] = keep
+    if not merged_into:
+        return groups
+
+    by_primary = {g.primary_finding_key: g for g in groups}
+    for drop_key, keep_key in merged_into.items():
+        dropped = by_primary.pop(drop_key, None)
+        target = by_primary.get(keep_key)
+        if dropped is None or target is None:
+            continue
+        target.variant_finding_keys.append(dropped.primary_finding_key)
+        target.variant_finding_keys.extend(dropped.variant_finding_keys)
+        target.source_boundaries = list(
+            dict.fromkeys(target.source_boundaries + dropped.source_boundaries)
+        )
+        target.affected_locations = list(
+            dict.fromkeys(target.affected_locations + dropped.affected_locations)
+        )
+    state.metrics["root_cause_prompt_merges"] = (
+        state.metrics.get("root_cause_prompt_merges", 0) + len(merged_into)
+    )
+    return list(by_primary.values())
+
+
+def _run_dedupe_phase(state: AuditRunState, ctx: "InputContext | None") -> None:
+    """Cluster verified findings into root-cause groups and advance the phase."""
+    if state.verified_findings:
+        groups = _build_root_cause_groups(state)
+        groups = _prompt_assisted_dedupe(state, ctx, groups)
+        state.root_cause_groups = groups
+        _apply_group_membership(state)
+        merged = sum(len(g.variant_finding_keys) for g in groups)
+        state.metrics["root_cause_groups"] = len(groups)
+        state.metrics["root_cause_variants_merged"] = merged
+        fmt.info(
+            f"phase dedupe: {len(groups)} root-cause group(s); "
+            f"merged {merged} variant(s)"
+        )
+    else:
+        state.root_cause_groups = []
+    state.phase = "artifacts"
+    state.save()
+
+
 _DISPROOF_SENTINEL = "swival-audit-disproof-v1"
 _DISPROOF_BLOCK_RE = re.compile(
     r"```" + _DISPROOF_SENTINEL + r"\s*\n(.*?)\n```",
@@ -4806,6 +5139,7 @@ def _phase5_report(
     patch_filename: str,
     patch_text: str,
     ctx: InputContext,
+    state: "AuditRunState | None" = None,
 ) -> str:
     """Generate the markdown report."""
     finding_json = json.dumps(asdict(vf.finding), indent=2)
@@ -4821,6 +5155,34 @@ def _phase5_report(
         f"Affected source:\n{evidence}\n\n"
         f"Patch ({patch_filename}):\n```diff\n{patch_text}```"
     )
+    group = None
+    variants: list[VerifiedFinding] = []
+    if state is not None and vf.root_cause_group_id:
+        for g in state.root_cause_groups:
+            if g.id == vf.root_cause_group_id:
+                group = g
+                variants = _group_variants(state, g)
+                break
+    if group and (group.variant_finding_keys or len(group.source_boundaries) > 1):
+        group_blob = {
+            "root_cause_summary": group.root_cause_summary,
+            "source_boundaries": group.source_boundaries,
+            "affected_locations": group.affected_locations,
+            "variants": [
+                {
+                    "title": v.finding.title,
+                    "severity": v.finding.severity,
+                    "source_boundary": v.finding.source_boundary,
+                    "locations": v.finding.locations,
+                    "reachability_path": v.finding.reachability_path,
+                }
+                for v in variants
+            ],
+        }
+        suffix += (
+            "\n\nRoot-cause group (list all variants under Affected Locations):\n"
+            + json.dumps(group_blob, indent=2)
+        )
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": suffix},
@@ -5015,9 +5377,9 @@ def _artifact_filenames(index: int, finding: FindingRecord) -> tuple[str, str]:
 
 
 def _ensure_artifact_state(state: AuditRunState) -> None:
-    """Ensure each verified finding has a stable artifact entry."""
+    """Ensure each artifact target finding has a stable artifact entry."""
     current: dict[str, VerifiedFinding] = {
-        _artifact_key(vf): vf for vf in state.verified_findings
+        _artifact_key(vf): vf for vf in _artifact_target_findings(state)
     }
     for key in list(state.artifact_state):
         if key not in current:
@@ -5087,9 +5449,10 @@ def _reset_artifact_targets_for_regen(
     state: AuditRunState, selected_indexes: set[int] | None
 ) -> None:
     _ensure_artifact_state(state)
+    targets = _artifact_target_findings(state)
     selected_keys = {
         _artifact_key(vf)
-        for i, vf in enumerate(state.verified_findings)
+        for i, vf in enumerate(targets)
         if selected_indexes is None or i in selected_indexes
     }
     for key in selected_keys:
@@ -5101,7 +5464,9 @@ def _reset_artifact_targets_for_regen(
 
 def _artifact_summary(state: AuditRunState) -> tuple[int, int, int]:
     entries = [
-        state.artifact_state[_artifact_key(vf)] for vf in state.verified_findings
+        state.artifact_state[_artifact_key(vf)]
+        for vf in _artifact_target_findings(state)
+        if _artifact_key(vf) in state.artifact_state
     ]
     failed = sum(1 for e in entries if e.get("status") == "failed")
     pending = sum(1 for e in entries if e.get("status") == "pending")
@@ -5468,10 +5833,11 @@ def _run_audit_phases(
         if regen:
             if not state.verified_findings:
                 return "error: no verified findings to regenerate artifacts for."
+            regen_targets = _artifact_target_findings(state)
             if finding_selector is not None:
                 try:
                     selected_indexes = _parse_finding_selector(
-                        finding_selector, len(state.verified_findings)
+                        finding_selector, len(regen_targets)
                     )
                 except ValueError as e:
                     return f"error: {e}"
@@ -5481,7 +5847,7 @@ def _run_audit_phases(
             label = (
                 f"{len(selected_indexes)} selected"
                 if selected_indexes is not None
-                else f"{len(state.verified_findings)} verified"
+                else f"{len(regen_targets)} target(s)"
             )
             fmt.info(
                 f"regenerating artifacts for audit run {state.run_id} "
@@ -6334,9 +6700,12 @@ def _run_audit_phases(
                 deduped_vf.append(vf)
         state.verified_findings = deduped_vf
 
-        state.phase = "artifacts"
+        state.phase = "dedupe"
         state.save()
         fmt.info(f"phase 4 complete. {len(state.verified_findings)} verified findings.")
+
+    if state.phase == "dedupe":
+        _run_dedupe_phase(state, ctx)
 
     # Phase 5: artifacts
     if state.phase == "artifacts":
@@ -6345,9 +6714,10 @@ def _run_audit_phases(
             artifact_dir.mkdir(parents=True, exist_ok=True)
             _ensure_artifact_state(state)
 
+            primaries = _artifact_target_findings(state)
             targets = []
-            total = len(state.verified_findings)
-            for fi, vf in enumerate(state.verified_findings, 1):
+            total = len(primaries)
+            for fi, vf in enumerate(primaries, 1):
                 key = _artifact_key(vf)
                 entry = state.artifact_state[key]
                 if selected_indexes is not None:
@@ -6359,7 +6729,7 @@ def _run_audit_phases(
             if targets:
                 fmt.info(
                     f"phase 5: generating artifacts for {len(targets)} "
-                    f"of {len(state.verified_findings)} findings..."
+                    f"of {total} root-cause group(s)..."
                 )
 
             for target_i, (fi, vf, key, entry) in enumerate(targets, 1):
@@ -6390,7 +6760,11 @@ def _run_audit_phases(
                 fmt.info(f"  [{fi}/{total}] generating report...")
                 try:
                     report_text = _phase5_report(
-                        vf, patch_filename, patch_result.patch_text, ctx
+                        vf,
+                        patch_filename,
+                        patch_result.patch_text,
+                        ctx,
+                        state=state,
                     )
                 except Exception as e:
                     _mark_artifact_failed(

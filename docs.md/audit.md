@@ -141,6 +141,14 @@ Gapfill expansion is bounded. The cap is `--gapfill N` if set, otherwise `[audit
 
 The pipeline runs at most one gapfill round per run. Once `state.gapfill_round` has been advanced, any subsequent re-entry into the gapfill phase short-circuits to verification, including on `/audit --resume` after a transient failure during the follow-up pass. Coverage information that surfaces from gapfill tasks themselves is therefore intentionally ineligible for further gapfill: the harness trades a (very rare) third-order coverage gap for a hard upper bound on cost. Re-run from scratch if you want a second gapfill round against the same commit.
 
+### Phase 4d: Root-cause Dedupe
+
+Before artifacts are generated, verified findings cluster into root-cause groups. Two findings share a group only when they agree on every key boundary-sensitive field: attack class, finding type, source boundary, first reachability step, attacker position, sink operation, and the normalized invariant break. Exact duplicates that survived earlier dedupe collapse here too.
+
+This is deliberately conservative. Two endpoints can share a vulnerable helper but expose it through different boundaries; those stay separate reports because the attacker reachability and impact differ. When the heuristic key is ambiguous, meaning two groups share everything except the free-text invariant, a small dedupe prompt is asked to choose MERGE or KEEP per pair. The prompt cannot invent findings, only fold one into another.
+
+Group records are persisted, the primary finding of each group is what Phase 5 renders, and variant locations appear inside the primary's `## Affected Locations` section.
+
 ### Phase 5: Artifact Generation
 
 For each verified finding:
@@ -201,6 +209,8 @@ swival> /audit --resume
 `--regen` regenerates reports and patches for a completed audit run. It reuses the verified findings from the original run and re-runs only phase 5 (artifact generation). This is useful when you want to improve patch quality without repeating the expensive triage, deep review, and verification phases.
 
 Use `--finding` with 1-based Phase 5 finding numbers to regenerate only selected artifacts. `--finding` requires `--regen` and is rejected if you pass it on a fresh run.
+
+Finding numbers index into the post-dedupe artifact list, which is one entry per root-cause group, not one per raw verified finding. If Phase 4d folded three variants into a single group, that group is one number and one regenerate target; selecting it regenerates the primary report which already lists the variant locations. The 1-based ordering is stable across resumes because the underlying artifact entries carry stable indexes.
 
 ```text
 swival> /audit --regen

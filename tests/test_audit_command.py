@@ -4990,8 +4990,6 @@ class TestHarnessStateRoundtrip:
                 root_cause_summary="ssrf",
                 source_boundaries=["POST /webhook"],
                 affected_locations=["a.py:1"],
-                finding_type="vulnerability",
-                attack_class="ssrf",
             )
         )
         state.save()
@@ -5368,7 +5366,7 @@ class TestVerificationGates:
         )
         monkeypatch.setattr(
             "swival.audit._phase5_report",
-            lambda vf, patch_fn, patch_text, ctx: (_ for _ in ()).throw(
+            lambda vf, patch_fn, patch_text, ctx, **kw: (_ for _ in ()).throw(
                 RuntimeError("boom")
             ),
         )
@@ -5409,7 +5407,7 @@ class TestVerificationGates:
         )
         monkeypatch.setattr(
             "swival.audit._phase5_report",
-            lambda vf, patch_fn, patch_text, ctx: "# report",
+            lambda vf, patch_fn, patch_text, ctx, **kw: "# report",
         )
 
         _run_audit_phases(
@@ -5452,7 +5450,7 @@ class TestVerificationGates:
         )
         monkeypatch.setattr(
             "swival.audit._phase5_report",
-            lambda vf, patch_fn, patch_text, ctx: "# report",
+            lambda vf, patch_fn, patch_text, ctx, **kw: "# report",
         )
 
         _run_audit_phases(
@@ -5495,7 +5493,7 @@ class TestVerificationGates:
         )
         monkeypatch.setattr(
             "swival.audit._phase5_report",
-            lambda vf, patch_fn, patch_text, ctx: "# report",
+            lambda vf, patch_fn, patch_text, ctx, **kw: "# report",
         )
 
         _run_audit_phases(
@@ -5536,7 +5534,7 @@ class TestVerificationGates:
         )
         monkeypatch.setattr(
             "swival.audit._phase5_report",
-            lambda vf, patch_fn, patch_text, ctx: "# report",
+            lambda vf, patch_fn, patch_text, ctx, **kw: "# report",
         )
 
         result = _run_audit_phases(
@@ -7298,7 +7296,7 @@ class TestAutoRetry:
         )
         monkeypatch.setattr(
             "swival.audit._phase5_report",
-            lambda vf, patch_fn, patch_text, ctx: "# Report",
+            lambda vf, patch_fn, patch_text, ctx, **kw: "# Report",
         )
 
         ctx = SimpleNamespace(
@@ -8107,7 +8105,7 @@ class TestSelectAll:
         )
         monkeypatch.setattr(
             "swival.audit._phase5_report",
-            lambda vf, patch_fn, patch_text, ctx: "# Report",
+            lambda vf, patch_fn, patch_text, ctx, **kw: "# Report",
         )
 
     def test_select_all_skips_phase2_triage(self, monkeypatch, tmp_path):
@@ -9168,3 +9166,460 @@ class TestResumeForceReview:
             "forced via swival.toml" in r
             for r in loaded.triage_records["a.py"].promotion_reasons
         )
+
+
+def _ssrf_verified(
+    *,
+    title: str = "ssrf via webhook",
+    severity: str = "high",
+    source_boundary: str = "POST /webhook",
+    first_reach: str = "handle_webhook",
+    reachability_path: list[str] | None = None,
+    sink: str = "outbound HTTP GET",
+    local_bug: str = "unguarded fetch of attacker URL",
+    attacker_position: str = "unauthenticated remote client",
+    locations: list[str] | None = None,
+    finding_type: str = "vulnerability",
+    attack_class: str = "ssrf",
+) -> VerifiedFinding:
+    finding = FindingRecord(
+        title=title,
+        finding_type=finding_type,
+        severity=severity,
+        locations=locations if locations is not None else ["webhook.py:10"],
+        preconditions=[],
+        proof=[],
+        fix_outline="guard host",
+        source_file="webhook.py",
+        local_bug=local_bug,
+        source_boundary=source_boundary,
+        reachability_path=(
+            reachability_path
+            if reachability_path is not None
+            else [first_reach, source_boundary]
+        ),
+        sink_operation=sink,
+        exploit_chain=[],
+        reachability_status="reachable",
+        attack_class=attack_class,
+        attacker_position=attacker_position,
+        controlled_inputs=["callback_url"],
+    )
+    return VerifiedFinding(
+        finding=finding,
+        correctness_reason="ok",
+        rebuttal_reason="n/a",
+    )
+
+
+def _dedupe_state(tmp_path: Path) -> AuditRunState:
+    scope = AuditScope(
+        branch="main",
+        commit="abc",
+        tracked_files=["webhook.py"],
+        mandatory_files=["webhook.py"],
+        focus=[],
+    )
+    return AuditRunState(
+        run_id="dedupe-run",
+        scope=scope,
+        queued_files=["webhook.py"],
+        state_dir=tmp_path / ".swival" / "audit",
+    )
+
+
+class TestRootCauseDedupeHeuristic:
+    def test_heuristic_key_ignores_case_and_whitespace(self):
+        from swival.audit import _heuristic_dedupe_key
+
+        a = _ssrf_verified(source_boundary="POST /webhook").finding
+        b = _ssrf_verified(source_boundary="post  /webhook").finding
+        assert _heuristic_dedupe_key(a) == _heuristic_dedupe_key(b)
+
+    def test_different_source_boundary_keeps_groups_separate(self, tmp_path):
+        from swival.audit import _build_root_cause_groups
+
+        state = _dedupe_state(tmp_path)
+        state.verified_findings = [
+            _ssrf_verified(
+                source_boundary="POST /webhook",
+                locations=["webhook.py:10"],
+            ),
+            _ssrf_verified(
+                source_boundary="POST /relay",
+                locations=["webhook.py:42"],
+            ),
+        ]
+        groups = _build_root_cause_groups(state)
+        assert len(groups) == 2
+        assert all(len(g.variant_finding_keys) == 0 for g in groups)
+
+    def test_same_boundary_variants_merge_into_one_group(self, tmp_path):
+        from swival.audit import _build_root_cause_groups
+
+        state = _dedupe_state(tmp_path)
+        state.verified_findings = [
+            _ssrf_verified(
+                title="ssrf via webhook (handler)",
+                locations=["webhook.py:10"],
+                severity="medium",
+            ),
+            _ssrf_verified(
+                title="ssrf via webhook (retry path)",
+                locations=["webhook.py:75"],
+                severity="high",
+            ),
+        ]
+        groups = _build_root_cause_groups(state)
+        assert len(groups) == 1
+        g = groups[0]
+        assert len(g.variant_finding_keys) == 1
+        assert "webhook.py:10" in g.affected_locations
+        assert "webhook.py:75" in g.affected_locations
+        primary_key = g.primary_finding_key
+        primary_vf = next(
+            vf
+            for vf in state.verified_findings
+            if _finding_key(vf.finding) == primary_key
+        )
+        assert primary_vf.finding.severity == "high"
+
+    def test_different_first_reachability_step_keeps_groups_separate(self, tmp_path):
+        from swival.audit import _build_root_cause_groups
+
+        state = _dedupe_state(tmp_path)
+        state.verified_findings = [
+            _ssrf_verified(first_reach="handle_webhook"),
+            _ssrf_verified(first_reach="handle_webhook_retry"),
+        ]
+        groups = _build_root_cause_groups(state)
+        assert len(groups) == 2
+
+    def test_exact_duplicates_collapse_into_one_group(self, tmp_path):
+        from swival.audit import _build_root_cause_groups
+
+        state = _dedupe_state(tmp_path)
+        v1 = _ssrf_verified()
+        v2 = _ssrf_verified()
+        state.verified_findings = [v1, v2]
+        groups = _build_root_cause_groups(state)
+        assert len(groups) == 1
+        assert groups[0].variant_finding_keys == []
+
+    def test_apply_group_membership_stamps_ids(self, tmp_path):
+        from swival.audit import _apply_group_membership, _build_root_cause_groups
+
+        state = _dedupe_state(tmp_path)
+        state.verified_findings = [
+            _ssrf_verified(title="A"),
+            _ssrf_verified(title="B"),
+            _ssrf_verified(source_boundary="POST /relay", title="C"),
+        ]
+        state.root_cause_groups = _build_root_cause_groups(state)
+        _apply_group_membership(state)
+        assigned = {vf.root_cause_group_id for vf in state.verified_findings}
+        assert "" not in assigned
+        assert len(assigned) == 2
+
+    def test_groups_sort_by_severity_then_id(self, tmp_path):
+        from swival.audit import _build_root_cause_groups
+
+        state = _dedupe_state(tmp_path)
+        state.verified_findings = [
+            _ssrf_verified(
+                source_boundary="POST /low", severity="low", title="lo"
+            ),
+            _ssrf_verified(
+                source_boundary="POST /crit",
+                severity="critical",
+                title="cr",
+            ),
+            _ssrf_verified(
+                source_boundary="POST /med",
+                severity="medium",
+                title="md",
+            ),
+        ]
+        groups = _build_root_cause_groups(state)
+        severities = []
+        by_key = {_finding_key(vf.finding): vf for vf in state.verified_findings}
+        for g in groups:
+            severities.append(by_key[g.primary_finding_key].finding.severity)
+        assert severities == ["critical", "medium", "low"]
+
+
+class TestArtifactTargetFindings:
+    def test_returns_all_when_no_groups(self, tmp_path):
+        from swival.audit import _artifact_target_findings
+
+        state = _dedupe_state(tmp_path)
+        state.verified_findings = [_ssrf_verified(title="a"), _ssrf_verified(title="b")]
+        assert _artifact_target_findings(state) == state.verified_findings
+
+    def test_returns_primaries_only_when_groups_set(self, tmp_path):
+        from swival.audit import (
+            _apply_group_membership,
+            _artifact_target_findings,
+            _build_root_cause_groups,
+        )
+
+        state = _dedupe_state(tmp_path)
+        state.verified_findings = [
+            _ssrf_verified(title="A", severity="high"),
+            _ssrf_verified(title="B", severity="low"),
+            _ssrf_verified(source_boundary="POST /relay", title="C"),
+        ]
+        state.root_cause_groups = _build_root_cause_groups(state)
+        _apply_group_membership(state)
+        targets = _artifact_target_findings(state)
+        assert len(targets) == 2
+        target_keys = {_finding_key(vf.finding) for vf in targets}
+        primary_keys = {g.primary_finding_key for g in state.root_cause_groups}
+        assert target_keys == primary_keys
+
+
+class TestPromptAssistedDedupe:
+    def test_no_pairs_returns_groups_unchanged(self, tmp_path):
+        from swival.audit import _build_root_cause_groups, _prompt_assisted_dedupe
+
+        state = _dedupe_state(tmp_path)
+        state.verified_findings = [
+            _ssrf_verified(source_boundary="POST /a"),
+            _ssrf_verified(source_boundary="POST /b"),
+        ]
+        groups = _build_root_cause_groups(state)
+        result = _prompt_assisted_dedupe(state, None, groups)
+        assert result == groups
+
+    def test_merges_ambiguous_pair_on_llm_merge(self, monkeypatch, tmp_path):
+        from swival.audit import _build_root_cause_groups, _prompt_assisted_dedupe
+
+        state = _dedupe_state(tmp_path)
+        state.verified_findings = [
+            _ssrf_verified(
+                local_bug="missing host check before fetch",
+                title="ssrf phrased one way",
+            ),
+            _ssrf_verified(
+                local_bug="callback url is not validated against allowlist",
+                title="ssrf phrased another way",
+            ),
+        ]
+        groups = _build_root_cause_groups(state)
+        assert len(groups) == 2
+        keys = sorted(g.primary_finding_key for g in groups)
+        assert len(keys) == 2
+
+        def fake_llm(ctx, messages, trace_task=None):
+            return (
+                "I think these match.\n"
+                "```swival-audit-dedupe-v1\n"
+                f"action: MERGE\nkeep: {keys[0]}\ndrop: {keys[1]}\n"
+                "```\n"
+            )
+
+        monkeypatch.setattr("swival.audit._call_audit_llm", fake_llm)
+
+        from types import SimpleNamespace
+
+        ctx = SimpleNamespace(base_dir=str(tmp_path), loop_kwargs={})
+        merged = _prompt_assisted_dedupe(state, ctx, groups)
+        assert len(merged) == 1
+        assert keys[1] in merged[0].variant_finding_keys
+        assert state.metrics.get("root_cause_prompt_merges") == 1
+
+    def test_keep_directive_leaves_groups_intact(self, monkeypatch, tmp_path):
+        from swival.audit import _build_root_cause_groups, _prompt_assisted_dedupe
+
+        state = _dedupe_state(tmp_path)
+        state.verified_findings = [
+            _ssrf_verified(local_bug="one"),
+            _ssrf_verified(local_bug="two"),
+        ]
+        groups = _build_root_cause_groups(state)
+        keys = sorted(g.primary_finding_key for g in groups)
+
+        def fake_llm(ctx, messages, trace_task=None):
+            return (
+                "```swival-audit-dedupe-v1\n"
+                f"action: KEEP\nkeep: {keys[0]}\ndrop: {keys[1]}\n"
+                "```\n"
+            )
+
+        monkeypatch.setattr("swival.audit._call_audit_llm", fake_llm)
+
+        from types import SimpleNamespace
+
+        ctx = SimpleNamespace(base_dir=str(tmp_path), loop_kwargs={})
+        result = _prompt_assisted_dedupe(state, ctx, groups)
+        assert len(result) == 2
+
+    def test_invalid_keys_in_directive_ignored(self, monkeypatch, tmp_path):
+        from swival.audit import _build_root_cause_groups, _prompt_assisted_dedupe
+
+        state = _dedupe_state(tmp_path)
+        state.verified_findings = [
+            _ssrf_verified(local_bug="one"),
+            _ssrf_verified(local_bug="two"),
+        ]
+        groups = _build_root_cause_groups(state)
+
+        def fake_llm(ctx, messages, trace_task=None):
+            return (
+                "```swival-audit-dedupe-v1\n"
+                "action: MERGE\nkeep: nonexistent\ndrop: also-not-real\n"
+                "```\n"
+            )
+
+        monkeypatch.setattr("swival.audit._call_audit_llm", fake_llm)
+
+        from types import SimpleNamespace
+
+        ctx = SimpleNamespace(base_dir=str(tmp_path), loop_kwargs={})
+        result = _prompt_assisted_dedupe(state, ctx, groups)
+        assert len(result) == 2
+
+    def test_llm_failure_falls_back_to_heuristic(self, monkeypatch, tmp_path):
+        from swival.audit import _build_root_cause_groups, _prompt_assisted_dedupe
+
+        state = _dedupe_state(tmp_path)
+        state.verified_findings = [
+            _ssrf_verified(local_bug="one"),
+            _ssrf_verified(local_bug="two"),
+        ]
+        groups = _build_root_cause_groups(state)
+
+        def boom(ctx, messages, trace_task=None):
+            raise RuntimeError("transport failure")
+
+        monkeypatch.setattr("swival.audit._call_audit_llm", boom)
+
+        from types import SimpleNamespace
+
+        ctx = SimpleNamespace(base_dir=str(tmp_path), loop_kwargs={})
+        result = _prompt_assisted_dedupe(state, ctx, groups)
+        assert len(result) == 2
+
+
+class TestDedupePhaseTransition:
+    def test_dedupe_phase_populates_groups_and_advances(self, tmp_path):
+        from swival.audit import _run_dedupe_phase
+
+        state = _dedupe_state(tmp_path)
+        state.verified_findings = [
+            _ssrf_verified(title="A"),
+            _ssrf_verified(title="B"),
+        ]
+        state.phase = "dedupe"
+
+        _run_dedupe_phase(state, None)
+
+        assert len(state.root_cause_groups) == 1
+        assert state.metrics["root_cause_groups"] == 1
+        assert state.metrics["root_cause_variants_merged"] == 1
+        assert state.phase == "artifacts"
+
+    def test_dedupe_phase_with_no_findings_clears_groups(self, tmp_path):
+        from swival.audit import _run_dedupe_phase
+
+        state = _dedupe_state(tmp_path)
+        state.phase = "dedupe"
+        _run_dedupe_phase(state, None)
+        assert state.root_cause_groups == []
+        assert state.phase == "artifacts"
+
+    def test_dedupe_state_roundtrips(self, tmp_path):
+        from swival.audit import _build_root_cause_groups
+
+        state = _dedupe_state(tmp_path)
+        state.verified_findings = [
+            _ssrf_verified(title="A"),
+            _ssrf_verified(title="B"),
+        ]
+        state.root_cause_groups = _build_root_cause_groups(state)
+        for vf in state.verified_findings:
+            for g in state.root_cause_groups:
+                if (
+                    _finding_key(vf.finding) == g.primary_finding_key
+                    or _finding_key(vf.finding) in g.variant_finding_keys
+                ):
+                    vf.root_cause_group_id = g.id
+        state.save()
+        loaded = AuditRunState.load(state.state_dir, state.run_id)
+        assert len(loaded.root_cause_groups) == 1
+        assert loaded.root_cause_groups[0].id == state.root_cause_groups[0].id
+        gids = {vf.root_cause_group_id for vf in loaded.verified_findings}
+        assert gids == {state.root_cause_groups[0].id}
+
+
+class TestRootCauseGroupLoadCompat:
+    def test_load_tolerates_unknown_root_cause_group_keys(self, tmp_path):
+        import json
+
+        from swival.audit import AuditRunState, RootCauseGroup
+
+        state = _dedupe_state(tmp_path)
+        state.verified_findings = [_ssrf_verified(title="A")]
+        state.root_cause_groups = [
+            RootCauseGroup(
+                id="g1",
+                primary_finding_key="aaa",
+                variant_finding_keys=[],
+                root_cause_summary="ssrf",
+                source_boundaries=["POST /webhook"],
+                affected_locations=["webhook.py:10"],
+            )
+        ]
+        state.save()
+        state_path = state.state_dir / state.run_id / "state.json"
+        blob = json.loads(state_path.read_text())
+        blob["root_cause_groups"][0]["finding_type"] = "vulnerability"
+        blob["root_cause_groups"][0]["attack_class"] = "ssrf"
+        blob["root_cause_groups"][0]["legacy_unused_field"] = "x"
+        state_path.write_text(json.dumps(blob))
+
+        loaded = AuditRunState.load(state.state_dir, state.run_id)
+        assert loaded.root_cause_groups[0].id == "g1"
+
+
+class TestParseDedupeBlock:
+    def test_parses_multiple_directives(self):
+        from swival.audit import _parse_dedupe_block
+
+        raw = (
+            "```swival-audit-dedupe-v1\n"
+            "action: MERGE\nkeep: aaa\ndrop: bbb\n"
+            "---\n"
+            "action: KEEP\nkeep: ccc\ndrop: ddd\n"
+            "```\n"
+        )
+        directives = _parse_dedupe_block(raw)
+        assert directives == [
+            {"action": "MERGE", "keep": "aaa", "drop": "bbb"},
+            {"action": "KEEP", "keep": "ccc", "drop": "ddd"},
+        ]
+
+    def test_no_block_returns_empty(self):
+        from swival.audit import _parse_dedupe_block
+
+        assert _parse_dedupe_block("no fenced block here") == []
+
+    def test_missing_keys_skipped(self):
+        from swival.audit import _parse_dedupe_block
+
+        raw = (
+            "```swival-audit-dedupe-v1\n"
+            "action: MERGE\ndrop: bbb\n"
+            "```"
+        )
+        assert _parse_dedupe_block(raw) == []
+
+    def test_unknown_action_skipped(self):
+        from swival.audit import _parse_dedupe_block
+
+        raw = (
+            "```swival-audit-dedupe-v1\n"
+            "action: REJECT\nkeep: aaa\ndrop: bbb\n"
+            "```"
+        )
+        assert _parse_dedupe_block(raw) == []
