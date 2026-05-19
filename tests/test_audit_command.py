@@ -4072,6 +4072,579 @@ class TestProofStrictResumeRetriesGapfill:
         )
 
 
+def _gapfill_state(tmp_path: Path):
+    """Build an AuditRunState with one round-0 hunt task and one CoverageRecord."""
+    from swival.audit import (
+        AuditRunState,
+        AuditScope,
+        CoverageRecord,
+        HuntTask,
+    )
+
+    scope = AuditScope(
+        branch="m",
+        commit="c",
+        tracked_files=["a.py", "b.py", "c.py"],
+        mandatory_files=["a.py", "b.py", "c.py"],
+        focus=[],
+    )
+    state = AuditRunState(
+        run_id="gf1",
+        scope=scope,
+        queued_files=list(scope.mandatory_files),
+        state_dir=tmp_path / ".swival" / "audit",
+        hunt_mode=True,
+    )
+    parent = HuntTask(
+        id="ssrf-parent",
+        task_kind="hunt",
+        attack_class="ssrf",
+        attacker_position="unauthenticated remote client",
+        controlled_inputs=["callback_url"],
+        trust_boundary_crossed="POST /webhook",
+        scope_hint="src/api/**",
+        seed_files=["a.py", "b.py"],
+        seed_symbols=["fetch_remote"],
+        sink_files=["c.py"],
+        source="phase1",
+        priority="high",
+        status="done",
+        language_hint="python",
+    )
+    state.hunt_tasks[parent.id] = parent
+    state.coverage_records[parent.id] = CoverageRecord(
+        task_id=parent.id,
+        observed_files=["a.py"],
+        observed_symbols=["fetch_remote"],
+        observed_edges=[],
+        covered_fraction_of_seed_files=0.5,
+        covered_fraction_of_sink_hits=0.0,
+        unobserved_high_priority_seeds=["b.py", "c.py"],
+        explicit_not_covered=["redirect chain"],
+        followup_task_ids=[],
+        confidence="medium",
+    )
+    return state, parent
+
+
+def _add_hunt_clones(state, parent, prefix, count, **overrides):
+    """Add ``count`` round-0 hunt tasks cloned from ``parent``."""
+    from swival.audit import HuntTask
+
+    for i in range(count):
+        t = HuntTask(
+            id=f"{prefix}{i}",
+            task_kind="hunt",
+            attack_class=parent.attack_class,
+            attacker_position=parent.attacker_position,
+            controlled_inputs=list(parent.controlled_inputs),
+            trust_boundary_crossed=parent.trust_boundary_crossed,
+            scope_hint=parent.scope_hint,
+            seed_files=parent.seed_files,
+            seed_symbols=parent.seed_symbols,
+            sink_files=parent.sink_files,
+            source=overrides.get("source", "phase1"),
+            priority=overrides.get("priority", "medium"),
+            status=overrides.get("status", "done"),
+        )
+        state.hunt_tasks[t.id] = t
+
+
+class TestEffectiveGapfillCap:
+    def test_operator_override_wins(self, tmp_path):
+        from swival.audit import _effective_gapfill_cap
+
+        state, _ = _gapfill_state(tmp_path)
+        state.max_gapfill_tasks = 7
+        assert _effective_gapfill_cap(state) == 7
+
+    def test_default_is_quarter_of_round_zero_hunt_tasks(self, tmp_path):
+        from swival.audit import _effective_gapfill_cap
+
+        state, parent = _gapfill_state(tmp_path)
+        _add_hunt_clones(state, parent, "x", 19)
+        # 20 round-0 hunt tasks -> ceil(20 * 0.25) -> 5
+        assert _effective_gapfill_cap(state) == 5
+
+    def test_default_rounds_up_fractional_quarter(self, tmp_path):
+        from swival.audit import _effective_gapfill_cap
+
+        state, parent = _gapfill_state(tmp_path)
+        _add_hunt_clones(state, parent, "r", 8)
+        # 9 tasks -> ceil(9 * 0.25) -> 3 (floor would give 2 and under-feed).
+        assert _effective_gapfill_cap(state) == 3
+
+    def test_default_caps_at_fifty(self, tmp_path):
+        from swival.audit import _effective_gapfill_cap
+
+        state, parent = _gapfill_state(tmp_path)
+        _add_hunt_clones(state, parent, "y", 400)
+        assert _effective_gapfill_cap(state) == 50
+
+    def test_zero_when_no_round_zero_hunt_tasks(self, tmp_path):
+        from swival.audit import AuditRunState, AuditScope, _effective_gapfill_cap
+
+        scope = AuditScope(
+            branch="m",
+            commit="c",
+            tracked_files=["a.py"],
+            mandatory_files=["a.py"],
+            focus=[],
+        )
+        state = AuditRunState(
+            run_id="gf0",
+            scope=scope,
+            queued_files=["a.py"],
+            state_dir=tmp_path / ".swival" / "audit",
+        )
+        assert _effective_gapfill_cap(state) == 0
+
+    def test_gapfill_source_tasks_excluded_from_default_formula(self, tmp_path):
+        from swival.audit import _effective_gapfill_cap
+
+        state, parent = _gapfill_state(tmp_path)
+        parent.source = "gapfill"
+        assert _effective_gapfill_cap(state) == 0
+
+
+class TestGapfillCandidates:
+    def test_eligible_record_is_picked(self, tmp_path):
+        from swival.audit import _gapfill_candidates
+
+        state, _ = _gapfill_state(tmp_path)
+        cands = _gapfill_candidates(state)
+        assert len(cands) == 1
+        assert cands[0][0].id == "ssrf-parent"
+
+    def test_high_confidence_is_skipped(self, tmp_path):
+        from swival.audit import _gapfill_candidates
+
+        state, parent = _gapfill_state(tmp_path)
+        state.coverage_records[parent.id].confidence = "high"
+        assert _gapfill_candidates(state) == []
+
+    def test_existing_followups_skip_record(self, tmp_path):
+        from swival.audit import _gapfill_candidates
+
+        state, parent = _gapfill_state(tmp_path)
+        state.coverage_records[parent.id].followup_task_ids = ["already"]
+        assert _gapfill_candidates(state) == []
+
+    def test_low_priority_parent_is_skipped(self, tmp_path):
+        from swival.audit import _gapfill_candidates
+
+        state, parent = _gapfill_state(tmp_path)
+        parent.priority = "low"
+        assert _gapfill_candidates(state) == []
+
+    def test_gapfill_source_parent_is_skipped(self, tmp_path):
+        from swival.audit import _gapfill_candidates
+
+        state, parent = _gapfill_state(tmp_path)
+        parent.source = "gapfill"
+        assert _gapfill_candidates(state) == []
+
+    def test_no_unobserved_and_no_not_covered_skips(self, tmp_path):
+        from swival.audit import _gapfill_candidates
+
+        state, parent = _gapfill_state(tmp_path)
+        state.coverage_records[parent.id].unobserved_high_priority_seeds = []
+        state.coverage_records[parent.id].explicit_not_covered = []
+        assert _gapfill_candidates(state) == []
+
+    def test_failed_status_parent_is_skipped(self, tmp_path):
+        from swival.audit import _gapfill_candidates
+
+        state, parent = _gapfill_state(tmp_path)
+        parent.status = "failed"
+        assert _gapfill_candidates(state) == []
+
+    def test_reachability_task_kind_skipped(self, tmp_path):
+        from swival.audit import _gapfill_candidates
+
+        state, parent = _gapfill_state(tmp_path)
+        parent.task_kind = "reachability"
+        assert _gapfill_candidates(state) == []
+
+
+class TestGenerateGapfillTasks:
+    def test_followup_inherits_attacker_model(self, tmp_path):
+        from swival.audit import _generate_gapfill_tasks
+
+        state, parent = _gapfill_state(tmp_path)
+        tasks = _generate_gapfill_tasks(state, cap=5)
+        assert len(tasks) == 1
+        t = tasks[0]
+        assert t.attack_class == parent.attack_class
+        assert t.attacker_position == parent.attacker_position
+        assert t.controlled_inputs == parent.controlled_inputs
+        assert t.trust_boundary_crossed == parent.trust_boundary_crossed
+        assert t.source == "gapfill"
+        assert t.parent_task_id == parent.id
+        assert t.task_kind == "hunt"
+
+    def test_seed_files_narrow_to_unobserved(self, tmp_path):
+        from swival.audit import _generate_gapfill_tasks
+
+        state, _ = _gapfill_state(tmp_path)
+        tasks = _generate_gapfill_tasks(state, cap=5)
+        assert tasks[0].seed_files == ["b.py", "c.py"]
+
+    def test_scope_hint_includes_not_covered_blurb(self, tmp_path):
+        from swival.audit import _generate_gapfill_tasks
+
+        state, _ = _gapfill_state(tmp_path)
+        tasks = _generate_gapfill_tasks(state, cap=5)
+        assert tasks[0].scope_hint.startswith("gapfill: redirect chain")
+
+    def test_cap_respected(self, tmp_path):
+        from swival.audit import CoverageRecord, HuntTask, _generate_gapfill_tasks
+
+        state, parent = _gapfill_state(tmp_path)
+        # Add 5 more eligible parents.
+        for i in range(5):
+            t = HuntTask(
+                id=f"clone-{i}",
+                task_kind="hunt",
+                attack_class="ssrf",
+                attacker_position="unauthenticated remote client",
+                controlled_inputs=["callback_url"],
+                trust_boundary_crossed="POST /webhook",
+                scope_hint=f"src/api/{i}/**",
+                seed_files=[f"u{i}.py"],
+                seed_symbols=[],
+                sink_files=[],
+                source="phase1",
+                priority="medium",
+                status="done",
+            )
+            state.hunt_tasks[t.id] = t
+            state.coverage_records[t.id] = CoverageRecord(
+                task_id=t.id,
+                unobserved_high_priority_seeds=[f"o{i}.py"],
+                confidence="low",
+            )
+        tasks = _generate_gapfill_tasks(state, cap=3)
+        assert len(tasks) == 3
+
+    def test_zero_cap_generates_nothing(self, tmp_path):
+        from swival.audit import _generate_gapfill_tasks
+
+        state, _ = _gapfill_state(tmp_path)
+        assert _generate_gapfill_tasks(state, cap=0) == []
+
+    def test_followup_stamped_on_coverage_record(self, tmp_path):
+        from swival.audit import _generate_gapfill_tasks
+
+        state, parent = _gapfill_state(tmp_path)
+        tasks = _generate_gapfill_tasks(state, cap=5)
+        cov = state.coverage_records[parent.id]
+        assert cov.followup_task_ids == [tasks[0].id]
+
+    def test_already_stamped_record_skipped(self, tmp_path):
+        from swival.audit import _generate_gapfill_tasks
+
+        state, parent = _gapfill_state(tmp_path)
+        state.coverage_records[parent.id].followup_task_ids = ["earlier"]
+        assert _generate_gapfill_tasks(state, cap=5) == []
+
+    def test_id_collision_skipped(self, tmp_path):
+        from swival.audit import _generate_gapfill_tasks, _hunt_task_id
+
+        state, parent = _gapfill_state(tmp_path)
+        cov = state.coverage_records[parent.id]
+        seed_files = cov.unobserved_high_priority_seeds[:8]
+        blurb = "; ".join(cov.explicit_not_covered[:2])
+        scope_hint = f"gapfill: {blurb}"[:200]
+        collision_id = _hunt_task_id(
+            parent.attack_class,
+            parent.attacker_position,
+            scope_hint,
+            seed_files,
+            suffix=f"gapfill:{parent.id}",
+        )
+        # Pre-populate that id so the generator must skip it.
+        state.hunt_tasks[collision_id] = parent
+        tasks = _generate_gapfill_tasks(state, cap=5)
+        assert tasks == []
+
+    def test_falls_back_to_parent_seeds_when_no_unobserved(self, tmp_path):
+        from swival.audit import _generate_gapfill_tasks
+
+        state, parent = _gapfill_state(tmp_path)
+        cov = state.coverage_records[parent.id]
+        cov.unobserved_high_priority_seeds = []
+        # explicit_not_covered still present so the candidate qualifies.
+        tasks = _generate_gapfill_tasks(state, cap=5)
+        assert len(tasks) == 1
+        assert tasks[0].seed_files == ["a.py", "b.py"]
+
+
+class TestGapfillPhaseTransition:
+    def test_disproof_advances_to_gapfill_not_verification(self):
+        import inspect
+
+        from swival import audit
+
+        src = inspect.getsource(audit._run_audit_phases)
+        chunk = src.split('if state.phase == "disproof":', 1)[1]
+        chunk = chunk.split('if state.phase == "gapfill":', 1)[0]
+        # Last phase assignment inside the disproof block must be "gapfill".
+        assert 'state.phase = "gapfill"' in chunk
+        assert chunk.count('state.phase = "verification"') == 0
+
+    def _simulate_gapfill_branch(self, state):
+        """Mirror the gapfill phase block's branch decision."""
+        from swival import audit
+
+        cap = audit._effective_gapfill_cap(state)
+        new_tasks = audit._generate_gapfill_tasks(state, cap)
+        for t in new_tasks:
+            state.hunt_tasks[t.id] = t
+        retries = sum(
+            1 for v in state.adversarial_state.values() if v.get("status") == "gapfill"
+        )
+        state.gapfill_round = 1
+        if new_tasks:
+            state.phase = "hunt"
+        elif state.proof_strict and retries:
+            state.phase = "disproof"
+        else:
+            state.phase = "verification"
+        return new_tasks, retries
+
+    def test_gapfill_phase_loops_back_to_hunt_when_candidates_exist(self, tmp_path):
+        state, _ = _gapfill_state(tmp_path)
+        state.phase = "gapfill"
+        new_tasks, _ = self._simulate_gapfill_branch(state)
+        assert state.phase == "hunt"
+        assert new_tasks
+        assert any(t.source == "gapfill" for t in state.hunt_tasks.values())
+
+    def test_gapfill_phase_advances_when_no_candidates(self, tmp_path):
+        state, parent = _gapfill_state(tmp_path)
+        state.coverage_records[parent.id].confidence = "high"
+        state.phase = "gapfill"
+        new_tasks, _ = self._simulate_gapfill_branch(state)
+        assert state.phase == "verification"
+        assert new_tasks == []
+
+    def test_gapfill_phase_after_round_one_advances_to_verification(self):
+        import inspect
+
+        from swival import audit
+
+        src = inspect.getsource(audit._run_audit_phases)
+        chunk = src.split('if state.phase == "gapfill":', 1)[1]
+        # Round-1 short-circuit must advance directly to verification.
+        guard = chunk.split("else:", 1)[0]
+        assert "state.gapfill_round >= 1" in guard
+        assert 'state.phase = "verification"' in guard
+
+
+class TestProofStrictGapfillRetryFlow:
+    def test_strict_halt_requires_gapfill_round(self):
+        import inspect
+
+        from swival import audit
+
+        src = inspect.getsource(audit._run_audit_phases)
+        chunk = src.split('if state.phase == "disproof":', 1)[1]
+        chunk = chunk.split('state.phase = "gapfill"', 1)[0]
+        # The strict halt at end of disproof must require gapfill_round >= 1
+        # so that the first disproof pass always advances to gapfill phase
+        # instead of failing the run on infra transients.
+        assert "state.gapfill_round >= 1" in chunk
+
+    def test_disproof_gapfill_status_drives_strict_retry_loop(self, tmp_path):
+        from swival import audit
+
+        state, parent = _gapfill_state(tmp_path)
+        state.proof_strict = True
+        # No coverage-driven candidates: high confidence kills the eligibility
+        # check, so _generate_gapfill_tasks returns []. The only remaining
+        # signal is the stuck disproof entry, which must still force a retry.
+        state.coverage_records[parent.id].confidence = "high"
+        state.adversarial_state["k-stuck"] = {
+            "status": "gapfill",
+            "attempts": 2,
+            "reason": "transport: timeout",
+            "review_model": "",
+        }
+        state.phase = "gapfill"
+        cap = audit._effective_gapfill_cap(state)
+        new_tasks = audit._generate_gapfill_tasks(state, cap)
+        retries = sum(
+            1 for v in state.adversarial_state.values() if v.get("status") == "gapfill"
+        )
+        state.gapfill_round = 1
+        if new_tasks:
+            state.phase = "hunt"
+        elif state.proof_strict and retries:
+            state.phase = "disproof"
+        else:
+            state.phase = "verification"
+        # With no new hunt tasks but a stuck disproof entry, the phase must
+        # loop directly back to disproof — going through hunt/reachability
+        # first would waste a scan over the full hunt task dict.
+        assert new_tasks == []
+        assert retries == 1
+        assert state.phase == "disproof"
+
+
+class TestGapfillSecondPassReachability:
+    """Reviewer concern: a new LOCAL_ONLY finding from a gapfill hunt task
+    must get its own reachability task before _filter_to_reachable_findings
+    runs, otherwise gapfill silently loses every LOCAL_ONLY follow-up."""
+
+    def test_second_pass_local_only_gets_new_reachability_task(self, tmp_path):
+        from swival.audit import (
+            FindingRecord,
+            HuntTask,
+            _finding_key,
+            _generate_reachability_tasks,
+        )
+
+        state, parent = _gapfill_state(tmp_path)
+        # Simulate the post-first-pass state: a gapfill hunt task already
+        # ran and produced a LOCAL_ONLY finding. Its parent_finding_key is
+        # not in any existing reachability task.
+        gapfill_task = HuntTask(
+            id="ssrf-gapfill-a",
+            task_kind="hunt",
+            attack_class=parent.attack_class,
+            attacker_position=parent.attacker_position,
+            controlled_inputs=list(parent.controlled_inputs),
+            trust_boundary_crossed=parent.trust_boundary_crossed,
+            scope_hint="gapfill: redirect chain",
+            seed_files=["b.py", "c.py"],
+            seed_symbols=list(parent.seed_symbols),
+            sink_files=list(parent.sink_files),
+            source="gapfill",
+            priority="high",
+            status="done",
+            language_hint="python",
+            parent_task_id=parent.id,
+        )
+        state.hunt_tasks[gapfill_task.id] = gapfill_task
+        new_finding = FindingRecord(
+            title="ssrf via redirect helper",
+            finding_type="vulnerability",
+            severity="high",
+            locations=["b.py:42"],
+            preconditions=[],
+            proof=["..."],
+            fix_outline="restrict scheme",
+            source_file="b.py",
+            local_bug="unguarded redirect",
+            reachability_status="local_only",
+            hunt_task_id=gapfill_task.id,
+            attack_class=parent.attack_class,
+            attacker_position=parent.attacker_position,
+        )
+        state.proposed_findings.append(new_finding)
+        # First-pass reachability tasks exist for older findings, but not
+        # for this new one.
+        new_reach = _generate_reachability_tasks(state)
+        assert len(new_reach) == 1
+        assert new_reach[0].parent_finding_key == _finding_key(new_finding)
+        assert new_reach[0].task_kind == "reachability"
+
+    def test_hunt_phase_calls_generate_reachability_on_re_entry(self):
+        """Source-inspection guard: the hunt phase's reachability-task
+        generation must live inside the ``state.phase == 'hunt'`` block
+        itself, not behind a one-shot guard, so the second-pass entry
+        triggered by gapfill re-runs it."""
+        import inspect
+
+        from swival import audit
+
+        src = inspect.getsource(audit._run_audit_phases)
+        chunk = src.split('if state.phase == "hunt":', 1)[1]
+        chunk = chunk.split("if state.phase ==", 1)[0]
+        assert "_generate_reachability_tasks(state)" in chunk
+
+
+class TestGapfillRoundOneShortCircuit:
+    """Reviewer concern: once ``state.gapfill_round >= 1``, the gapfill
+    phase short-circuits to verification. Lock that semantics in so a
+    later refactor cannot accidentally re-open the round counter."""
+
+    def test_round_one_skips_candidate_generation(self):
+        import inspect
+
+        from swival import audit
+
+        src = inspect.getsource(audit._run_audit_phases)
+        chunk = src.split('if state.phase == "gapfill":', 1)[1]
+        guard, _, rest = chunk.partition("else:")
+        # The round>=1 short-circuit must NOT call _generate_gapfill_tasks
+        # or touch _gapfill_candidates: it goes straight to verification.
+        assert "_generate_gapfill_tasks" not in guard
+        assert "_gapfill_candidates" not in guard
+        assert 'state.phase = "verification"' in guard
+        # Sanity: the else-branch is the one that actually generates.
+        assert "_generate_gapfill_tasks" in rest
+
+
+class TestGapfillRoundtrip:
+    def test_state_fields_persist(self, tmp_path):
+        from swival.audit import AuditRunState, AuditScope
+
+        scope = AuditScope(
+            branch="m",
+            commit="c",
+            tracked_files=["a.py"],
+            mandatory_files=["a.py"],
+            focus=[],
+        )
+        state_dir = tmp_path / ".swival" / "audit"
+        state = AuditRunState(
+            run_id="rt1",
+            scope=scope,
+            queued_files=["a.py"],
+            state_dir=state_dir,
+        )
+        state.gapfill_round = 1
+        state.max_gapfill_tasks = 33
+        state.metrics["gapfill_tasks_added"] = 7
+        state.metrics["gapfill_disproof_retries"] = 2
+        state.save()
+        loaded = AuditRunState.load(state_dir, "rt1")
+        assert loaded.gapfill_round == 1
+        assert loaded.max_gapfill_tasks == 33
+        assert loaded.metrics["gapfill_tasks_added"] == 7
+        assert loaded.metrics["gapfill_disproof_retries"] == 2
+
+    def test_hunt_task_source_persists(self, tmp_path):
+        from swival.audit import AuditRunState
+
+        state, parent = _gapfill_state(tmp_path)
+        parent.source = "gapfill"
+        state.save()
+        loaded = AuditRunState.load(state.state_dir, state.run_id)
+        assert loaded.hunt_tasks[parent.id].source == "gapfill"
+
+    def test_load_tolerates_unknown_hunt_task_keys(self, tmp_path):
+        """Saved states from older harness versions may carry HuntTask fields
+        the current schema no longer defines (e.g. the dropped ``gapfill_round``
+        from the first Step 7 iteration). Load must strip them rather than
+        raise ``TypeError`` and break ``/audit --resume``."""
+        import json
+
+        from swival.audit import AuditRunState
+
+        state, parent = _gapfill_state(tmp_path)
+        state.save()
+        state_path = state.state_dir / state.run_id / "state.json"
+        blob = json.loads(state_path.read_text())
+        blob["hunt_tasks"][parent.id]["gapfill_round"] = 1
+        blob["hunt_tasks"][parent.id]["legacy_unused_field"] = "x"
+        state_path.write_text(json.dumps(blob))
+        loaded = AuditRunState.load(state.state_dir, state.run_id)
+        assert loaded.hunt_tasks[parent.id].id == parent.id
+
+
 class TestBudgetPlanner:
     def _state(self, tmp_path: Path, budget: int = 0):
         scope = AuditScope(
@@ -4220,13 +4793,42 @@ class TestAuditCliFlags:
         run_audit_command("--budget-tokens 1,500,000", self._ctx(tmp_path))
         assert captured["budget_tokens"] == 1_500_000
 
-    def test_gapfill_flag_is_reserved(self, tmp_path):
+    def test_gapfill_flag_threads_through(self, tmp_path, monkeypatch):
         from swival.audit import run_audit_command
 
-        out = run_audit_command("--gapfill 25", self._ctx(tmp_path))
-        assert out.startswith("error:")
-        assert "--gapfill is reserved" in out
-        assert "not yet implemented" in out
+        captured = self._capture(monkeypatch)
+        run_audit_command("--gapfill 25", self._ctx(tmp_path))
+        assert captured["max_gapfill_tasks"] == 25
+
+    def test_gapfill_requires_value(self, tmp_path):
+        from swival.audit import run_audit_command
+
+        out = run_audit_command("--gapfill", _make_ctx(tmp_path))
+        assert out.startswith("error:") and "--gapfill" in out
+
+    def test_gapfill_rejects_negative(self, tmp_path):
+        from swival.audit import run_audit_command
+
+        out = run_audit_command("--gapfill -3", _make_ctx(tmp_path))
+        assert out.startswith("error:") and "non-negative" in out
+
+    def test_max_gapfill_tasks_config_key_threads_through(self, tmp_path, monkeypatch):
+        from swival.audit import run_audit_command
+
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+        (tmp_path / "swival.toml").write_text("[audit]\nmax_gapfill_tasks = 12\n")
+        captured = self._capture(monkeypatch)
+        run_audit_command("", self._ctx(tmp_path))
+        assert captured["max_gapfill_tasks"] == 12
+
+    def test_gapfill_cli_overrides_config(self, tmp_path, monkeypatch):
+        from swival.audit import run_audit_command
+
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+        (tmp_path / "swival.toml").write_text("[audit]\nmax_gapfill_tasks = 12\n")
+        captured = self._capture(monkeypatch)
+        run_audit_command("--gapfill 30", self._ctx(tmp_path))
+        assert captured["max_gapfill_tasks"] == 30
 
     def test_proof_strict_config_key_threads_through(self, tmp_path, monkeypatch):
         from swival.audit import run_audit_command
@@ -4259,16 +4861,6 @@ class TestAuditCliFlags:
         captured = self._capture(monkeypatch)
         run_audit_command("", self._ctx(tmp_path))
         assert captured["reviewer_model"] == "reviewer-mini"
-
-    def test_max_gapfill_tasks_config_key_is_reserved(self, tmp_path, monkeypatch):
-        from swival.audit import run_audit_command
-
-        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
-        (tmp_path / "swival.toml").write_text("[audit]\nmax_gapfill_tasks = 10\n")
-        out = run_audit_command("", self._ctx(tmp_path))
-        assert out.startswith("error:")
-        assert "max_gapfill_tasks" in out
-        assert "not yet implemented" in out
 
     def test_budget_tokens_requires_value(self, tmp_path):
         from swival.audit import run_audit_command

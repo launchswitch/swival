@@ -5,7 +5,7 @@ The `/audit` command runs a multi-phase security audit over committed Git-tracke
 It triages files by attack surface, performs deep review on escalated files, verifies each finding with an isolated proof-of-concept agent, generates patches, and writes structured reports. Only provable bugs survive to the final output.
 
 ```text
-/audit [path|glob ...] [--resume] [--regen] [--finding N[,M-R]] [--all] [--measure-triage] [--hunt] [--proof-strict] [--budget-tokens N] [--workers N] [--patch-max-turns N] [--debug]
+/audit [path|glob ...] [--resume] [--regen] [--finding N[,M-R]] [--all] [--measure-triage] [--hunt] [--proof-strict] [--budget-tokens N] [--gapfill N] [--workers N] [--patch-max-turns N] [--debug]
 ```
 
 Works in both interactive (REPL) and one-shot mode (requires `--oneshot-commands`). Runs against `HEAD`, so dirty working-directory changes are ignored.
@@ -99,7 +99,7 @@ The two are merged into canonical `FindingRecord` objects. JSON parse failures t
 
 Before the expensive proof verifier runs, every proposed finding is handed to an adversarial reviewer that tries to falsify it. The reviewer reads the finding plus the same evidence bundle the verifier would receive, and cannot emit new findings — it can only return `INVALID`, `NEEDS_PROOF`, or `PLAUSIBLE`. Findings flagged `INVALID` with a concrete blocking control or missing reachability step are discarded before they reach the verifier; `NEEDS_PROOF` findings carry a `required_next_proof` string into the verifier prompt; `PLAUSIBLE` findings proceed normally.
 
-The disproof reviewer can be pointed at a separate model under `[audit.reviewer]` in `swival.toml`. Without that configuration the main model fills in and the metric `disproof_same_model` is incremented so the agreement rate can be audited after the fact. By default a reviewer transport failure fails open to the verifier (logged as `failed_open`); `--proof-strict` instead routes those into a gapfill queue and refuses to advance to verification until the operator resolves them.
+The disproof reviewer can be pointed at a separate model under `[audit.reviewer]` in `swival.toml`. Without that configuration the main model fills in and the metric `disproof_same_model` is incremented so the agreement rate can be audited after the fact. By default a reviewer transport failure fails open to the verifier (logged as `failed_open`); `--proof-strict` instead marks those entries as `gapfill` and hands them off to the gapfill phase, which gives the reviewer one retry before the strict-mode halt fires.
 
 ### Phase 4b: Verification
 
@@ -130,6 +130,16 @@ The harness rejects malformed proof blocks the same way it rejects `NOTREPRODUCE
 Verified findings advance to artifact generation. Discarded findings are dropped. Failed verifications (infrastructure errors, timeouts) are retried once for transient errors and can be resumed with `--resume`.
 
 Verification runs in parallel, capped at 2 concurrent workers regardless of the `--workers` setting.
+
+### Phase 4c: Gapfill
+
+After the disproof gate completes, an observable-coverage pass looks at each hunter task's `swival-audit-coverage-v1` block and decides whether any area should be re-hunted with a tighter scope. A hunt task is eligible for a follow-up when its priority is `high` or `medium`, its self-reported confidence is `low` or `medium`, and it left explicit signals: either `unobserved_high_priority_seeds` (seed files the prompt provided but the hunter never read) or `explicit_not_covered` entries (concrete missed scope items). The follow-up inherits the parent task's attacker model and narrows `seed_files` to the unobserved seeds.
+
+Under `--proof-strict`, disproof reviewer transport failures (`status = "gapfill"` in the adversarial state) also enter the gapfill phase. The first time disproof leaves any entry stuck on `gapfill`, the run advances to the gapfill phase rather than failing immediately; the phase loops back to hunt → reachability → disproof so the reviewer gets one more chance. Only if a second disproof pass still leaves entries stuck does the strict-mode halt fire.
+
+Gapfill expansion is bounded. The cap is `--gapfill N` if set, otherwise `[audit] max_gapfill_tasks`, otherwise `min(50, ceil(hunt_tasks * 0.25))`. Follow-up tasks are deduplicated by the deterministic task id derived from `(attack_class, attacker_position, scope_hint, seed_files)`, and the source coverage record is stamped with the new task id so the same area is not requeued twice.
+
+The pipeline runs at most one gapfill round per run. Once `state.gapfill_round` has been advanced, any subsequent re-entry into the gapfill phase short-circuits to verification, including on `/audit --resume` after a transient failure during the follow-up pass. Coverage information that surfaces from gapfill tasks themselves is therefore intentionally ineligible for further gapfill: the harness trades a (very rare) third-order coverage gap for a hard upper bound on cost. Re-run from scratch if you want a second gapfill round against the same commit.
 
 ### Phase 5: Artifact Generation
 
@@ -271,7 +281,7 @@ Hunt findings carry an explicit `reachability_status`. When the hunter reports `
 swival> /audit --hunt --budget-tokens 2_000_000 src/api/
 ```
 
-`--proof-strict` enables the strict variant of the adversarial disproof gate. In balanced mode (the default), a disproof reviewer transport failure fails open to the verifier so the run keeps moving. Under `--proof-strict`, those failures route into a gapfill queue and the run refuses to advance until the operator resolves them. The flag can also be set as `proof_strict = true` under `[audit]` in `swival.toml`.
+`--proof-strict` enables the strict variant of the adversarial disproof gate. In balanced mode (the default), a disproof reviewer transport failure fails open to the verifier so the run keeps moving. Under `--proof-strict`, those failures are marked `gapfill` instead; the gapfill phase loops the affected entries back through one more disproof attempt, and only a second consecutive failure halts the run. The flag can also be set as `proof_strict = true` under `[audit]` in `swival.toml`.
 
 The reviewer can be pointed at a separate same-provider model under `[audit.reviewer] model`; without it the main model fills in.
 
@@ -285,7 +295,9 @@ model = "claude-haiku-4-5"
 
 `[audit.reviewer] profile` is parsed but reserved for a future release. Switching the reviewer to a different provider needs an api_base/api_key overlay that is not yet wired through, so for now only same-provider model overrides take effect; a `profile` entry currently surfaces an explicit error.
 
-Two more harness flags are recognised by the parser but reserved for upcoming work and currently return an explicit `not yet implemented` error: `--trace-reachability` (in-repo reachability trace) and `--gapfill N` (observable-coverage gapfill). The `[audit] max_gapfill_tasks` config key is similarly refused. These will land in subsequent releases.
+`--gapfill N` caps how many follow-up hunt tasks the observable-coverage gapfill phase may queue per run. The same value can be set as `max_gapfill_tasks` under `[audit]` in `swival.toml`; the CLI flag wins. Without an explicit cap, the default is `min(50, ceil(hunt_tasks * 0.25))`, so gapfill cannot more than quarter the original hunt budget while still rounding up partial slots on small runs. See "Phase 4c: gapfill" below for what gets queued.
+
+One more harness flag is recognised by the parser but reserved for upcoming work and currently returns an explicit `not yet implemented` error: `--trace-reachability` (in-repo reachability trace).
 
 All options can be combined with a focus path:
 
@@ -320,7 +332,7 @@ budget_tokens = 2_000_000     # same effect as --budget-tokens
 max_hunt_tasks = 200          # ceiling on generated hunt tasks
 ```
 
-`[[audit.hunt_task]]` entries are concatenated across global and project config; project entries come last so a project-level operator intent is the source of truth on the queue. The keys `max_gapfill_tasks` and `proof_strict`, plus the `[audit.reviewer]` table, are parsed but currently refused with an explicit `not yet implemented` error; they are scaffolded for the upcoming disproof / gapfill phases.
+`[[audit.hunt_task]]` entries are concatenated across global and project config; project entries come last so a project-level operator intent is the source of truth on the queue. `max_gapfill_tasks` (an integer) caps the observable-coverage gapfill phase; see the `--gapfill N` description above.
 
 ## Scope
 

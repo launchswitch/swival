@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import subprocess
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, fields
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -977,9 +978,7 @@ def _generate_hunt_tasks(
         # Keep configured tasks (which were pushed first) and trim the tail.
         kept_configured = [t for t in tasks if t.source == "user"]
         rest = [t for t in tasks if t.source != "user"]
-        # Prefer ``high`` over ``medium`` over ``low`` when trimming.
-        priority_rank = {"high": 0, "medium": 1, "low": 2}
-        rest.sort(key=lambda t: (priority_rank.get(t.priority, 3), t.id))
+        rest.sort(key=lambda t: (_HUNT_PRIORITY_RANK.get(t.priority, 3), t.id))
         room = max(0, max_tasks - len(kept_configured))
         tasks = kept_configured + rest[:room]
 
@@ -1054,6 +1053,8 @@ class AuditRunState:
     trace_state: dict[str, dict] = field(default_factory=dict)
     proof_strict: bool = False
     trace_reachability: bool = False
+    gapfill_round: int = 0
+    max_gapfill_tasks: int = 0
     budget_tokens: int = 0
     # Token consumption is tallied per top-level phase; the keys are the same
     # phase labels we already use in `state.phase` plus a few sub-buckets.
@@ -1116,6 +1117,8 @@ class AuditRunState:
             "trace_state": self.trace_state,
             "proof_strict": self.proof_strict,
             "trace_reachability": self.trace_reachability,
+            "gapfill_round": self.gapfill_round,
+            "max_gapfill_tasks": self.max_gapfill_tasks,
             "budget_tokens": self.budget_tokens,
             "budget_used": self.budget_used,
             "attack_class_metrics": self.attack_class_metrics,
@@ -1153,7 +1156,11 @@ class AuditRunState:
                 "the artifact_state field. Re-run /audit from scratch."
             )
 
-        hunt_tasks = {k: HuntTask(**v) for k, v in blob.get("hunt_tasks", {}).items()}
+        hunt_task_fields = {f.name for f in fields(HuntTask)}
+        hunt_tasks = {
+            k: HuntTask(**{kk: vv for kk, vv in v.items() if kk in hunt_task_fields})
+            for k, v in blob.get("hunt_tasks", {}).items()
+        }
         coverage_records = {
             k: CoverageRecord(**v) for k, v in blob.get("coverage_records", {}).items()
         }
@@ -1193,6 +1200,8 @@ class AuditRunState:
             trace_state=blob.get("trace_state", {}),
             proof_strict=bool(blob.get("proof_strict", False)),
             trace_reachability=bool(blob.get("trace_reachability", False)),
+            gapfill_round=int(blob.get("gapfill_round", 0)),
+            max_gapfill_tasks=int(blob.get("max_gapfill_tasks", 0)),
             budget_tokens=int(blob.get("budget_tokens", 0)),
             budget_used=blob.get("budget_used", {}),
             attack_class_metrics=blob.get("attack_class_metrics", {}),
@@ -3794,6 +3803,110 @@ def _parse_reachability_response(raw: str, metrics: dict[str, int]) -> dict | No
     return records[0] if records else None
 
 
+_GAPFILL_TASK_SOURCE = "gapfill"
+_GAPFILL_DEFAULT_CAP = 50
+_GAPFILL_DEFAULT_FRACTION = 0.25
+_HUNT_PRIORITY_RANK = {"high": 0, "medium": 1, "low": 2}
+
+
+def _effective_gapfill_cap(state: AuditRunState) -> int:
+    """Cap on follow-up hunt tasks for the gapfill phase."""
+    if state.max_gapfill_tasks > 0:
+        return state.max_gapfill_tasks
+    hunt_total = sum(
+        1
+        for t in state.hunt_tasks.values()
+        if t.task_kind == _HUNT_TASK_KIND_HUNT and t.source != _GAPFILL_TASK_SOURCE
+    )
+    if hunt_total <= 0:
+        return 0
+    return min(
+        _GAPFILL_DEFAULT_CAP,
+        max(1, math.ceil(hunt_total * _GAPFILL_DEFAULT_FRACTION)),
+    )
+
+
+def _gapfill_candidates(
+    state: AuditRunState,
+) -> list[tuple[HuntTask, CoverageRecord]]:
+    """Round-0 hunt tasks with coverage worth a narrow follow-up."""
+    out: list[tuple[HuntTask, CoverageRecord]] = []
+    for task in state.hunt_tasks.values():
+        if task.task_kind != _HUNT_TASK_KIND_HUNT:
+            continue
+        if task.source == _GAPFILL_TASK_SOURCE:
+            continue
+        if task.priority not in ("high", "medium"):
+            continue
+        if task.status != "done":
+            continue
+        cov = state.coverage_records.get(task.id)
+        if cov is None or cov.followup_task_ids:
+            continue
+        if cov.confidence not in ("low", "medium"):
+            continue
+        if not (cov.unobserved_high_priority_seeds or cov.explicit_not_covered):
+            continue
+        out.append((task, cov))
+    out.sort(key=lambda pair: _HUNT_PRIORITY_RANK.get(pair[0].priority, 3))
+    return out
+
+
+def _generate_gapfill_tasks(state: AuditRunState, cap: int) -> list[HuntTask]:
+    """Spawn follow-up hunt tasks for low-coverage round-0 findings."""
+    if cap <= 0:
+        return []
+    new_tasks: list[HuntTask] = []
+    existing_ids = set(state.hunt_tasks)
+    for parent, cov in _gapfill_candidates(state):
+        if len(new_tasks) >= cap:
+            break
+        unobserved = [s for s in cov.unobserved_high_priority_seeds if s]
+        seed_files = unobserved[:8] or list(parent.seed_files[:8])
+        blurb = "; ".join(s for s in cov.explicit_not_covered[:2] if s)
+        if blurb:
+            scope_hint = f"gapfill: {blurb}"[:200]
+        else:
+            scope_hint = (
+                f"gapfill: unobserved seeds in {parent.scope_hint or 'parent scope'}"[
+                    :200
+                ]
+            )
+        task_id = _hunt_task_id(
+            parent.attack_class,
+            parent.attacker_position,
+            scope_hint,
+            seed_files,
+            suffix=f"gapfill:{parent.id}",
+        )
+        if task_id in existing_ids:
+            continue
+        new = HuntTask(
+            id=task_id,
+            task_kind=_HUNT_TASK_KIND_HUNT,
+            attack_class=parent.attack_class,
+            attacker_position=parent.attacker_position,
+            controlled_inputs=list(parent.controlled_inputs),
+            trust_boundary_crossed=parent.trust_boundary_crossed,
+            scope_hint=scope_hint,
+            seed_files=seed_files,
+            seed_symbols=list(parent.seed_symbols),
+            sink_files=list(parent.sink_files),
+            source=_GAPFILL_TASK_SOURCE,
+            priority=parent.priority,
+            parent_task_id=parent.id,
+            language_hint=parent.language_hint,
+        )
+        try:
+            _validate_hunt_task(new)
+        except HuntTaskValidationError:
+            continue
+        new_tasks.append(new)
+        cov.followup_task_ids.append(task_id)
+        existing_ids.add(task_id)
+    return new_tasks
+
+
 def _generate_reachability_tasks(state: AuditRunState) -> list[HuntTask]:
     """Promote each LOCAL_ONLY hunt finding to one reachability follow-up.
 
@@ -5196,7 +5309,7 @@ def run_audit_command(cmd_arg: str, ctx: InputContext) -> str:
                 f"error: unknown option {parts[i]!r}. "
                 f"Known flags: --resume, --regen, --debug, --all, "
                 f"--measure-triage, --hunt, --workers N, --patch-max-turns N, "
-                f"--budget-tokens N, --finding N."
+                f"--budget-tokens N, --gapfill N, --finding N."
             )
         else:
             filtered.append(parts[i])
@@ -5211,11 +5324,6 @@ def run_audit_command(cmd_arg: str, ctx: InputContext) -> str:
         return (
             "error: --trace-reachability is reserved for the upcoming in-repo "
             "reachability trace phase; not yet implemented."
-        )
-    if gapfill_cli is not None:
-        return (
-            "error: --gapfill is reserved for the upcoming observable-coverage "
-            "gapfill phase; not yet implemented."
         )
 
     audit_cfg = _load_audit_config(base_dir)
@@ -5241,11 +5349,11 @@ def run_audit_command(cmd_arg: str, ctx: InputContext) -> str:
             "(needs provider/api_base overlay). Use [audit.reviewer] model "
             "for a same-provider reviewer model override."
         )
-    if int(audit_cfg.get("max_gapfill_tasks") or 0) > 0:
-        return (
-            "error: [audit] max_gapfill_tasks is reserved for the upcoming "
-            "observable-coverage gapfill phase; not yet implemented."
-        )
+    max_gapfill_tasks = (
+        gapfill_cli
+        if gapfill_cli is not None
+        else int(audit_cfg.get("max_gapfill_tasks") or 0)
+    )
     max_hunt_tasks = int(audit_cfg.get("max_hunt_tasks") or 0)
     configured_hunt_tasks = list(audit_cfg.get("hunt_tasks") or [])
 
@@ -5282,6 +5390,7 @@ def run_audit_command(cmd_arg: str, ctx: InputContext) -> str:
             configured_hunt_tasks=configured_hunt_tasks,
             proof_strict=proof_strict,
             reviewer_model=reviewer_model,
+            max_gapfill_tasks=max_gapfill_tasks,
         )
     finally:
         _debug_log_path = None
@@ -5309,6 +5418,7 @@ def _run_audit_phases(
     configured_hunt_tasks: list[dict] | None = None,
     proof_strict: bool = False,
     reviewer_model: str = "",
+    max_gapfill_tasks: int = 0,
 ) -> str:
     configured_hunt_tasks = list(configured_hunt_tasks or [])
     force_review = list(force_review or [])
@@ -5353,6 +5463,8 @@ def _run_audit_phases(
         # passed) keeps the saved cap. To disable, start a fresh run.
         if budget_tokens is not None and int(budget_tokens) > 0:
             state.budget_tokens = int(budget_tokens)
+        if max_gapfill_tasks is not None and int(max_gapfill_tasks) > 0:
+            state.max_gapfill_tasks = int(max_gapfill_tasks)
         if regen:
             if not state.verified_findings:
                 return "error: no verified findings to regenerate artifacts for."
@@ -5396,6 +5508,7 @@ def _run_audit_phases(
             hunt_mode=hunt_mode,
             budget_tokens=int(budget_tokens or 0),
             proof_strict=bool(proof_strict),
+            max_gapfill_tasks=int(max_gapfill_tasks or 0),
         )
         mode_flags = []
         if state.select_all:
@@ -5408,6 +5521,8 @@ def _run_audit_phases(
             mode_flags.append("--proof-strict")
         if state.budget_tokens:
             mode_flags.append(f"--budget-tokens {state.budget_tokens}")
+        if state.max_gapfill_tasks:
+            mode_flags.append(f"--gapfill {state.max_gapfill_tasks}")
         mode_tail = (" " + " ".join(mode_flags)) if mode_flags else ""
         fmt.info(
             f"audit {state.run_id}: {len(scope.mandatory_files)} files, "
@@ -6018,7 +6133,7 @@ def _run_audit_phases(
                 f"before verification"
             )
 
-        if state.proof_strict:
+        if state.proof_strict and state.gapfill_round >= 1:
             stuck = [
                 k
                 for k, v in state.adversarial_state.items()
@@ -6028,12 +6143,55 @@ def _run_audit_phases(
                 state.save()
                 return (
                     f"Audit incomplete: {len(stuck)} disproof review(s) failed "
-                    f"under --proof-strict. Re-run with /audit --resume after the "
-                    f"reviewer is healthy, or drop --proof-strict to fail open."
+                    f"under --proof-strict after gapfill retry. Re-run with "
+                    f"/audit --resume after the reviewer is healthy, or drop "
+                    f"--proof-strict to fail open."
                 )
 
-        state.phase = "verification"
+        state.phase = "gapfill"
         state.save()
+
+    if state.phase == "gapfill":
+        if state.gapfill_round >= 1:
+            state.phase = "verification"
+            state.save()
+        else:
+            cap = _effective_gapfill_cap(state)
+            new_tasks = _generate_gapfill_tasks(state, cap)
+            for t in new_tasks:
+                state.hunt_tasks[t.id] = t
+            disproof_retries = sum(
+                1
+                for v in state.adversarial_state.values()
+                if v.get("status") == _DISPROOF_STATUS_GAPFILL
+            )
+            state.gapfill_round = 1
+            state.metrics["gapfill_tasks_added"] = int(
+                state.metrics.get("gapfill_tasks_added", 0)
+            ) + len(new_tasks)
+            state.metrics["gapfill_disproof_retries"] = (
+                int(state.metrics.get("gapfill_disproof_retries", 0)) + disproof_retries
+            )
+            if new_tasks:
+                state.phase = "hunt"
+                fmt.info(
+                    f"phase gapfill: queued {len(new_tasks)} follow-up hunt "
+                    f"task(s) and {disproof_retries} disproof retry(ies) "
+                    f"(cap={cap})"
+                )
+            elif state.proof_strict and disproof_retries:
+                state.phase = "disproof"
+                fmt.info(
+                    f"phase gapfill: re-running disproof for "
+                    f"{disproof_retries} stuck retry(ies) (cap={cap})"
+                )
+            else:
+                state.phase = "verification"
+                fmt.info(
+                    f"phase gapfill: nothing to requeue (cap={cap}); advancing "
+                    f"to verification"
+                )
+            state.save()
 
     # Phase 4: verification (parallel)
     if state.phase == "verification":

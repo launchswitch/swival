@@ -59,6 +59,11 @@ INPUT_COMMANDS: dict[str, CommandInfo] = {
                 "to gapfill instead of failing open to proof",
             ),
             (
+                "--gapfill N",
+                "Cap the number of follow-up hunt tasks the observable-coverage "
+                "gapfill phase may queue (default: min(50, hunt_tasks * 0.25))",
+            ),
+            (
                 "--budget-tokens N",
                 "Global token budget for the whole run; underscores and "
                 "commas accepted (e.g. 2_000_000)",
