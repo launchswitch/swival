@@ -109,9 +109,63 @@ def _fuzzy_match_spans(
     return spans
 
 
-def _replace_span(content: str, span: tuple[int, int], new_string: str) -> str:
-    """Replace a single span in content."""
-    return content[: span[0]] + new_string + content[span[1] :]
+def _absorb_trailing_newline(
+    content: str, end: int, old_string: str, new_string: str
+) -> int:
+    """Return the end offset to splice at, absorbing a trailing file newline
+    when old_string excludes it but new_string ends with one.
+
+    The model commonly omits the trailing newline from old_string while still
+    treating its new_string as a complete replacement line. Without this
+    adjustment the splice would produce a double newline at the boundary.
+    """
+    if (
+        old_string
+        and not old_string.endswith("\n")
+        and new_string.endswith("\n")
+        and end < len(content)
+        and content[end] == "\n"
+    ):
+        return end + 1
+    return end
+
+
+def _replace_span(
+    content: str,
+    span: tuple[int, int],
+    new_string: str,
+    old_string: str = "",
+) -> str:
+    """Replace a single span in content, absorbing a trailing file newline
+    when *old_string* and *new_string* disagree on the line terminator."""
+    start, end = span
+    end = _absorb_trailing_newline(content, end, old_string, new_string)
+    return content[:start] + new_string + content[end:]
+
+
+def _replace_all_exact(content: str, old_string: str, new_string: str) -> str:
+    """Replace every exact occurrence of *old_string* with *new_string*,
+    applying the trailing-newline absorption rule at each splice.
+
+    When the absorption rule cannot fire (old_string ends with \\n, or
+    new_string doesn't), we fall back to the C-implemented str.replace
+    which is materially faster on files with many occurrences.
+    """
+    if old_string.endswith("\n") or not new_string.endswith("\n"):
+        return content.replace(old_string, new_string)
+    parts: list[str] = []
+    i = 0
+    while True:
+        idx = content.find(old_string, i)
+        if idx == -1:
+            parts.append(content[i:])
+            break
+        parts.append(content[i:idx])
+        parts.append(new_string)
+        i = _absorb_trailing_newline(
+            content, idx + len(old_string), old_string, new_string
+        )
+    return "".join(parts)
 
 
 def _replace_all_fuzzy(
@@ -123,7 +177,7 @@ def _replace_all_fuzzy(
         spans = _fuzzy_match_spans(result, old_string, normalize=normalize)
         if not spans:
             break
-        result = _replace_span(result, spans[0], new_string)
+        result = _replace_span(result, spans[0], new_string, old_string)
     return result
 
 
@@ -240,7 +294,7 @@ def replace(
 
         if replace_all:
             if pass_name == "exact":
-                return content.replace(old_string, new_string)
+                return _replace_all_exact(content, old_string, new_string)
             return _replace_all_fuzzy(
                 content, old_string, new_string, normalize=normalize
             )
@@ -249,7 +303,7 @@ def replace(
             matching, cand_lines = _filter_by_line(spans, content, line_number)
             all_candidate_lines.extend(cand_lines)
             if len(matching) == 1:
-                return _replace_span(content, matching[0], new_string)
+                return _replace_span(content, matching[0], new_string, old_string)
             if len(matching) > 1:
                 raise ValueError(
                     f"multiple matches on line {line_number}; "
@@ -258,7 +312,7 @@ def replace(
             continue
 
         if len(spans) == 1:
-            return _replace_span(content, spans[0], new_string)
+            return _replace_span(content, spans[0], new_string, old_string)
 
         all_candidate_lines.extend(_span_lines(content, s, e)[0] for s, e in spans)
         raise ValueError(

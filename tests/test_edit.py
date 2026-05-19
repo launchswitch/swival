@@ -304,3 +304,68 @@ class TestExactMatchSpans:
         spans = _exact_match_spans("aaaa", "aa")
         assert len(spans) == 2
         assert spans == [(0, 2), (2, 4)]
+
+
+# =========================================================================
+# Trailing-newline boundary: old_string excludes a file \n that new_string
+# adds back. Without absorption, the splice would double the newline.
+# =========================================================================
+
+
+class TestTrailingNewlineAbsorption:
+    """The splice consumes the file's terminating \\n when the model omits
+    it from old_string but puts it back in new_string."""
+
+    def test_exact_match_at_eof_does_not_double(self):
+        content = "red\norange\ngreen\nblue\npurple\n"
+        result = replace(
+            content,
+            "red\norange\ngreen\nblue\npurple",
+            "red\norange\nyellow\ngreen\nblue\npurple\n",
+        )
+        assert result == "red\norange\nyellow\ngreen\nblue\npurple\n"
+
+    def test_exact_match_mid_file_does_not_double(self):
+        content = "aaa\nbbb\nccc\n"
+        result = replace(content, "aaa", "xxx\n")
+        assert result == "xxx\nbbb\nccc\n"
+
+    def test_replace_all_exact_does_not_double(self):
+        content = "aaa\nbbb\naaa\n"
+        result = replace(content, "aaa", "xxx\n", replace_all=True)
+        assert result == "xxx\nbbb\nxxx\n"
+
+    def test_fuzzy_match_does_not_double(self):
+        content = "red  \ngreen  \nblue  \n"
+        result = replace(content, "red\ngreen\nblue", "red\nyellow\ngreen\nblue\n")
+        assert result == "red\nyellow\ngreen\nblue\n"
+
+    def test_legitimate_mid_line_substring_unaffected(self):
+        content = "hello world\nfoo\n"
+        result = replace(content, "world", "WORLD")
+        assert result == "hello WORLD\nfoo\n"
+
+    def test_no_trailing_newline_in_new_string_unaffected(self):
+        content = "aaa\nbbb\n"
+        result = replace(content, "aaa", "xxx")
+        assert result == "xxx\nbbb\n"
+
+    def test_inserting_extra_line_still_works(self):
+        content = "abc\ndef\n"
+        result = replace(content, "abc", "abc\nNEW LINE\n")
+        assert result == "abc\nNEW LINE\ndef\n"
+
+    def test_multiline_old_no_trailing_newline(self):
+        content = "aaa\nbbb\nccc\n"
+        result = replace(content, "aaa\nbbb", "XXX\nYYY\n")
+        assert result == "XXX\nYYY\nccc\n"
+
+    def test_old_already_has_trailing_newline_unchanged(self):
+        content = "aaa\nbbb\n"
+        result = replace(content, "aaa\n", "xxx\n")
+        assert result == "xxx\nbbb\n"
+
+    def test_match_at_end_with_no_following_newline(self):
+        content = "aaa\nbbb"
+        result = replace(content, "bbb", "xxx\n")
+        assert result == "aaa\nxxx\n"
