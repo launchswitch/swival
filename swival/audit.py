@@ -1048,7 +1048,6 @@ class AuditRunState:
     coverage_records: dict[str, CoverageRecord] = field(default_factory=dict)
     adversarial_state: dict[str, dict] = field(default_factory=dict)
     root_cause_groups: list[RootCauseGroup] = field(default_factory=list)
-    trace_state: dict[str, dict] = field(default_factory=dict)
     proof_strict: bool = False
     trace_reachability: bool = False
     gapfill_round: int = 0
@@ -1112,7 +1111,6 @@ class AuditRunState:
             },
             "adversarial_state": self.adversarial_state,
             "root_cause_groups": [asdict(g) for g in self.root_cause_groups],
-            "trace_state": self.trace_state,
             "proof_strict": self.proof_strict,
             "trace_reachability": self.trace_reachability,
             "gapfill_round": self.gapfill_round,
@@ -1197,7 +1195,6 @@ class AuditRunState:
             coverage_records=coverage_records,
             adversarial_state=blob.get("adversarial_state", {}),
             root_cause_groups=root_cause_groups,
-            trace_state=blob.get("trace_state", {}),
             proof_strict=bool(blob.get("proof_strict", False)),
             trace_reachability=bool(blob.get("trace_reachability", False)),
             gapfill_round=int(blob.get("gapfill_round", 0)),
@@ -4473,14 +4470,9 @@ def _apply_group_membership(state: AuditRunState) -> None:
         vf.root_cause_group_id = key_to_gid.get(_finding_key(vf.finding), "")
 
 
-def _artifact_target_findings(state: AuditRunState) -> list[VerifiedFinding]:
-    """Verified findings that should receive their own artifact entry.
-
-    Post-dedupe only the primary of each root-cause group renders; variants
-    appear inside the primary's report. When dedupe has not run yet
-    (older state, or before the dedupe phase fires) every verified
-    finding is its own target.
-    """
+def _artifact_primary_candidates(state: AuditRunState) -> list[VerifiedFinding]:
+    """Verified primaries before trace filtering: one per root-cause group, or
+    every verified finding when dedupe has not run yet."""
     if not state.root_cause_groups:
         return list(state.verified_findings)
     primaries = {g.primary_finding_key for g in state.root_cause_groups}
@@ -4488,6 +4480,30 @@ def _artifact_target_findings(state: AuditRunState) -> list[VerifiedFinding]:
         vf for vf in state.verified_findings
         if _finding_key(vf.finding) in primaries
     ]
+
+
+def _artifact_target_findings(state: AuditRunState) -> list[VerifiedFinding]:
+    """Primaries that should receive an artifact entry.
+
+    With ``--trace-reachability``, NOT_REACHABLE and UNKNOWN primaries drop
+    out, except for the high/critical ``security_control_failure`` carve-out.
+    Findings without a trace verdict pass through (the trace phase has not
+    produced a verdict for them, e.g. it has not yet run).
+    """
+    candidates = _artifact_primary_candidates(state)
+    if not state.trace_reachability:
+        return candidates
+    kept: list[VerifiedFinding] = []
+    for vf in candidates:
+        if _is_scf_high_or_critical(vf.finding):
+            kept.append(vf)
+            continue
+        if vf.trace is None:
+            kept.append(vf)
+            continue
+        if vf.trace.get("verdict") == _TRACE_VERDICT_REACHABLE:
+            kept.append(vf)
+    return kept
 
 
 def _group_variants(
@@ -4674,8 +4690,275 @@ def _run_dedupe_phase(state: AuditRunState, ctx: "InputContext | None") -> None:
         )
     else:
         state.root_cause_groups = []
-    state.phase = "artifacts"
+    state.phase = "trace" if state.trace_reachability else "artifacts"
     state.save()
+
+
+_TRACE_SENTINEL = "swival-audit-trace-v1"
+_TRACE_BLOCK_RE = re.compile(
+    r"```" + _TRACE_SENTINEL + r"\s*\n(.*?)\n```",
+    re.DOTALL,
+)
+_TRACE_VERDICT_REACHABLE = "REACHABLE"
+_TRACE_VERDICT_NOT_REACHABLE = "NOT_REACHABLE"
+_TRACE_VERDICT_UNKNOWN = "UNKNOWN"
+_TRACE_VERDICTS = (
+    _TRACE_VERDICT_REACHABLE,
+    _TRACE_VERDICT_NOT_REACHABLE,
+    _TRACE_VERDICT_UNKNOWN,
+)
+_TRACE_CONFIDENCE_LEVELS = ("high", "medium", "low")
+_TRACE_SCALAR_KEYS = ("verdict", "entry_point", "blocker", "confidence")
+_TRACE_LIST_KEYS = ("trace_step",)
+_TRACE_EVIDENCE_FILE_CAP = 8
+
+
+class TraceBlockError(ValueError):
+    """Malformed swival-audit-trace-v1 block."""
+
+
+def _parse_trace_body(body: str) -> dict:
+    parsed = _parse_kv_block(body, _TRACE_SCALAR_KEYS, _TRACE_LIST_KEYS)
+    verdict = (parsed.get("verdict") or "").upper()
+    if verdict not in _TRACE_VERDICTS:
+        raise TraceBlockError(f"unknown verdict {verdict!r}")
+    parsed["verdict"] = verdict
+    confidence = (parsed.get("confidence") or "").lower()
+    if confidence and confidence not in _TRACE_CONFIDENCE_LEVELS:
+        confidence = ""
+    parsed["confidence"] = confidence
+    return parsed
+
+
+def _parse_trace_block(answer: str) -> dict:
+    return _parse_sentinel_block(
+        answer or "",
+        _TRACE_BLOCK_RE,
+        _parse_trace_body,
+        TraceBlockError,
+        f"missing ```{_TRACE_SENTINEL} block",
+    )
+
+
+_PHASE_TRACE_SYSTEM = """\
+You are an in-repo reachability tracer running one narrow task at the end of a
+staged audit.
+
+You are given one verified security finding with a proven local bug and the
+repository's Phase 1 profile listing entry points, trust boundaries, auth
+surfaces, and dangerous operations. Your only job is to decide whether
+attacker-controlled data from a real external entry point in this repository
+actually reaches the verified sink, using only committed code.
+
+You have no tools, no shell access, and no ability to run commands. All the
+source code you need is included below.
+
+Output format: exactly one fenced ```swival-audit-trace-v1 block with these
+keys, one per line. Use exactly the keys shown. Do not quote or wrap values.
+
+- verdict: REACHABLE | NOT_REACHABLE | UNKNOWN
+- entry_point: the concrete Phase 1 entry point or trust boundary the trace
+  starts at; required when verdict is REACHABLE, blank otherwise
+- trace_step: one step in the data path from entry to sink, in order; one line
+  per file:function or symbol; repeatable; omit when verdict is not REACHABLE
+- blocker: the named guard, missing edge, or absent caller that breaks the
+  path; only set when verdict is NOT_REACHABLE
+- confidence: high | medium | low
+
+Rules:
+- Use only the supplied evidence. Do not invent files, symbols, or routes.
+- Report UNKNOWN when the path is plausible but the evidence is incomplete; do
+  not guess.
+- Report NOT_REACHABLE only when a concrete guard or missing edge blocks the
+  path from every listed entry point, and name it in blocker.
+- Do not change the bug claim or propose new findings. Only decide whether the
+  verified bug is externally reachable from this repository's own entry points.
+"""
+
+
+def _build_trace_user_prompt(
+    vf: VerifiedFinding,
+    state: AuditRunState,
+    file_evidence: dict[str, str],
+) -> str:
+    profile_json = _repo_profile_json(state)
+    finding = vf.finding
+    locations = ", ".join(finding.locations) or finding.source_file
+    prior_path = (
+        " -> ".join(finding.reachability_path)
+        if finding.reachability_path
+        else "(none reported)"
+    )
+    boundary = finding.source_boundary or "(unspecified)"
+    reproducer_summary = ""
+    if vf.reproducer:
+        reproducer_summary = json.dumps(
+            {
+                "proof_kind": vf.reproducer.get("proof_kind"),
+                "trigger": vf.reproducer.get("trigger"),
+                "impact": vf.reproducer.get("impact"),
+                "observed_output": (vf.reproducer.get("observed_output") or "")[:400],
+            },
+            indent=2,
+        )
+    related = _format_seed_evidence(
+        list(file_evidence.keys()), file_evidence, cap_files=_TRACE_EVIDENCE_FILE_CAP
+    )
+    return (
+        f"Verified finding: {finding.title}\n"
+        f"Attack class: {finding.attack_class}\n"
+        f"Finding type: {finding.finding_type}\n"
+        f"Severity: {finding.severity}\n"
+        f"Hunter-reported source boundary: {boundary}\n"
+        f"Local bug: {finding.local_bug or '(unspecified)'}\n"
+        f"Sink operation: {finding.sink_operation or '(unspecified)'}\n"
+        f"Sink location(s): {locations}\n"
+        f"Hunter-reported partial path: {prior_path}\n"
+        f"Reproducer summary:\n{reproducer_summary or '(none)'}\n\n"
+        f"Repository profile (Phase 1):\n{profile_json}\n\n"
+        f"Committed evidence (sink + entry-point files):\n{related}\n\n"
+        f"Decide whether attacker input from a real external entry point in "
+        f"this repository can reach the verified sink. Emit exactly one "
+        f"```swival-audit-trace-v1 fenced block."
+    )
+
+
+def _trace_evidence_files(
+    vf: VerifiedFinding, entry_points: list[str]
+) -> list[str]:
+    """Sink-location files plus Phase 1 entry points, deduped and capped."""
+    seen: dict[str, None] = dict.fromkeys(_evidence_file_paths(vf.finding))
+    for ep in entry_points:
+        seen.setdefault(ep, None)
+    return list(seen)[:_TRACE_EVIDENCE_FILE_CAP]
+
+
+def _phase_trace_one(
+    vf: VerifiedFinding,
+    state: AuditRunState,
+    ctx: InputContext,
+    entry_cache: dict[str, str],
+    entry_points: list[str],
+) -> tuple[dict | None, str | None]:
+    budget = BudgetPlanner(state)
+    if budget.exhausted():
+        return (None, "budget exhausted before task started")
+    evidence_files = _trace_evidence_files(vf, entry_points)
+    sink_only = [f for f in evidence_files if f not in entry_cache]
+    file_evidence = dict(entry_cache)
+    if sink_only:
+        file_evidence.update(_load_file_contents(sink_only, ctx.base_dir))
+    user_prompt = _build_trace_user_prompt(vf, state, file_evidence)
+    messages = [
+        {"role": "system", "content": _PHASE_TRACE_SYSTEM},
+        {"role": "user", "content": user_prompt},
+    ]
+    try:
+        raw = _call_audit_llm(
+            ctx, messages, trace_task=f"audit: trace {vf.finding.title}"
+        )
+    except Exception as e:
+        return (None, f"llm error: {e}")
+    budget.charge_call("trace", user_prompt, raw or "")
+    try:
+        parsed = _parse_trace_block(raw or "")
+    except TraceBlockError as e:
+        return (None, f"malformed trace block: {e}")
+    return (parsed, None)
+
+
+def _trace_record(parsed: dict, error: str | None) -> dict:
+    if parsed is None:
+        return {
+            "verdict": _TRACE_VERDICT_UNKNOWN,
+            "entry_point": "",
+            "trace_step": [],
+            "blocker": "",
+            "confidence": "",
+            "error": error or "",
+        }
+    return {
+        "verdict": parsed.get("verdict", _TRACE_VERDICT_UNKNOWN),
+        "entry_point": parsed.get("entry_point", ""),
+        "trace_step": list(parsed.get("trace_step", []) or []),
+        "blocker": parsed.get("blocker", ""),
+        "confidence": parsed.get("confidence", ""),
+        "error": "",
+    }
+
+
+def _run_trace_phase(
+    state: AuditRunState,
+    ctx: "InputContext | None",
+    workers: int = 4,
+) -> None:
+    """In-repo reachability trace for verified primaries.
+
+    ``vf.trace`` is the single source of truth. NOT_REACHABLE non-SCF and
+    UNKNOWN primaries are gated out of artifacts by
+    :func:`_artifact_target_findings`. UNKNOWN counts surface in metrics; no
+    follow-up task is queued because the trace phase is terminal in the
+    execution graph.
+    """
+    try:
+        if not state.trace_reachability:
+            return
+        primaries = _artifact_primary_candidates(state)
+        if not primaries:
+            return
+        if ctx is None:
+            for vf in primaries:
+                if vf.trace is None:
+                    vf.trace = _trace_record(None, "no context for trace")
+            return
+
+        pending = [vf for vf in primaries if vf.trace is None]
+        if pending:
+            fmt.info(f"phase trace: tracing {len(pending)} verified finding(s)...")
+            entry_points = _entry_point_paths(state)
+            entry_cache = _load_file_contents(entry_points, ctx.base_dir)
+
+            def _trace(vf):
+                parsed, err = _phase_trace_one(
+                    vf, state, ctx, entry_cache, entry_points
+                )
+                return (vf, _trace_record(parsed, err), err)
+
+            batch_size = max(1, workers) * 2
+            for start in range(0, len(pending), batch_size):
+                batch = pending[start : start + batch_size]
+                for vf, record, err in _run_batch(
+                    _trace, batch, max_workers=max(1, workers)
+                ):
+                    vf.trace = record
+                    if err:
+                        fmt.warning(f"  trace {vf.finding.title}: {err[:120]}")
+                    else:
+                        fmt.info(
+                            f"  trace {vf.finding.title}: {record['verdict']} "
+                            f"(confidence={record['confidence'] or 'unset'})"
+                        )
+                state.save()
+                if BudgetPlanner(state).exhausted():
+                    fmt.warning("phase trace: budget exhausted; halting")
+                    break
+
+        verdicts = {v: 0 for v in _TRACE_VERDICTS}
+        for vf in primaries:
+            verdict = (vf.trace or {}).get("verdict", _TRACE_VERDICT_UNKNOWN)
+            verdicts[verdict] = verdicts.get(verdict, 0) + 1
+        state.metrics["trace_reachable"] = verdicts[_TRACE_VERDICT_REACHABLE]
+        state.metrics["trace_not_reachable"] = verdicts[_TRACE_VERDICT_NOT_REACHABLE]
+        state.metrics["trace_unknown"] = verdicts[_TRACE_VERDICT_UNKNOWN]
+        fmt.info(
+            "phase trace complete: "
+            f"{verdicts[_TRACE_VERDICT_REACHABLE]} reachable, "
+            f"{verdicts[_TRACE_VERDICT_NOT_REACHABLE]} not reachable, "
+            f"{verdicts[_TRACE_VERDICT_UNKNOWN]} unknown"
+        )
+    finally:
+        state.phase = "artifacts"
+        state.save()
 
 
 _DISPROOF_SENTINEL = "swival-audit-disproof-v1"
@@ -5183,6 +5466,18 @@ def _phase5_report(
             "\n\nRoot-cause group (list all variants under Affected Locations):\n"
             + json.dumps(group_blob, indent=2)
         )
+    if vf.trace:
+        trace_blob = {
+            "verdict": vf.trace.get("verdict"),
+            "entry_point": vf.trace.get("entry_point"),
+            "trace_step": vf.trace.get("trace_step", []),
+            "blocker": vf.trace.get("blocker"),
+            "confidence": vf.trace.get("confidence"),
+        }
+        suffix += (
+            "\n\nIn-repo reachability trace (cite under Attacker Reachability):\n"
+            + json.dumps(trace_blob, indent=2)
+        )
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": suffix},
@@ -5673,7 +5968,8 @@ def run_audit_command(cmd_arg: str, ctx: InputContext) -> str:
             return (
                 f"error: unknown option {parts[i]!r}. "
                 f"Known flags: --resume, --regen, --debug, --all, "
-                f"--measure-triage, --hunt, --workers N, --patch-max-turns N, "
+                f"--measure-triage, --hunt, --proof-strict, "
+                f"--trace-reachability, --workers N, --patch-max-turns N, "
                 f"--budget-tokens N, --gapfill N, --finding N."
             )
         else:
@@ -5684,12 +5980,6 @@ def run_audit_command(cmd_arg: str, ctx: InputContext) -> str:
 
     if finding_selector is not None and not regen:
         return "error: --finding requires --regen"
-
-    if trace_reachability:
-        return (
-            "error: --trace-reachability is reserved for the upcoming in-repo "
-            "reachability trace phase; not yet implemented."
-        )
 
     audit_cfg = _load_audit_config(base_dir)
     force_review = audit_cfg["force_review"]
@@ -5756,6 +6046,7 @@ def run_audit_command(cmd_arg: str, ctx: InputContext) -> str:
             proof_strict=proof_strict,
             reviewer_model=reviewer_model,
             max_gapfill_tasks=max_gapfill_tasks,
+            trace_reachability=trace_reachability,
         )
     finally:
         _debug_log_path = None
@@ -5784,6 +6075,7 @@ def _run_audit_phases(
     proof_strict: bool = False,
     reviewer_model: str = "",
     max_gapfill_tasks: int = 0,
+    trace_reachability: bool = False,
 ) -> str:
     configured_hunt_tasks = list(configured_hunt_tasks or [])
     force_review = list(force_review or [])
@@ -5821,6 +6113,14 @@ def _run_audit_phases(
             now = "strict" if proof_strict else "balanced"
             return (
                 f"error: --proof-strict mismatch. saved run was {saved}; "
+                f"this invocation is {now}. "
+                f"Start a fresh run instead of resuming."
+            )
+        if trace_reachability != state.trace_reachability:
+            saved = "trace-reachability" if state.trace_reachability else "no-trace"
+            now = "trace-reachability" if trace_reachability else "no-trace"
+            return (
+                f"error: --trace-reachability mismatch. saved run was {saved}; "
                 f"this invocation is {now}. "
                 f"Start a fresh run instead of resuming."
             )
@@ -5875,6 +6175,7 @@ def _run_audit_phases(
             budget_tokens=int(budget_tokens or 0),
             proof_strict=bool(proof_strict),
             max_gapfill_tasks=int(max_gapfill_tasks or 0),
+            trace_reachability=bool(trace_reachability),
         )
         mode_flags = []
         if state.select_all:
@@ -5885,6 +6186,8 @@ def _run_audit_phases(
             mode_flags.append("--hunt")
         if state.proof_strict:
             mode_flags.append("--proof-strict")
+        if state.trace_reachability:
+            mode_flags.append("--trace-reachability")
         if state.budget_tokens:
             mode_flags.append(f"--budget-tokens {state.budget_tokens}")
         if state.max_gapfill_tasks:
@@ -6706,6 +7009,9 @@ def _run_audit_phases(
 
     if state.phase == "dedupe":
         _run_dedupe_phase(state, ctx)
+
+    if state.phase == "trace":
+        _run_trace_phase(state, ctx, workers=workers)
 
     # Phase 5: artifacts
     if state.phase == "artifacts":

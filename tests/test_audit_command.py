@@ -4771,13 +4771,12 @@ class TestAuditCliFlags:
         run_audit_command("--proof-strict", self._ctx(tmp_path))
         assert captured["proof_strict"] is True
 
-    def test_trace_reachability_flag_is_reserved(self, tmp_path):
+    def test_trace_reachability_flag_threads_through(self, tmp_path, monkeypatch):
         from swival.audit import run_audit_command
 
-        out = run_audit_command("--trace-reachability", self._ctx(tmp_path))
-        assert out.startswith("error:")
-        assert "--trace-reachability is reserved" in out
-        assert "not yet implemented" in out
+        captured = self._capture(monkeypatch)
+        run_audit_command("--trace-reachability", self._ctx(tmp_path))
+        assert captured["trace_reachability"] is True
 
     def test_budget_tokens_accepts_underscore_separator(self, tmp_path, monkeypatch):
         from swival.audit import run_audit_command
@@ -5086,7 +5085,6 @@ class TestHarnessStateRoundtrip:
         assert loaded.coverage_records == {}
         assert loaded.adversarial_state == {}
         assert loaded.root_cause_groups == []
-        assert loaded.trace_state == {}
         assert loaded.proof_strict is False
         assert loaded.trace_reachability is False
         assert loaded.budget_tokens == 0
@@ -9623,3 +9621,342 @@ class TestParseDedupeBlock:
             "```"
         )
         assert _parse_dedupe_block(raw) == []
+
+
+def _trace_state(tmp_path: Path) -> AuditRunState:
+    state = _dedupe_state(tmp_path)
+    state.repo_profile = {
+        "summary": "tiny webhook service",
+        "entry_points": ["webhook.py"],
+        "trust_boundaries": ["POST /webhook"],
+    }
+    state.trace_reachability = True
+    return state
+
+
+class TestParseTraceBlock:
+    def test_parses_reachable_block(self):
+        from swival.audit import _parse_trace_block
+
+        raw = (
+            "Reasoning preamble...\n"
+            "```swival-audit-trace-v1\n"
+            "verdict: REACHABLE\n"
+            "entry_point: POST /webhook\n"
+            "trace_step: webhook.py:handle_webhook\n"
+            "trace_step: client.py:fetch_remote\n"
+            "blocker: \n"
+            "confidence: high\n"
+            "```\n"
+        )
+        parsed = _parse_trace_block(raw)
+        assert parsed["verdict"] == "REACHABLE"
+        assert parsed["entry_point"] == "POST /webhook"
+        assert parsed["trace_step"] == [
+            "webhook.py:handle_webhook",
+            "client.py:fetch_remote",
+        ]
+        assert parsed["confidence"] == "high"
+
+    def test_parses_not_reachable_with_blocker(self):
+        from swival.audit import _parse_trace_block
+
+        raw = (
+            "```swival-audit-trace-v1\n"
+            "verdict: NOT_REACHABLE\n"
+            "entry_point: \n"
+            "blocker: require_auth() rejects unauthenticated requests\n"
+            "confidence: medium\n"
+            "```"
+        )
+        parsed = _parse_trace_block(raw)
+        assert parsed["verdict"] == "NOT_REACHABLE"
+        assert "require_auth" in parsed["blocker"]
+
+    def test_lowercase_verdict_normalised(self):
+        from swival.audit import _parse_trace_block
+
+        raw = (
+            "```swival-audit-trace-v1\n"
+            "verdict: unknown\n"
+            "entry_point: \n"
+            "blocker: \n"
+            "confidence: low\n"
+            "```"
+        )
+        assert _parse_trace_block(raw)["verdict"] == "UNKNOWN"
+
+    def test_unknown_verdict_rejected(self):
+        from swival.audit import TraceBlockError, _parse_trace_block
+
+        raw = (
+            "```swival-audit-trace-v1\n"
+            "verdict: MAYBE\n"
+            "entry_point: \n"
+            "blocker: \n"
+            "confidence: low\n"
+            "```"
+        )
+        with pytest.raises(TraceBlockError):
+            _parse_trace_block(raw)
+
+    def test_invalid_confidence_blanked(self):
+        from swival.audit import _parse_trace_block
+
+        raw = (
+            "```swival-audit-trace-v1\n"
+            "verdict: REACHABLE\n"
+            "entry_point: POST /webhook\n"
+            "blocker: \n"
+            "confidence: maximal\n"
+            "```"
+        )
+        assert _parse_trace_block(raw)["confidence"] == ""
+
+    def test_missing_block_raises(self):
+        from swival.audit import TraceBlockError, _parse_trace_block
+
+        with pytest.raises(TraceBlockError):
+            _parse_trace_block("no fenced block here")
+
+
+class TestRunTracePhase:
+    def _patch_llm(self, monkeypatch, responses):
+        """Patch `_call_audit_llm` to return responses in order."""
+        from swival import audit
+
+        iterator = iter(responses)
+
+        def fake(*args, **kwargs):
+            return next(iterator)
+
+        monkeypatch.setattr(audit, "_call_audit_llm", fake)
+
+    def test_reachable_keeps_finding_and_records_trace(self, tmp_path, monkeypatch):
+        from swival.audit import (
+            _artifact_target_findings,
+            _build_root_cause_groups,
+            _run_trace_phase,
+        )
+
+        state = _trace_state(tmp_path)
+        vf = _ssrf_verified(title="reachable bug")
+        state.verified_findings = [vf]
+        state.root_cause_groups = _build_root_cause_groups(state)
+        state.phase = "trace"
+
+        self._patch_llm(
+            monkeypatch,
+            [
+                "```swival-audit-trace-v1\n"
+                "verdict: REACHABLE\n"
+                "entry_point: POST /webhook\n"
+                "trace_step: webhook.py:handle_webhook\n"
+                "blocker: \n"
+                "confidence: high\n"
+                "```\n",
+            ],
+        )
+
+        _run_trace_phase(state, _make_ctx(tmp_path))
+
+        assert state.phase == "artifacts"
+        assert vf.trace["verdict"] == "REACHABLE"
+        assert state.metrics.get("trace_reachable") == 1
+        assert _artifact_target_findings(state) == [vf]
+
+    def test_not_reachable_drops_finding_from_artifacts(
+        self, tmp_path, monkeypatch
+    ):
+        from swival.audit import (
+            _artifact_target_findings,
+            _build_root_cause_groups,
+            _run_trace_phase,
+        )
+
+        state = _trace_state(tmp_path)
+        vf = _ssrf_verified(title="not reachable bug")
+        state.verified_findings = [vf]
+        state.root_cause_groups = _build_root_cause_groups(state)
+        state.phase = "trace"
+
+        self._patch_llm(
+            monkeypatch,
+            [
+                "```swival-audit-trace-v1\n"
+                "verdict: NOT_REACHABLE\n"
+                "entry_point: \n"
+                "blocker: require_auth\n"
+                "confidence: high\n"
+                "```\n",
+            ],
+        )
+
+        _run_trace_phase(state, _make_ctx(tmp_path))
+
+        assert state.metrics.get("trace_not_reachable") == 1
+        assert _artifact_target_findings(state) == []
+
+    def test_scf_high_critical_preserved_when_not_reachable(
+        self, tmp_path, monkeypatch
+    ):
+        from swival.audit import (
+            _artifact_target_findings,
+            _build_root_cause_groups,
+            _run_trace_phase,
+        )
+
+        state = _trace_state(tmp_path)
+        vf = _ssrf_verified(
+            title="scf bug",
+            finding_type="security_control_failure",
+            severity="critical",
+        )
+        state.verified_findings = [vf]
+        state.root_cause_groups = _build_root_cause_groups(state)
+        state.phase = "trace"
+
+        self._patch_llm(
+            monkeypatch,
+            [
+                "```swival-audit-trace-v1\n"
+                "verdict: NOT_REACHABLE\n"
+                "entry_point: \n"
+                "blocker: no external entry\n"
+                "confidence: high\n"
+                "```\n",
+            ],
+        )
+
+        _run_trace_phase(state, _make_ctx(tmp_path))
+
+        assert _artifact_target_findings(state) == [vf]
+
+    def test_unknown_drops_from_artifacts_and_records_metric(
+        self, tmp_path, monkeypatch
+    ):
+        from swival.audit import (
+            _artifact_target_findings,
+            _build_root_cause_groups,
+            _run_trace_phase,
+        )
+
+        state = _trace_state(tmp_path)
+        vf = _ssrf_verified(title="unknown bug")
+        state.verified_findings = [vf]
+        state.root_cause_groups = _build_root_cause_groups(state)
+        state.phase = "trace"
+
+        self._patch_llm(
+            monkeypatch,
+            [
+                "```swival-audit-trace-v1\n"
+                "verdict: UNKNOWN\n"
+                "entry_point: \n"
+                "blocker: \n"
+                "confidence: low\n"
+                "```\n",
+            ],
+        )
+
+        _run_trace_phase(state, _make_ctx(tmp_path))
+
+        assert vf.trace["verdict"] == "UNKNOWN"
+        assert _artifact_target_findings(state) == []
+        assert state.metrics.get("trace_unknown") == 1
+        assert not any(
+            t.source == "trace_feedback" for t in state.hunt_tasks.values()
+        )
+
+    def test_llm_failure_records_unknown_with_error(self, tmp_path, monkeypatch):
+        from swival import audit
+        from swival.audit import _build_root_cause_groups, _run_trace_phase
+
+        state = _trace_state(tmp_path)
+        vf = _ssrf_verified(title="boom")
+        state.verified_findings = [vf]
+        state.root_cause_groups = _build_root_cause_groups(state)
+        state.phase = "trace"
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("provider down")
+
+        monkeypatch.setattr(audit, "_call_audit_llm", boom)
+
+        _run_trace_phase(state, _make_ctx(tmp_path))
+
+        assert vf.trace["verdict"] == "UNKNOWN"
+        assert "provider down" in vf.trace["error"]
+        assert state.phase == "artifacts"
+
+    def test_disabled_when_flag_not_set(self, tmp_path):
+        from swival.audit import _build_root_cause_groups, _run_trace_phase
+
+        state = _trace_state(tmp_path)
+        state.trace_reachability = False
+        vf = _ssrf_verified(title="x")
+        state.verified_findings = [vf]
+        state.root_cause_groups = _build_root_cause_groups(state)
+        state.phase = "trace"
+
+        _run_trace_phase(state, None)
+
+        assert state.phase == "artifacts"
+        assert vf.trace is None
+
+    def test_resume_skips_already_traced_findings(self, tmp_path, monkeypatch):
+        from swival.audit import _build_root_cause_groups, _run_trace_phase
+
+        state = _trace_state(tmp_path)
+        v1 = _ssrf_verified(title="A")
+        v2 = _ssrf_verified(title="B", source_boundary="POST /relay")
+        state.verified_findings = [v1, v2]
+        state.root_cause_groups = _build_root_cause_groups(state)
+        state.phase = "trace"
+        v1.trace = {
+            "verdict": "REACHABLE",
+            "entry_point": "POST /webhook",
+            "trace_step": [],
+            "blocker": "",
+            "confidence": "high",
+            "error": "",
+        }
+
+        calls = {"n": 0}
+
+        def fake(*args, **kwargs):
+            calls["n"] += 1
+            return (
+                "```swival-audit-trace-v1\n"
+                "verdict: REACHABLE\n"
+                "entry_point: POST /relay\n"
+                "blocker: \n"
+                "confidence: high\n"
+                "```\n"
+            )
+
+        monkeypatch.setattr("swival.audit._call_audit_llm", fake)
+
+        _run_trace_phase(state, _make_ctx(tmp_path))
+
+        assert calls["n"] == 1
+
+
+class TestTraceStateRoundtrip:
+    def test_trace_state_roundtrips(self, tmp_path):
+        state = _trace_state(tmp_path)
+        vf = _ssrf_verified(title="A")
+        vf.trace = {
+            "verdict": "REACHABLE",
+            "entry_point": "POST /webhook",
+            "trace_step": ["a", "b"],
+            "blocker": "",
+            "confidence": "high",
+            "error": "",
+        }
+        state.verified_findings = [vf]
+        state.save()
+
+        loaded = AuditRunState.load(state.state_dir, state.run_id)
+        assert loaded.trace_reachability is True
+        assert loaded.verified_findings[0].trace["verdict"] == "REACHABLE"

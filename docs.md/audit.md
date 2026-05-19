@@ -5,7 +5,7 @@ The `/audit` command runs a multi-phase security audit over committed Git-tracke
 It triages files by attack surface, performs deep review on escalated files, verifies each finding with an isolated proof-of-concept agent, generates patches, and writes structured reports. Only provable bugs survive to the final output.
 
 ```text
-/audit [path|glob ...] [--resume] [--regen] [--finding N[,M-R]] [--all] [--measure-triage] [--hunt] [--proof-strict] [--budget-tokens N] [--gapfill N] [--workers N] [--patch-max-turns N] [--debug]
+/audit [path|glob ...] [--resume] [--regen] [--finding N[,M-R]] [--all] [--measure-triage] [--hunt] [--proof-strict] [--trace-reachability] [--budget-tokens N] [--gapfill N] [--workers N] [--patch-max-turns N] [--debug]
 ```
 
 Works in both interactive (REPL) and one-shot mode (requires `--oneshot-commands`). Runs against `HEAD`, so dirty working-directory changes are ignored.
@@ -148,6 +148,16 @@ Before artifacts are generated, verified findings cluster into root-cause groups
 This is deliberately conservative. Two endpoints can share a vulnerable helper but expose it through different boundaries; those stay separate reports because the attacker reachability and impact differ. When the heuristic key is ambiguous, meaning two groups share everything except the free-text invariant, a small dedupe prompt is asked to choose MERGE or KEEP per pair. The prompt cannot invent findings, only fold one into another.
 
 Group records are persisted, the primary finding of each group is what Phase 5 renders, and variant locations appear inside the primary's `## Affected Locations` section.
+
+### Phase 4e: In-repo Reachability Trace
+
+This phase only runs when `--trace-reachability` is set on the original run. It takes each primary root-cause finding that has already cleared the verifier and asks one focused question: starting from the entry points listed in the Phase 1 profile, can attacker-controlled input from a real external boundary in this repository actually reach the verified sink?
+
+The trace agent receives the verified finding, the Phase 1 entry points and trust boundaries, the sink-location files, and a handful of entry-point files. It returns one of three verdicts in a structured `swival-audit-trace-v1` block: `REACHABLE` (with a named entry point and an ordered list of `trace_step` lines), `NOT_REACHABLE` (with a concrete `blocker`, such as the guard or absent caller that breaks every plausible path), or `UNKNOWN` (when the path is plausible but the evidence on hand is not enough to decide).
+
+The verdict gates what reaches the final report. `REACHABLE` findings carry their trace path into Phase 5 and get a strengthened reachability section. `NOT_REACHABLE` findings drop out of artifact generation, with one carve-out: a high or critical `security_control_failure` still produces a report because the control itself is the boundary. `UNKNOWN` findings also drop from the artifact list, and the count surfaces in metrics (`trace_unknown`) so the operator knows how much of the run sat on insufficient evidence. The harness does not auto-queue follow-up trace tasks: the trace phase is terminal in the current execution graph and there is no in-loop path back to hunt or reachability, so claiming a route to gapfill would mislead about what actually ran. Pursuing a specific `UNKNOWN` finding is an operator decision: add an `[[audit.hunt_task]]` block in `swival.toml` and re-run.
+
+Cross-repository tracing (`--trace-consumers`) is explicitly out of scope for now: reading arbitrary sibling repositories from a CLI flag would create confused-deputy risks around path access and accidental script execution that the in-repo case does not have.
 
 ### Phase 5: Artifact Generation
 
@@ -307,7 +317,7 @@ model = "claude-haiku-4-5"
 
 `--gapfill N` caps how many follow-up hunt tasks the observable-coverage gapfill phase may queue per run. The same value can be set as `max_gapfill_tasks` under `[audit]` in `swival.toml`; the CLI flag wins. Without an explicit cap, the default is `min(50, ceil(hunt_tasks * 0.25))`, so gapfill cannot more than quarter the original hunt budget while still rounding up partial slots on small runs. See "Phase 4c: gapfill" below for what gets queued.
 
-One more harness flag is recognised by the parser but reserved for upcoming work and currently returns an explicit `not yet implemented` error: `--trace-reachability` (in-repo reachability trace).
+`--trace-reachability` runs the in-repo reachability trace described in "Phase 4e" after verification and dedupe. The flag is opt-in because it adds one LLM call per primary root-cause finding; the value is that `NOT_REACHABLE` findings stop polluting the final report and `UNKNOWN` findings queue scoped trace-feedback follow-ups instead of being silently kept or silently dropped. Resuming a saved run requires the flag setting to match what the original run used, because the trace verdict gates artifact selection.
 
 All options can be combined with a focus path:
 

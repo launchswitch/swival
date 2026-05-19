@@ -59,6 +59,12 @@ INPUT_COMMANDS: dict[str, CommandInfo] = {
                 "to gapfill instead of failing open to proof",
             ),
             (
+                "--trace-reachability",
+                "Run an in-repo reachability trace on each verified finding; "
+                "NOT_REACHABLE non-SCF and UNKNOWN findings are excluded from "
+                "reports and UNKNOWN findings queue trace-feedback follow-ups",
+            ),
+            (
                 "--gapfill N",
                 "Cap the number of follow-up hunt tasks the observable-coverage "
                 "gapfill phase may queue (default: min(50, hunt_tasks * 0.25))",
