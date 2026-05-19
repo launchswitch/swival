@@ -99,7 +99,7 @@
             <h1 id="swival-security-scanner">Swival Security Scanner</h1>
 <p>The <code>/audit</code> command runs a multi-phase security audit over committed Git-tracked code.</p>
 <p>It triages files by attack surface, performs deep review on escalated files, verifies each finding with an isolated proof-of-concept agent, generates patches, and writes structured reports. Only provable bugs survive to the final output.</p>
-<pre><code class="language-text">/audit [path|glob ...] [--resume] [--regen] [--finding N[,M-R]] [--all] [--measure-triage] [--hunt] [--proof-strict] [--budget-tokens N] [--gapfill N] [--workers N] [--patch-max-turns N] [--debug]
+<pre><code class="language-text">/audit [path|glob ...] [--resume] [--regen] [--finding N[,M-R]] [--all] [--measure-triage] [--hunt] [--proof-strict] [--trace-reachability] [--budget-tokens N] [--gapfill N] [--workers N] [--patch-max-turns N] [--debug]
 </code></pre>
 <p>Works in both interactive (REPL) and one-shot mode (requires <code>--oneshot-commands</code>). Runs against <code>HEAD</code>, so dirty working-directory changes are ignored.</p>
 <h2 id="quick-start">Quick Start</h2>
@@ -193,6 +193,24 @@ Gapfill expansion is bounded. The cap is `--gapfill N` if set, otherwise `[audit
 
 The pipeline runs at most one gapfill round per run. Once `state.gapfill_round` has been advanced, any subsequent re-entry into the gapfill phase short-circuits to verification, including on `/audit --resume` after a transient failure during the follow-up pass. Coverage information that surfaces from gapfill tasks themselves is therefore intentionally ineligible for further gapfill: the harness trades a (very rare) third-order coverage gap for a hard upper bound on cost. Re-run from scratch if you want a second gapfill round against the same commit.
 
+### Phase 4d: Root-cause Dedupe
+
+Before artifacts are generated, verified findings cluster into root-cause groups. Two findings share a group only when they agree on every key boundary-sensitive field: attack class, finding type, source boundary, first reachability step, attacker position, sink operation, and the normalized invariant break. Exact duplicates that survived earlier dedupe collapse here too.
+
+This is deliberately conservative. Two endpoints can share a vulnerable helper but expose it through different boundaries; those stay separate reports because the attacker reachability and impact differ. When the heuristic key is ambiguous, meaning two groups share everything except the free-text invariant, a small dedupe prompt is asked to choose MERGE or KEEP per pair. The prompt cannot invent findings, only fold one into another.
+
+Group records are persisted, the primary finding of each group is what Phase 5 renders, and variant locations appear inside the primary's `## Affected Locations` section.
+
+### Phase 4e: In-repo Reachability Trace
+
+This phase only runs when `--trace-reachability` is set on the original run. It takes each primary root-cause finding that has already cleared the verifier and asks one focused question: starting from the entry points listed in the Phase 1 profile, can attacker-controlled input from a real external boundary in this repository actually reach the verified sink?
+
+The trace agent receives the verified finding, the Phase 1 entry points and trust boundaries, the sink-location files, and a handful of entry-point files. It returns one of three verdicts in a structured `swival-audit-trace-v1` block: `REACHABLE` (with a named entry point and an ordered list of `trace_step` lines), `NOT_REACHABLE` (with a concrete `blocker`, such as the guard or absent caller that breaks every plausible path), or `UNKNOWN` (when the path is plausible but the evidence on hand is not enough to decide).
+
+The verdict gates what reaches the final report. `REACHABLE` findings carry their trace path into Phase 5 and get a strengthened reachability section. `NOT_REACHABLE` findings drop out of artifact generation, with one carve-out: a high or critical `security_control_failure` still produces a report because the control itself is the boundary. `UNKNOWN` findings also drop from the artifact list, and the count surfaces in metrics (`trace_unknown`) so the operator knows how much of the run sat on insufficient evidence. The harness does not auto-queue follow-up trace tasks: the trace phase is terminal in the current execution graph and there is no in-loop path back to hunt or reachability, so claiming a route to gapfill would mislead about what actually ran. Pursuing a specific `UNKNOWN` finding is an operator decision: add an `[[audit.hunt_task]]` block in `swival.toml` and re-run.
+
+Cross-repository tracing (`--trace-consumers`) is explicitly out of scope for now: reading arbitrary sibling repositories from a CLI flag would create confused-deputy risks around path access and accidental script execution that the in-repo case does not have.
+
 ### Phase 5: Artifact Generation
 
 For each verified finding:
@@ -236,6 +254,7 @@ audit-findings/
 </code></pre>
 <p><code>--regen</code> regenerates reports and patches for a completed audit run. It reuses the verified findings from the original run and re-runs only phase 5 (artifact generation). This is useful when you want to improve patch quality without repeating the expensive triage, deep review, and verification phases.</p>
 <p>Use <code>--finding</code> with 1-based Phase 5 finding numbers to regenerate only selected artifacts. <code>--finding</code> requires <code>--regen</code> and is rejected if you pass it on a fresh run.</p>
+<p>Finding numbers index into the post-dedupe artifact list, which is one entry per root-cause group, not one per raw verified finding. If Phase 4d folded three variants into a single group, that group is one number and one regenerate target; selecting it regenerates the primary report which already lists the variant locations. The 1-based ordering is stable across resumes because the underlying artifact entries carry stable indexes.</p>
 <pre><code class="language-text">swival&gt; /audit --regen
 swival&gt; /audit --regen --finding 2 --patch-max-turns 75
 swival&gt; /audit --regen --finding 2,4-6
@@ -290,7 +309,7 @@ model = &quot;claude-haiku-4-5&quot;
 </code></pre>
 <p><code>[audit.reviewer] profile</code> is parsed but reserved for a future release. Switching the reviewer to a different provider needs an api_base/api_key overlay that is not yet wired through, so for now only same-provider model overrides take effect; a <code>profile</code> entry currently surfaces an explicit error.</p>
 <p><code>--gapfill N</code> caps how many follow-up hunt tasks the observable-coverage gapfill phase may queue per run. The same value can be set as <code>max_gapfill_tasks</code> under <code>[audit]</code> in <code>swival.toml</code>; the CLI flag wins. Without an explicit cap, the default is <code>min(50, ceil(hunt_tasks * 0.25))</code>, so gapfill cannot more than quarter the original hunt budget while still rounding up partial slots on small runs. See "Phase 4c: gapfill" below for what gets queued.</p>
-<p>One more harness flag is recognised by the parser but reserved for upcoming work and currently returns an explicit <code>not yet implemented</code> error: <code>--trace-reachability</code> (in-repo reachability trace).</p>
+<p><code>--trace-reachability</code> runs the in-repo reachability trace described in "Phase 4e" after verification and dedupe. The flag is opt-in because it adds one LLM call per primary root-cause finding; the value is that <code>NOT_REACHABLE</code> non-SCF findings stop polluting the final report and <code>UNKNOWN</code> findings are surfaced in metrics rather than silently kept or silently dropped. Resuming a saved run requires the flag setting to match what the original run used, because the trace verdict gates artifact selection.</p>
 <p>All options can be combined with a focus path:</p>
 <pre><code class="language-text">swival&gt; /audit src/api/ --resume --workers 6
 swival&gt; /audit src/api/ --regen
@@ -366,7 +385,7 @@ max_hunt_tasks = 200          # ceiling on generated hunt tasks
 </ul>
 <p>LLM interactions are traced to <code>.swival/audit/&lt;run_id&gt;/traces/</code> when <code>--trace-dir</code> is set on the outer session.</p>
 <p>Temporary worktrees for verification and patch generation are created under <code>.swival/audit/&lt;run_id&gt;/verify/</code> and <code>.swival/audit/&lt;run_id&gt;/patch-gen/</code>, and cleaned up automatically.</p>
-<p>Final artifacts go to <code>audit-findings/</code> in the project root.</p>
+<p>Final artifacts go to <code>audit-findings/</code> in the project root. A <code>run_summary.json</code> is written next to <code>state.json</code> at end-of-run; see "Run Summary and Metrics" below.</p>
 <h2 id="interruption-and-recovery">Interruption and Recovery</h2>
 <p>The audit is designed to be interrupted and resumed. <code>Ctrl+C</code> during any phase stops the audit gracefully. State is always saved before the interrupt is handled, so <code>/audit --resume</code> picks up where it left off.</p>
 <p>If verification produces partial results (some findings verified, some failed), the audit reports the incomplete state and asks you to resume:</p>
@@ -376,6 +395,20 @@ max_hunt_tasks = 200          # ceiling on generated hunt tasks
 <pre><code class="language-text">Audit incomplete: artifact generation has 1 failed and 0 pending out of 10 verified finding(s). Use /audit --resume --patch-max-turns 75 to retry incomplete artifacts, or /audit --regen --finding 1 --patch-max-turns 75 to retry a specific finding.
 </code></pre>
 <p>A completed audit (phase <code>"done"</code>) is not resumable with <code>--resume</code>, but can be used with <code>--regen</code> to regenerate artifacts.</p>
+<h2 id="run-summary-and-metrics">Run Summary and Metrics</h2>
+<p>When an audit finishes it prints a short <code>--- run summary ---</code> block to stderr and writes the same data to <code>.swival/audit/&lt;run_id&gt;/run_summary.json</code>. The summary is meant to be diffed across runs without scraping prose: the JSON keys are stable and additions are append-only, so a file-centric run and a <code>--hunt</code> run on the same repository can be compared field by field.</p>
+<p>The block reports:</p>
+<ul>
+<li><strong>verified vs proposed</strong>, with the high/critical subset called out separately. This is the headline number for the default-rollout gate: any switch to a hunt-first default has to keep or improve verified high/critical recall at the agreed cost multiplier before bare <code>/audit</code> flips defaults.</li>
+<li><strong>per-attack-class precision</strong> in the form <code>verified/proposed (percent)</code>. Hunt-path findings carry their originating attack class straight through verification; file-centric findings land in an <code>unspecified</code> bucket so the precision line stays honest about which findings the harness actually routed by class.</li>
+<li><strong>proof-kind distribution</strong> (<code>runtime</code>, <code>source</code>, <code>mixed</code>, <code>unspecified</code>). The plan prefers runtime proofs for memory-safety, parser-differential, deserialization, injection, and similar bug classes; source-only proofs are acceptable for security-control failures and simple logic bugs. The distribution makes it visible when a model has drifted toward cheap source-only proofs.</li>
+<li><strong>trace verdicts</strong> (when <code>--trace-reachability</code> ran): how many primary root-cause findings the trace agent labelled <code>REACHABLE</code>, <code>NOT_REACHABLE</code>, or <code>UNKNOWN</code>.</li>
+<li><strong>disproof outcomes</strong>: the count of adversarial verdicts (<code>plausible</code>, <code>needs_proof</code>, <code>invalid</code>, <code>failed_open</code>, <code>gapfill</code>) plus the agreement-with-proof tally and the number of disproof rounds that ran with the main model rather than a separate reviewer.</li>
+<li><strong>root-cause groups</strong>: the number of report-level groups after dedupe and how many variants were merged into a primary.</li>
+<li><strong>budget breakdown</strong> per phase when <code>--budget-tokens</code> was set.</li>
+</ul>
+<p>The accompanying <code>run_summary.json</code> mirrors that block as structured data. The <code>attack_class</code> and <code>proof_kinds</code> maps are the load-bearing keys for cross-run comparison; <code>disproof.same_model_rounds</code> matters when judging whether the adversarial gate had a genuinely independent reviewer or fell back to same-model fallback.</p>
+<p>The default rollout gate from the harness plan is the operator process that consumes this data: run bare <code>/audit --measure-triage</code> and <code>/audit --hunt</code> on the same corpus, compare <code>verified_high_or_critical</code>, the per-attack-class precision, and the cost reflected in <code>budget.used</code>, and only flip the default once hunt holds or improves both.</p>
 <h2 id="limitations">Limitations</h2>
 <p>The audit depends heavily on the quality of the underlying LLM. Models with weak code understanding will produce lower-quality triage and more false negatives. The verification phase catches many false positives, but a weak verifier model may also miss real bugs or incorrectly confirm speculative findings.</p>
 <p>The audit sees only committed code. Runtime configuration, environment variables, deployment topology, and dynamic code paths that depend on external state are outside its view.</p>

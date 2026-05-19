@@ -3281,6 +3281,199 @@ def _apply_promotions(
     return promotions
 
 
+def _bump_metric(metrics: dict[str, int], key: str, n: int = 1) -> None:
+    metrics[key] = int(metrics.get(key, 0)) + n
+
+
+def _bump_attack_class(
+    state: AuditRunState, attack_class: str, side: str, n: int = 1
+) -> None:
+    bucket = state.attack_class_metrics.setdefault(
+        attack_class, {"proposed": 0, "verified": 0}
+    )
+    bucket[side] = int(bucket.get(side, 0)) + n
+
+
+def _proof_kind_counts(metrics: dict[str, int]) -> dict[str, int]:
+    return {
+        k[len("proof_kind_") :]: int(v)
+        for k, v in metrics.items()
+        if k.startswith("proof_kind_") and int(v) > 0
+    }
+
+
+def _disproof_aggregations(
+    state: AuditRunState,
+) -> tuple[dict[str, int], dict[str, int]]:
+    statuses: dict[str, int] = {}
+    agreements: dict[str, int] = {}
+    for rec in state.adversarial_state.values():
+        statuses[rec.get("status") or "unknown"] = (
+            statuses.get(rec.get("status") or "unknown", 0) + 1
+        )
+        ag = rec.get("agreement_with_proof") or ""
+        if ag:
+            agreements[ag] = agreements.get(ag, 0) + 1
+    return statuses, agreements
+
+
+def _record_verified_metrics(state: AuditRunState, vf: VerifiedFinding) -> None:
+    """Tally per-attack-class verification and proof-kind distribution.
+
+    Hunt-path findings carry an ``attack_class`` from the originating
+    ``HuntTask``; file-centric findings land in the ``"unspecified"`` bucket
+    so the precision section stays honest about which findings the harness
+    actually routed by class.
+    """
+    ac = vf.finding.attack_class or "unspecified"
+    _bump_attack_class(state, ac, "verified")
+    kind = (vf.reproducer or {}).get("proof_kind") or "unspecified"
+    _bump_metric(state.metrics, f"proof_kind_{kind}")
+    if (vf.finding.severity or "").lower() in ("high", "critical"):
+        _bump_metric(state.metrics, "verified_high_or_critical")
+
+
+def _reconcile_verified_metrics(state: AuditRunState) -> None:
+    """Recompute verified-side counters from ``state.verified_findings``.
+
+    Called after the Phase 4 content-key dedupe collapses duplicate verified
+    entries: ``_record_verified_metrics`` already bumped counters when the
+    duplicates were originally appended, so without this the per-attack-class
+    and proof-kind tallies would over-count by the collapsed-row count.
+    """
+    for bucket in state.attack_class_metrics.values():
+        bucket["verified"] = 0
+    for key in list(state.metrics):
+        if key.startswith("proof_kind_"):
+            state.metrics[key] = 0
+    state.metrics["verified_high_or_critical"] = 0
+    for vf in state.verified_findings:
+        _record_verified_metrics(state, vf)
+
+
+def _emit_run_summary(state: AuditRunState) -> None:
+    """Print the end-of-run metrics block.
+
+    Shape is stable on purpose: the rollout gate diffs the per-attack-class
+    precision lines and proof-kind/trace tallies across runs, so callers can
+    grep without parsing prose.
+    """
+    high_crit = int(state.metrics.get("verified_high_or_critical", 0))
+
+    fmt.info("--- run summary ---")
+    fmt.info(
+        f"  verified: {len(state.verified_findings)} (high/critical: {high_crit}) "
+        f"of {len(state.proposed_findings)} proposed"
+    )
+
+    if state.attack_class_metrics:
+        fmt.info("  per attack class (verified / proposed):")
+        for ac in sorted(state.attack_class_metrics):
+            bucket = state.attack_class_metrics[ac]
+            proposed = int(bucket.get("proposed", 0))
+            verified = int(bucket.get("verified", 0))
+            if proposed == 0 and verified == 0:
+                continue
+            if proposed == 0:
+                fmt.info(f"    {ac}: {verified} verified (no hunt tally)")
+                continue
+            precision = 100.0 * verified / proposed
+            fmt.info(f"    {ac}: {verified}/{proposed} ({precision:.0f}%)")
+
+    proof_kinds = sorted(_proof_kind_counts(state.metrics).items())
+    if proof_kinds:
+        fmt.info("  proof kinds: " + ", ".join(f"{k}={v}" for k, v in proof_kinds))
+
+    if state.trace_reachability:
+        tr = int(state.metrics.get("trace_reachable", 0))
+        tn = int(state.metrics.get("trace_not_reachable", 0))
+        tu = int(state.metrics.get("trace_unknown", 0))
+        fmt.info(f"  trace verdicts: {tr} reachable, {tn} not-reachable, {tu} unknown")
+
+    if state.adversarial_state:
+        statuses, agreements = _disproof_aggregations(state)
+        fmt.info(
+            "  disproof: " + ", ".join(f"{k}={v}" for k, v in sorted(statuses.items()))
+        )
+        if agreements:
+            fmt.info(
+                "  disproof agreement: "
+                + ", ".join(f"{k}={v}" for k, v in sorted(agreements.items()))
+            )
+        if state.metrics.get("disproof_same_model"):
+            fmt.info(
+                f"  disproof same-model fallback rounds: "
+                f"{int(state.metrics['disproof_same_model'])}"
+            )
+
+    if state.root_cause_groups:
+        merged = int(state.metrics.get("root_cause_variants_merged", 0))
+        fmt.info(
+            f"  root-cause groups: {len(state.root_cause_groups)} "
+            f"({merged} variant(s) merged)"
+        )
+
+    for line in BudgetPlanner(state).detail_lines():
+        fmt.info(line)
+
+
+def _build_run_summary(state: AuditRunState) -> dict:
+    """Return the run summary as a plain dict for the JSON artifact.
+
+    Keep keys stable: the rollout gate diffs this dict across runs, so new
+    keys are append-only and existing keys must keep meaning.
+    """
+    disproof_statuses, disproof_agreement = _disproof_aggregations(state)
+    budget = BudgetPlanner(state)
+    return {
+        "run_id": state.run_id,
+        "proposed": len(state.proposed_findings),
+        "verified": len(state.verified_findings),
+        "verified_high_or_critical": int(
+            state.metrics.get("verified_high_or_critical", 0)
+        ),
+        "attack_class": {
+            ac: {
+                "proposed": int(b.get("proposed", 0)),
+                "verified": int(b.get("verified", 0)),
+            }
+            for ac, b in state.attack_class_metrics.items()
+        },
+        "proof_kinds": _proof_kind_counts(state.metrics),
+        "trace": {
+            "enabled": bool(state.trace_reachability),
+            "reachable": int(state.metrics.get("trace_reachable", 0)),
+            "not_reachable": int(state.metrics.get("trace_not_reachable", 0)),
+            "unknown": int(state.metrics.get("trace_unknown", 0)),
+        },
+        "disproof": {
+            "status": disproof_statuses,
+            "agreement": disproof_agreement,
+            "same_model_rounds": int(state.metrics.get("disproof_same_model", 0)),
+        },
+        "root_cause": {
+            "groups": len(state.root_cause_groups),
+            "variants_merged": int(state.metrics.get("root_cause_variants_merged", 0)),
+        },
+        "budget": {
+            "enabled": budget.enabled,
+            "total": budget.total,
+            "used": budget.used(),
+            "per_phase": dict(state.budget_used),
+        },
+    }
+
+
+def _write_run_summary_json(state: AuditRunState, base_dir: str) -> None:
+    """Persist the run summary alongside ``state.json`` for cross-run diffing."""
+    out_path = Path(base_dir) / state.state_dir / state.run_id / "run_summary.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        out_path.write_text(json.dumps(_build_run_summary(state), indent=2))
+    except OSError as e:
+        _debug_log("run_summary_write_failed", error=str(e), path=str(out_path))
+
+
 def _emit_measure_triage_recall(state: AuditRunState) -> None:
     """Print the calibration mode recall section.
 
@@ -3678,10 +3871,7 @@ def _phase_hunt_one(
     findings = [_hunt_finding_to_record(f, task) for f in findings_raw[:3]]
     coverage = _coverage_record_from_parsed(task, state, coverage_raw)
 
-    bucket = state.attack_class_metrics.setdefault(
-        task.attack_class, {"proposed": 0, "verified": 0}
-    )
-    bucket["proposed"] = int(bucket.get("proposed", 0)) + len(findings)
+    _bump_attack_class(state, task.attack_class, "proposed", len(findings))
 
     return (findings, coverage, None)
 
@@ -4342,9 +4532,7 @@ def _finding_key(finding: FindingRecord) -> str:
     return hashlib.sha256(blob.encode()).hexdigest()[:12]
 
 
-_SEVERITY_RANK: dict[str, int] = {
-    s: i for i, s in enumerate(reversed(_SEVERITIES))
-}
+_SEVERITY_RANK: dict[str, int] = {s: i for i, s in enumerate(reversed(_SEVERITIES))}
 _DEDUPE_LOCAL_BUG_PREFIX = 80
 _DEDUPE_SUMMARY_MAX = 300
 _DEDUPE_SENTINEL = "swival-audit-dedupe-v1"
@@ -4426,12 +4614,12 @@ def _build_root_cause_groups(state: AuditRunState) -> list[RootCauseGroup]:
         primary = members[0]
         primary_key = key_by_id[id(primary)]
         variant_keys = [
-            key_by_id[id(m)]
-            for m in members
-            if key_by_id[id(m)] != primary_key
+            key_by_id[id(m)] for m in members if key_by_id[id(m)] != primary_key
         ]
         boundaries = list(
-            dict.fromkeys(m.finding.source_boundary for m in members if m.finding.source_boundary)
+            dict.fromkeys(
+                m.finding.source_boundary for m in members if m.finding.source_boundary
+            )
         )
         affected = list(
             dict.fromkeys(loc for m in members for loc in m.finding.locations)
@@ -4477,8 +4665,7 @@ def _artifact_primary_candidates(state: AuditRunState) -> list[VerifiedFinding]:
         return list(state.verified_findings)
     primaries = {g.primary_finding_key for g in state.root_cause_groups}
     return [
-        vf for vf in state.verified_findings
-        if _finding_key(vf.finding) in primaries
+        vf for vf in state.verified_findings if _finding_key(vf.finding) in primaries
     ]
 
 
@@ -4668,9 +4855,9 @@ def _prompt_assisted_dedupe(
         target.affected_locations = list(
             dict.fromkeys(target.affected_locations + dropped.affected_locations)
         )
-    state.metrics["root_cause_prompt_merges"] = (
-        state.metrics.get("root_cause_prompt_merges", 0) + len(merged_into)
-    )
+    state.metrics["root_cause_prompt_merges"] = state.metrics.get(
+        "root_cause_prompt_merges", 0
+    ) + len(merged_into)
     return list(by_primary.values())
 
 
@@ -4823,9 +5010,7 @@ def _build_trace_user_prompt(
     )
 
 
-def _trace_evidence_files(
-    vf: VerifiedFinding, entry_points: list[str]
-) -> list[str]:
+def _trace_evidence_files(vf: VerifiedFinding, entry_points: list[str]) -> list[str]:
     """Sink-location files plus Phase 1 entry points, deduped and capped."""
     seen: dict[str, None] = dict.fromkeys(_evidence_file_paths(vf.finding))
     for ep in entry_points:
@@ -6966,6 +7151,7 @@ def _run_audit_phases(
                     vs["status"] = "verified"
                     vs["summary"] = "verified by proof-of-concept reproduction"
                     state.verified_findings.append(result.verified_finding)
+                    _record_verified_metrics(state, result.verified_finding)
                     verified_count += 1
                     fmt.info(f"  [{i + 1}/{total}] verified: {finding_title}")
 
@@ -7001,7 +7187,9 @@ def _run_audit_phases(
             if vf_key not in seen_vf_keys:
                 seen_vf_keys.add(vf_key)
                 deduped_vf.append(vf)
-        state.verified_findings = deduped_vf
+        if len(deduped_vf) != len(state.verified_findings):
+            state.verified_findings = deduped_vf
+            _reconcile_verified_metrics(state)
 
         state.phase = "dedupe"
         state.save()
@@ -7134,6 +7322,8 @@ def _run_audit_phases(
 
         state.phase = "done"
         state.save()
+        _emit_run_summary(state)
+        _write_run_summary_json(state, base_dir)
     else:
         _failed, _pending, written = _artifact_summary(state)
 

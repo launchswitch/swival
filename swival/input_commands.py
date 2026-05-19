@@ -62,7 +62,7 @@ INPUT_COMMANDS: dict[str, CommandInfo] = {
                 "--trace-reachability",
                 "Run an in-repo reachability trace on each verified finding; "
                 "NOT_REACHABLE non-SCF and UNKNOWN findings are excluded from "
-                "reports and UNKNOWN findings queue trace-feedback follow-ups",
+                "final reports",
             ),
             (
                 "--gapfill N",

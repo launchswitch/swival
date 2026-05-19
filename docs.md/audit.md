@@ -317,7 +317,7 @@ model = "claude-haiku-4-5"
 
 `--gapfill N` caps how many follow-up hunt tasks the observable-coverage gapfill phase may queue per run. The same value can be set as `max_gapfill_tasks` under `[audit]` in `swival.toml`; the CLI flag wins. Without an explicit cap, the default is `min(50, ceil(hunt_tasks * 0.25))`, so gapfill cannot more than quarter the original hunt budget while still rounding up partial slots on small runs. See "Phase 4c: gapfill" below for what gets queued.
 
-`--trace-reachability` runs the in-repo reachability trace described in "Phase 4e" after verification and dedupe. The flag is opt-in because it adds one LLM call per primary root-cause finding; the value is that `NOT_REACHABLE` findings stop polluting the final report and `UNKNOWN` findings queue scoped trace-feedback follow-ups instead of being silently kept or silently dropped. Resuming a saved run requires the flag setting to match what the original run used, because the trace verdict gates artifact selection.
+`--trace-reachability` runs the in-repo reachability trace described in "Phase 4e" after verification and dedupe. The flag is opt-in because it adds one LLM call per primary root-cause finding; the value is that `NOT_REACHABLE` non-SCF findings stop polluting the final report and `UNKNOWN` findings are surfaced in metrics rather than silently kept or silently dropped. Resuming a saved run requires the flag setting to match what the original run used, because the trace verdict gates artifact selection.
 
 All options can be combined with a focus path:
 
@@ -402,7 +402,7 @@ LLM interactions are traced to `.swival/audit/<run_id>/traces/` when `--trace-di
 
 Temporary worktrees for verification and patch generation are created under `.swival/audit/<run_id>/verify/` and `.swival/audit/<run_id>/patch-gen/`, and cleaned up automatically.
 
-Final artifacts go to `audit-findings/` in the project root.
+Final artifacts go to `audit-findings/` in the project root. A `run_summary.json` is written next to `state.json` at end-of-run; see "Run Summary and Metrics" below.
 
 ## Interruption and Recovery
 
@@ -421,6 +421,24 @@ Audit incomplete: artifact generation has 1 failed and 0 pending out of 10 verif
 ```
 
 A completed audit (phase `"done"`) is not resumable with `--resume`, but can be used with `--regen` to regenerate artifacts.
+
+## Run Summary and Metrics
+
+When an audit finishes it prints a short `--- run summary ---` block to stderr and writes the same data to `.swival/audit/<run_id>/run_summary.json`. The summary is meant to be diffed across runs without scraping prose: the JSON keys are stable and additions are append-only, so a file-centric run and a `--hunt` run on the same repository can be compared field by field.
+
+The block reports:
+
+- **verified vs proposed**, with the high/critical subset called out separately. This is the headline number for the default-rollout gate: any switch to a hunt-first default has to keep or improve verified high/critical recall at the agreed cost multiplier before bare `/audit` flips defaults.
+- **per-attack-class precision** in the form `verified/proposed (percent)`. Hunt-path findings carry their originating attack class straight through verification; file-centric findings land in an `unspecified` bucket so the precision line stays honest about which findings the harness actually routed by class.
+- **proof-kind distribution** (`runtime`, `source`, `mixed`, `unspecified`). The plan prefers runtime proofs for memory-safety, parser-differential, deserialization, injection, and similar bug classes; source-only proofs are acceptable for security-control failures and simple logic bugs. The distribution makes it visible when a model has drifted toward cheap source-only proofs.
+- **trace verdicts** (when `--trace-reachability` ran): how many primary root-cause findings the trace agent labelled `REACHABLE`, `NOT_REACHABLE`, or `UNKNOWN`.
+- **disproof outcomes**: the count of adversarial verdicts (`plausible`, `needs_proof`, `invalid`, `failed_open`, `gapfill`) plus the agreement-with-proof tally and the number of disproof rounds that ran with the main model rather than a separate reviewer.
+- **root-cause groups**: the number of report-level groups after dedupe and how many variants were merged into a primary.
+- **budget breakdown** per phase when `--budget-tokens` was set.
+
+The accompanying `run_summary.json` mirrors that block as structured data. The `attack_class` and `proof_kinds` maps are the load-bearing keys for cross-run comparison; `disproof.same_model_rounds` matters when judging whether the adversarial gate had a genuinely independent reviewer or fell back to same-model fallback.
+
+The default rollout gate from the harness plan is the operator process that consumes this data: run bare `/audit --measure-triage` and `/audit --hunt` on the same corpus, compare `verified_high_or_critical`, the per-attack-class precision, and the cost reflected in `budget.used`, and only flip the default once hunt holds or improves both.
 
 ## Limitations
 

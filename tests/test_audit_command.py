@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -9324,9 +9325,7 @@ class TestRootCauseDedupeHeuristic:
 
         state = _dedupe_state(tmp_path)
         state.verified_findings = [
-            _ssrf_verified(
-                source_boundary="POST /low", severity="low", title="lo"
-            ),
+            _ssrf_verified(source_boundary="POST /low", severity="low", title="lo"),
             _ssrf_verified(
                 source_boundary="POST /crit",
                 severity="critical",
@@ -9605,21 +9604,13 @@ class TestParseDedupeBlock:
     def test_missing_keys_skipped(self):
         from swival.audit import _parse_dedupe_block
 
-        raw = (
-            "```swival-audit-dedupe-v1\n"
-            "action: MERGE\ndrop: bbb\n"
-            "```"
-        )
+        raw = "```swival-audit-dedupe-v1\naction: MERGE\ndrop: bbb\n```"
         assert _parse_dedupe_block(raw) == []
 
     def test_unknown_action_skipped(self):
         from swival.audit import _parse_dedupe_block
 
-        raw = (
-            "```swival-audit-dedupe-v1\n"
-            "action: REJECT\nkeep: aaa\ndrop: bbb\n"
-            "```"
-        )
+        raw = "```swival-audit-dedupe-v1\naction: REJECT\nkeep: aaa\ndrop: bbb\n```"
         assert _parse_dedupe_block(raw) == []
 
 
@@ -9765,9 +9756,7 @@ class TestRunTracePhase:
         assert state.metrics.get("trace_reachable") == 1
         assert _artifact_target_findings(state) == [vf]
 
-    def test_not_reachable_drops_finding_from_artifacts(
-        self, tmp_path, monkeypatch
-    ):
+    def test_not_reachable_drops_finding_from_artifacts(self, tmp_path, monkeypatch):
         from swival.audit import (
             _artifact_target_findings,
             _build_root_cause_groups,
@@ -9864,9 +9853,7 @@ class TestRunTracePhase:
         assert vf.trace["verdict"] == "UNKNOWN"
         assert _artifact_target_findings(state) == []
         assert state.metrics.get("trace_unknown") == 1
-        assert not any(
-            t.source == "trace_feedback" for t in state.hunt_tasks.values()
-        )
+        assert not any(t.source == "trace_feedback" for t in state.hunt_tasks.values())
 
     def test_llm_failure_records_unknown_with_error(self, tmp_path, monkeypatch):
         from swival import audit
@@ -9960,3 +9947,142 @@ class TestTraceStateRoundtrip:
         loaded = AuditRunState.load(state.state_dir, state.run_id)
         assert loaded.trace_reachability is True
         assert loaded.verified_findings[0].trace["verdict"] == "REACHABLE"
+
+
+class TestRunSummaryMetrics:
+    def _state(self, tmp_path: Path) -> AuditRunState:
+        scope = AuditScope(
+            branch="main",
+            commit="abc",
+            tracked_files=["webhook.py"],
+            mandatory_files=["webhook.py"],
+            focus=[],
+        )
+        return AuditRunState(
+            run_id="summary-run",
+            scope=scope,
+            queued_files=["webhook.py"],
+            state_dir=tmp_path / ".swival" / "audit",
+        )
+
+    def test_record_verified_metrics_bumps_attack_class_and_proof_kind(self, tmp_path):
+        from swival.audit import _record_verified_metrics
+
+        state = self._state(tmp_path)
+        state.attack_class_metrics["ssrf"] = {"proposed": 2, "verified": 0}
+        vf = _ssrf_verified(severity="high")
+        vf.reproducer = {"proof_kind": "runtime"}
+
+        _record_verified_metrics(state, vf)
+
+        assert state.attack_class_metrics["ssrf"]["verified"] == 1
+        assert state.metrics["proof_kind_runtime"] == 1
+        assert state.metrics["verified_high_or_critical"] == 1
+
+    def test_record_verified_metrics_unspecified_class(self, tmp_path):
+        from swival.audit import _record_verified_metrics
+
+        state = self._state(tmp_path)
+        vf = _ssrf_verified(severity="low")
+        vf.finding.attack_class = ""
+        vf.reproducer = None
+
+        _record_verified_metrics(state, vf)
+
+        assert state.attack_class_metrics["unspecified"]["verified"] == 1
+        assert state.metrics["proof_kind_unspecified"] == 1
+        assert state.metrics.get("verified_high_or_critical", 0) == 0
+
+    def test_build_run_summary_shape(self, tmp_path):
+        from swival.audit import _build_run_summary, _record_verified_metrics
+
+        state = self._state(tmp_path)
+        state.attack_class_metrics["ssrf"] = {"proposed": 3, "verified": 0}
+        state.proposed_findings = [_ssrf_verified().finding for _ in range(3)]
+        vf = _ssrf_verified(severity="critical")
+        vf.reproducer = {"proof_kind": "runtime"}
+        state.verified_findings = [vf]
+        _record_verified_metrics(state, vf)
+        state.trace_reachability = True
+        state.metrics["trace_reachable"] = 1
+        state.metrics["trace_unknown"] = 2
+        state.adversarial_state["k1"] = {
+            "status": "plausible",
+            "agreement_with_proof": "agreed",
+        }
+        state.metrics["disproof_same_model"] = 1
+
+        summary = _build_run_summary(state)
+
+        assert summary["proposed"] == 3
+        assert summary["verified"] == 1
+        assert summary["verified_high_or_critical"] == 1
+        assert summary["attack_class"]["ssrf"] == {"proposed": 3, "verified": 1}
+        assert summary["proof_kinds"] == {"runtime": 1}
+        assert summary["trace"]["enabled"] is True
+        assert summary["trace"]["reachable"] == 1
+        assert summary["trace"]["unknown"] == 2
+        assert summary["disproof"]["status"] == {"plausible": 1}
+        assert summary["disproof"]["agreement"] == {"agreed": 1}
+        assert summary["disproof"]["same_model_rounds"] == 1
+
+    def test_write_run_summary_json_creates_file(self, tmp_path):
+        from swival.audit import _record_verified_metrics, _write_run_summary_json
+
+        state = self._state(tmp_path)
+        state.proposed_findings = [_ssrf_verified().finding]
+        vf = _ssrf_verified()
+        vf.reproducer = {"proof_kind": "source"}
+        state.verified_findings = [vf]
+        _record_verified_metrics(state, vf)
+
+        _write_run_summary_json(state, str(tmp_path))
+
+        out = tmp_path / ".swival" / "audit" / "summary-run" / "run_summary.json"
+        assert out.exists()
+        blob = json.loads(out.read_text())
+        assert blob["run_id"] == "summary-run"
+        assert blob["verified"] == 1
+        assert blob["proof_kinds"]["source"] == 1
+
+    def test_emit_run_summary_prints_attack_class_lines(self, tmp_path, monkeypatch):
+        from swival.audit import _emit_run_summary, _record_verified_metrics
+
+        state = self._state(tmp_path)
+        state.attack_class_metrics["ssrf"] = {"proposed": 4, "verified": 0}
+        state.proposed_findings = [_ssrf_verified().finding for _ in range(4)]
+        vf = _ssrf_verified(severity="high")
+        vf.reproducer = {"proof_kind": "runtime"}
+        state.verified_findings = [vf]
+        _record_verified_metrics(state, vf)
+
+        lines: list[str] = []
+        monkeypatch.setattr(
+            "swival.audit.fmt.info", lambda msg, *a, **k: lines.append(msg)
+        )
+
+        _emit_run_summary(state)
+
+        joined = "\n".join(lines)
+        assert "run summary" in joined
+        assert "verified: 1" in joined
+        assert "high/critical: 1" in joined
+        assert "ssrf: 1/4" in joined
+        assert "proof kinds: runtime=1" in joined
+
+    def test_reconcile_verified_metrics_after_dedupe(self, tmp_path):
+        from swival.audit import _reconcile_verified_metrics
+
+        state = self._state(tmp_path)
+        state.attack_class_metrics["ssrf"] = {"proposed": 1, "verified": 2}
+        state.metrics["proof_kind_runtime"] = 2
+        state.metrics["verified_high_or_critical"] = 2
+        vf = _ssrf_verified(severity="high")
+        vf.reproducer = {"proof_kind": "runtime"}
+        state.verified_findings = [vf]
+
+        _reconcile_verified_metrics(state)
+
+        assert state.attack_class_metrics["ssrf"]["verified"] == 1
+        assert state.metrics["proof_kind_runtime"] == 1
+        assert state.metrics["verified_high_or_critical"] == 1
