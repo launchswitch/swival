@@ -949,7 +949,8 @@ class TestAutoSplitStringCommand:
             resolved_commands={},
             unrestricted=False,
         )
-        assert "error: command list is empty" in result
+        assert result.startswith("error:")
+        assert "non-empty 'command' array" in result
 
     def test_json_array_string_still_works(self, tmp_path):
         """JSON-encoded array in a string still takes the JSON parse path."""

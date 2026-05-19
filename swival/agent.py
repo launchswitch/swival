@@ -1,5 +1,6 @@
 import argparse
 from collections.abc import Callable
+import contextlib
 from contextlib import nullcontext
 import copy
 from dataclasses import dataclass
@@ -3481,7 +3482,87 @@ def _is_vision_rejection(error: "AgentError") -> bool:
     return any(pattern in msg for pattern in _VISION_REJECTION_PATTERNS)
 
 
-def _completion_with_retry(completion_kwargs, *, max_retries, verbose):
+def _call_llm_with_dismiss(dismiss, llm_args, **llm_kwargs):
+    """Call ``call_llm`` with *dismiss* threaded as ``on_stream_start`` if
+    callable. Caller's kwargs dict is not mutated — we receive a copy."""
+    if callable(dismiss):
+        llm_kwargs["on_stream_start"] = dismiss
+    return call_llm(*llm_args, **llm_kwargs)
+
+
+def _completion_via_stream(completion_kwargs, on_stream_start=None):
+    """Run litellm.completion with stream=True, displaying a marquee, and
+    reassemble a non-streaming response object via stream_chunk_builder.
+
+    *on_stream_start*, if provided, is invoked once before the first marquee
+    update so a caller-owned waiting display can be dismissed cleanly.
+    """
+    import litellm
+
+    stream_kwargs = {**completion_kwargs, "stream": True}
+    chunks = []
+    # The marquee only displays the tail, so we keep a bounded sliding window
+    # instead of accumulating the whole response (avoids O(n^2) string growth
+    # over thousands of chunks).
+    tail = ""
+    tail_cap = 4096
+    # Hold off on dismissing the caller's waiting display until we have enough
+    # streamed text to fill the line — otherwise the brief, narrow stream
+    # display would prematurely cut off the wider prompt-marquee animation.
+    handoff_threshold = max(fmt._console.width, 40)
+    with contextlib.ExitStack() as stack:
+        update = None
+
+        def _on_delta(text: str) -> None:
+            nonlocal tail, update
+            tail += text
+            if len(tail) > tail_cap:
+                tail = tail[-tail_cap // 2 :]
+            if update is None:
+                if len(tail) < handoff_threshold:
+                    return
+                if on_stream_start is not None:
+                    try:
+                        on_stream_start()
+                    except Exception:
+                        pass
+                update = stack.enter_context(fmt.stream_marquee())
+            update(tail)
+
+        response_stream = litellm.completion(**stream_kwargs)
+        for chunk in response_stream:
+            chunks.append(chunk)
+            try:
+                delta = chunk.choices[0].delta
+            except Exception:
+                continue
+            content = getattr(delta, "content", None) or ""
+            if content:
+                _on_delta(content)
+            reasoning = getattr(delta, "reasoning_content", None) or ""
+            if reasoning:
+                _on_delta(reasoning)
+            for tc in getattr(delta, "tool_calls", None) or []:
+                fn = getattr(tc, "function", None)
+                if fn is None:
+                    continue
+                name = getattr(fn, "name", None)
+                if name:
+                    _on_delta(f" <{name}>")
+                args = getattr(fn, "arguments", None) or ""
+                if args:
+                    _on_delta(args)
+    return litellm.stream_chunk_builder(chunks, messages=completion_kwargs.get("messages"))
+
+
+def _completion_with_retry(
+    completion_kwargs,
+    *,
+    max_retries,
+    verbose,
+    stream=False,
+    on_stream_start=None,
+):
     """Call litellm.completion() with retry on transient errors.
 
     Returns (response, provider_retries) where provider_retries is the number
@@ -3500,6 +3581,13 @@ def _completion_with_retry(completion_kwargs, *, max_retries, verbose):
 
     for attempt in range(max_retries):
         try:
+            if stream:
+                return (
+                    _completion_via_stream(
+                        completion_kwargs, on_stream_start=on_stream_start
+                    ),
+                    attempt,
+                )
             return litellm.completion(**completion_kwargs), attempt
         except litellm.ContextWindowExceededError:
             coe = ContextOverflowError("context window exceeded (typed)")
@@ -3567,6 +3655,7 @@ def call_llm(
     llm_filter=None,
     call_kind="agent",
     aws_profile=None,
+    on_stream_start=None,
 ):
     """Call LiteLLM with the appropriate provider.
 
@@ -3824,10 +3913,21 @@ def call_llm(
                 tc.function.arguments = secret_shield.reverse_known(args_str)
         return msg
 
+    _stream = (
+        provider in ("generic", "llamacpp", "lmstudio", "huggingface", "openrouter")
+        and verbose
+        and call_kind == "agent"
+        and sys.stderr.isatty()
+    )
+
     retries = 0
     try:
         response, retries = _completion_with_retry(
-            completion_kwargs, max_retries=max_retries, verbose=verbose
+            completion_kwargs,
+            max_retries=max_retries,
+            verbose=verbose,
+            stream=_stream,
+            on_stream_start=on_stream_start if _stream else None,
         )
     except ContextOverflowError:
         raise  # already has _provider_retries from _completion_with_retry
@@ -7285,8 +7385,10 @@ def run_agent_loop(
                 _waiting_cm = fmt.llm_spinner(f"Thinking (turn {turns}/{max_turns})")
             else:
                 _waiting_cm = nullcontext()
-            with _waiting_cm:
-                _llm_result = call_llm(*_llm_args, **llm_kwargs)
+            with _waiting_cm as _dismiss_waiting:
+                _llm_result = _call_llm_with_dismiss(
+                    _dismiss_waiting, _llm_args, **llm_kwargs
+                )
                 msg, finish_reason = _llm_result[0], _llm_result[1]
                 cmd_activity = _llm_result[2] if len(_llm_result) > 2 else []
                 _provider_retries = _llm_result[3] if len(_llm_result) > 3 else 0
@@ -7407,8 +7509,10 @@ def run_agent_loop(
                         )
                         if verbose
                         else nullcontext()
-                    ):
-                        _llm_result = call_llm(*_llm_args, **llm_kwargs)
+                    ) as _dismiss_waiting:
+                        _llm_result = _call_llm_with_dismiss(
+                            _dismiss_waiting, _llm_args, **llm_kwargs
+                        )
                         msg, finish_reason = _llm_result[0], _llm_result[1]
                         cmd_activity = _llm_result[2] if len(_llm_result) > 2 else []
                         _provider_retries = (
@@ -7548,8 +7652,10 @@ def run_agent_loop(
                             )
                             if verbose
                             else nullcontext()
-                        ):
-                            _llm_result = call_llm(*_llm_args, **llm_kwargs)
+                        ) as _dismiss_waiting:
+                            _llm_result = _call_llm_with_dismiss(
+                                _dismiss_waiting, _llm_args, **llm_kwargs
+                            )
                             msg, finish_reason = _llm_result[0], _llm_result[1]
                             cmd_activity = (
                                 _llm_result[2] if len(_llm_result) > 2 else []
@@ -7638,8 +7744,10 @@ def run_agent_loop(
                                 )
                                 if verbose
                                 else nullcontext()
-                            ):
-                                _llm_result = call_llm(*_llm_args, **llm_kwargs)
+                            ) as _dismiss_waiting:
+                                _llm_result = _call_llm_with_dismiss(
+                                    _dismiss_waiting, _llm_args, **llm_kwargs
+                                )
                                 msg, finish_reason = (
                                     _llm_result[0],
                                     _llm_result[1],

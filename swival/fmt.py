@@ -23,6 +23,10 @@ _stdout_console = Console(stderr=False)
 _think_count = 0
 
 
+def _noop(*_args, **_kwargs) -> None:
+    return
+
+
 def reset_state() -> None:
     """Reset all module-level rendering state (think tree counter, etc.)."""
     global _think_count
@@ -114,15 +118,14 @@ def llm_spinner(label: str = "Thinking"):
     """Context manager showing a phase-cycling spinner on stderr.
 
     The spinner style and label evolve over time to give the perception
-    of progress through distinct work stages.
+    of progress through distinct work stages. Yields a ``dismiss()``
+    callable that early-stops the display so a different live region
+    can take over.
     """
     if not _console.is_terminal:
-        yield
+        yield _noop
         return
 
-    # Extract the parenthetical suffix from the label, e.g. "(turn 2/5)"
-    # If present, we cycle verbs with the suffix appended.
-    # If not, use the label verbatim as the initial description.
     suffix = ""
     if "(" in label:
         idx = label.index("(")
@@ -142,6 +145,7 @@ def llm_spinner(label: str = "Thinking"):
     )
 
     stop = threading.Event()
+    dismissed = threading.Event()
 
     def _cycle_phases(task_id):
         t0 = time.monotonic()
@@ -158,15 +162,23 @@ def llm_spinner(label: str = "Thinking"):
                 spinner_col.spinner = Spinner(name, style=style, speed=1.5)
                 progress.update(task_id, description=f"{verb}{suffix}")
 
-    with progress:
-        tid = progress.add_task(initial_desc, total=None)
-        t = threading.Thread(target=_cycle_phases, args=(tid,), daemon=True)
-        t.start()
-        try:
-            yield
-        finally:
-            stop.set()
-            t.join(timeout=1)
+    progress.start()
+    tid = progress.add_task(initial_desc, total=None)
+    t = threading.Thread(target=_cycle_phases, args=(tid,), daemon=True)
+    t.start()
+
+    def dismiss() -> None:
+        if dismissed.is_set():
+            return
+        dismissed.set()
+        stop.set()
+        t.join(timeout=1)
+        progress.stop()
+
+    try:
+        yield dismiss
+    finally:
+        dismiss()
 
 
 @contextlib.contextmanager
@@ -177,7 +189,7 @@ def input_marquee(text: str):
     user's prompt. The line is cleared as soon as the context exits.
     """
     if not _console.is_terminal:
-        yield
+        yield _noop
         return
 
     flat = " ".join(text.split())
@@ -192,6 +204,7 @@ def input_marquee(text: str):
         return line
 
     stop = threading.Event()
+    dismissed = threading.Event()
     live = Live(
         _frame(0),
         console=_console,
@@ -211,12 +224,52 @@ def input_marquee(text: str):
     live.start()
     t = threading.Thread(target=_scroll, daemon=True)
     t.start()
-    try:
-        yield
-    finally:
+
+    def dismiss() -> None:
+        if dismissed.is_set():
+            return
+        dismissed.set()
         stop.set()
         t.join(timeout=1)
         live.stop()
+
+    try:
+        yield dismiss
+    finally:
+        dismiss()
+
+
+@contextlib.contextmanager
+def stream_marquee():
+    """Context manager that displays streamed LLM output as a marquee on stderr.
+
+    Yields an ``update(text)`` callable. Each call replaces the displayed line
+    with the tail of *text* that fits in the terminal width. The line is
+    cleared on exit so subsequent output starts at column 0.
+    """
+    import sys
+
+    if not _console.is_terminal:
+        yield _noop
+        return
+
+    from rich.cells import cell_len
+
+    def update(text: str) -> None:
+        width = max(_console.width - 6, 20)
+        raw_tail = text[-(width * 2) :] if len(text) > width * 2 else text
+        sanitized = "".join(ch if ch.isprintable() else " " for ch in raw_tail)
+        flat = " ".join(sanitized.split())
+        while cell_len(flat) > width and flat:
+            flat = flat[1:]
+        sys.stderr.write(f"\r\x1b[2K  \x1b[36m> {flat}\x1b[0m")
+        sys.stderr.flush()
+
+    try:
+        yield update
+    finally:
+        sys.stderr.write("\r\x1b[2K")
+        sys.stderr.flush()
 
 
 def completion(turns: int, exit_code: str) -> None:

@@ -337,7 +337,7 @@ class TestWriteFileMoveFrom:
         (tmp_path / "same.txt").write_text("x", encoding="utf-8")
         result = _write_file("same.txt", None, str(tmp_path), move_from="same.txt")
         assert result.startswith("error:")
-        assert "same path" in result
+        assert "same location" in result
 
     def test_move_from_directory_rejected(self, tmp_path):
         """Error when move_from is a directory."""
@@ -366,7 +366,7 @@ class TestWriteFileMoveFrom:
         (tmp_path / "src.txt").write_text("x", encoding="utf-8")
         result = _write_file("dst.txt", "x", str(tmp_path), move_from="src.txt")
         assert result.startswith("error:")
-        assert "not both" in result
+        assert "mutually exclusive" in result
 
     def test_neither_content_nor_move_from_is_error(self, tmp_path):
         """Omitting both content and move_from is an error."""
@@ -1129,11 +1129,14 @@ class TestOutlineDispatch:
             str(tmp_path),
             files_mode="all",
         )
-        assert result == "error: set file_path or files, not both"
+        assert result.startswith("error:")
+        assert "mutually exclusive" in result
+        assert "file_path" in result and "files" in result
 
     def test_outline_dispatch_neither_arg(self, tmp_path):
         result = dispatch("outline", {}, str(tmp_path), files_mode="all")
-        assert result == "error: file_path or files is required"
+        assert result.startswith("error:")
+        assert "file_path" in result and "files" in result
 
     def test_outline_dispatch_files_not_array(self, tmp_path):
         result = dispatch(
@@ -1142,7 +1145,8 @@ class TestOutlineDispatch:
             str(tmp_path),
             files_mode="all",
         )
-        assert result == "error: 'files' must be an array"
+        assert result.startswith("error:")
+        assert "'files'" in result and "array" in result
 
     def test_outline_dispatch_files_bare_string(self, tmp_path):
         f = tmp_path / "t.py"

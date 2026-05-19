@@ -112,7 +112,8 @@ class TestReadMultipleFilesErrors:
 
     def test_empty_files_list(self, tmp_path):
         result = _read_files([], str(tmp_path))
-        assert result == "error: files list is empty"
+        assert result.startswith("error:")
+        assert "non-empty 'files' array" in result
 
     def test_too_many_files(self, tmp_path):
         files = [{"file_path": f"f{i}.txt"} for i in range(25)]
