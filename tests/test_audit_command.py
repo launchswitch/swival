@@ -350,12 +350,6 @@ class TestImportExport:
         assert "net/http/pprof" in imports
         assert "github.com/foo/log" in imports
 
-    def test_dart_imports(self):
-        code = "import 'package:flutter/material.dart';\nimport 'dart:io';"
-        imports = _extract_imports(code)
-        assert "package:flutter/material.dart" in imports
-        assert "dart:io" in imports
-
     def test_js_side_effect_import(self):
         code = "import 'polyfill';"
         assert "polyfill" in _extract_imports(code)
@@ -463,16 +457,6 @@ class TestImportExport:
         imports = _extract_imports("import static java.lang.Math.*;")
         assert "java.lang.Math" in imports
         assert "static" not in imports
-
-    def test_haskell_qualified_import(self):
-        imports = _extract_imports("import qualified Data.Map as Map")
-        assert "Data.Map" in imports
-        assert "qualified" not in imports
-
-    def test_haskell_safe_import(self):
-        imports = _extract_imports("import safe Data.Foo")
-        assert "Data.Foo" in imports
-        assert "safe" not in imports
 
     def test_swift_typed_imports(self):
         imports = _extract_imports(
@@ -588,14 +572,6 @@ class TestImportExport:
         imports = _extract_imports(code)
         assert "std" in imports
         assert "fake.zig" not in imports
-
-    def test_haskell_multi_modifier_import(self):
-        imports = _extract_imports("import safe qualified Data.Map as Map")
-        assert imports == ["Data.Map"]
-
-    def test_haskell_modifier_order_swap(self):
-        imports = _extract_imports("import qualified safe Data.Map as Map")
-        assert imports == ["Data.Map"]
 
 
 # ---------------------------------------------------------------------------

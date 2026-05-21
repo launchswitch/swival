@@ -538,7 +538,7 @@ def _order_by_attack_surface(
 
 _IMPORT_RE = re.compile(
     r"(?:"
-    # Go/Dart/JS quoted-path imports. Modifier words ahead of the path cover
+    # Go/JS quoted-path imports. Modifier words ahead of the path cover
     # `import _ "pkg"` (Go blank), `import log "pkg"` (Go alias),
     # `import api from "./api"` (JS), `import type Foo from "./foo"` (TS).
     r"^\s*import\s+(?:[\w.]+\s+)*['\"]([^'\"]+)['\"]"
@@ -548,13 +548,12 @@ _IMPORT_RE = re.compile(
     # does not register as an import.
     r"|^\s*(?:const|let|var|import|export)\s+[^'\"`\n]*?\sfrom\s+['\"]([^'\"]+)['\"]"
     r"|^\s*from\s+([\w.]+)\s+import"  # Python: from foo import bar
-    # Python/Java/Kotlin/Scala/Swift/Haskell `import NAME` with optional
-    # language-specific modifiers (Java `static`, Haskell `qualified`/`safe`
-    # which can stack as `import safe qualified ...`, Swift
+    # Python/Java/Kotlin/Scala/Swift `import NAME` with optional
+    # language-specific modifiers (Java `static`, Swift
     # `struct|class|enum|protocol|typealias|func|var|let`).
     # `\w+(?:\.\w+)*` is a proper dotted identifier so trailing `.*` in
     # `import static java.lang.Math.*` doesn't capture a trailing dot.
-    r"|^\s*import\s+(?:(?:static|qualified|safe|struct|class|enum|protocol|typealias|func|var|let)\s+){0,3}(\w+(?:\.\w+)*)"
+    r"|^\s*import\s+(?:(?:static|struct|class|enum|protocol|typealias|func|var|let)\s+)?(\w+(?:\.\w+)*)"
     r"|require\s*\(\s*['\"]([^'\"]+)['\"]\s*\)"  # Node require()
     r"|^\s*#include\s*(?:\"([^\"]+)\"|<([^>]+)>)"  # C/C++
     r"|^\s*using\s+(?:static\s+|namespace\s+)?([\w.]+)\s*;"  # C# / C++ using
@@ -945,7 +944,6 @@ _RELATIVE_IMPORT_EXTS: tuple[str, ...] = (
     ".mjs",
     ".cjs",
     ".zig",
-    ".dart",
     ".rs",
     ".py",
     ".go",
@@ -974,7 +972,7 @@ def _resolve_relative_import(
     Only attempts resolution when the import string is explicitly relative.
     Three flavors qualify:
 
-    * leading ``./`` or ``../`` (JS/TS, Dart),
+    * leading ``./`` or ``../`` (JS/TS),
     * Zig importer with a ``.zig``-suffixed bare name (Zig has no leading-`./`
       convention; package imports like ``@import("std")`` stay external),
     * Python importer with leading-dot syntax (``from .lib import x`` →
@@ -1160,12 +1158,10 @@ _EXT_TO_LANG: dict[str, str] = {
     ".pm": "perl",
     ".psgi": "perl",
     ".r": "r",
-    ".dart": "dart",
     ".ex": "elixir",
     ".exs": "elixir",
     ".erl": "erlang",
     ".clj": "clojure",
-    ".hs": "haskell",
     ".ml": "ocaml",
     ".nim": "nim",
     ".S": "assembly",
