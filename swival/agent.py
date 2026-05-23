@@ -8669,6 +8669,11 @@ def _repl_status(
     max_turns = turn_state["max_turns"]
 
     lines = []
+    try:
+        _ver = metadata.version("swival")
+        lines.append(f"swival: v{_ver}")
+    except Exception:
+        pass
     model_line = f"model: {model_id}"
     if current_profile:
         model_line += f"  (profile: {current_profile})"

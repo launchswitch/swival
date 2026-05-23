@@ -812,7 +812,16 @@ def repl_splash(
 
     _console.print()
     _console.print(text, end="")
-    _console.print(Text("  https://swival.dev", style="dim"))
+    try:
+        from importlib import metadata
+
+        _version = metadata.version("swival")
+    except Exception:
+        _version = ""
+    banner_line = Text("  https://swival.dev", style="dim")
+    if _version:
+        banner_line.append(f"  v{_version}", style="dim")
+    _console.print(banner_line)
 
     if model or provider or workspace:
         info_line = Text()
