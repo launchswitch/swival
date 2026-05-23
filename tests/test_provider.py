@@ -1,5 +1,6 @@
 """Tests for provider routing, model normalization, CLI validation, and path isolation."""
 
+import os
 import sys
 import types
 
@@ -1571,7 +1572,7 @@ class TestChatGPTRouting:
             mock_comp.return_value = self._mock_response()
             call_llm(
                 None,
-                "gpt-5.3-codex",
+                "gpt-5.5",
                 [],
                 100,
                 0.5,
@@ -1584,16 +1585,65 @@ class TestChatGPTRouting:
             )
             mock_comp.assert_called_once()
             kwargs = mock_comp.call_args[1]
-            assert kwargs["model"] == "chatgpt/gpt-5.3-codex"
+            assert kwargs["model"] == "chatgpt/gpt-5.5"
+            assert kwargs["extra_headers"]["originator"] == "swival"
+            assert kwargs["extra_headers"]["user-agent"].startswith("Swival/")
             assert "api_key" not in kwargs
             assert "api_base" not in kwargs
+
+    def test_chatgpt_identity_hooks_are_scoped_to_call(self, monkeypatch):
+        monkeypatch.setenv("CHATGPT_ORIGINATOR", "previous-originator")
+        monkeypatch.setenv("CHATGPT_USER_AGENT", "previous-ua")
+        monkeypatch.setenv("CHATGPT_DEFAULT_INSTRUCTIONS", "previous-instructions")
+
+        observed = {}
+
+        def fake_completion(**_kwargs):
+            from litellm.llms.chatgpt.responses import (
+                transformation as responses_transform,
+            )
+
+            headers = responses_transform.get_chatgpt_default_headers("tok", None)
+            observed["originator"] = headers["originator"]
+            observed["user_agent"] = headers["user-agent"]
+            observed["instructions"] = (
+                responses_transform.get_chatgpt_default_instructions()
+            )
+            observed["env_user_agent"] = os.environ.get("CHATGPT_USER_AGENT")
+            return self._mock_response()
+
+        with patch("litellm.completion", side_effect=fake_completion):
+            call_llm(
+                None,
+                "gpt-5.5",
+                [],
+                100,
+                0.5,
+                1.0,
+                None,
+                None,
+                False,
+                provider="chatgpt",
+                api_key=None,
+                user_agent="SwivalTest/1.2.3",
+            )
+
+        assert observed == {
+            "originator": "swival",
+            "user_agent": "SwivalTest/1.2.3",
+            "instructions": "You are Swival, a coding agent.",
+            "env_user_agent": "previous-ua",
+        }
+        assert os.environ["CHATGPT_ORIGINATOR"] == "previous-originator"
+        assert os.environ["CHATGPT_USER_AGENT"] == "previous-ua"
+        assert os.environ["CHATGPT_DEFAULT_INSTRUCTIONS"] == "previous-instructions"
 
     def test_chatgpt_with_explicit_key(self):
         with patch("litellm.completion") as mock_comp:
             mock_comp.return_value = self._mock_response()
             call_llm(
                 None,
-                "gpt-5.3-codex",
+                "gpt-5.5",
                 [],
                 100,
                 0.5,
@@ -1613,7 +1663,7 @@ class TestChatGPTRouting:
             mock_comp.return_value = self._mock_response()
             call_llm(
                 "https://proxy.example.com",
-                "gpt-5.3-codex",
+                "gpt-5.5",
                 [],
                 100,
                 0.5,
@@ -1635,7 +1685,7 @@ class TestChatGPTRouting:
             mock_comp.return_value = self._mock_response()
             call_llm(
                 None,
-                "gpt-5.3-codex",
+                "gpt-5.5",
                 [],
                 100,
                 0.7,
@@ -1699,7 +1749,7 @@ class TestChatGPTModelNormalization:
             mock_comp.return_value = self._mock_response()
             call_llm(
                 None,
-                "chatgpt/gpt-5.3-codex",
+                "chatgpt/gpt-5.5",
                 [],
                 100,
                 0.5,
@@ -1710,7 +1760,7 @@ class TestChatGPTModelNormalization:
                 provider="chatgpt",
                 api_key=None,
             )
-            assert mock_comp.call_args[1]["model"] == "chatgpt/gpt-5.3-codex"
+            assert mock_comp.call_args[1]["model"] == "chatgpt/gpt-5.5"
 
     def test_chatgpt_bare_model_id(self):
         """Bare model (no prefix) gets chatgpt/ prepended."""
@@ -1718,7 +1768,7 @@ class TestChatGPTModelNormalization:
             mock_comp.return_value = self._mock_response()
             call_llm(
                 None,
-                "gpt-5.3-codex",
+                "gpt-5.5",
                 [],
                 100,
                 0.5,
@@ -1729,7 +1779,7 @@ class TestChatGPTModelNormalization:
                 provider="chatgpt",
                 api_key=None,
             )
-            assert mock_comp.call_args[1]["model"] == "chatgpt/gpt-5.3-codex"
+            assert mock_comp.call_args[1]["model"] == "chatgpt/gpt-5.5"
 
     def test_chatgpt_double_prefix_stripped(self):
         """chatgpt/chatgpt/model collapses to chatgpt/model."""
@@ -1737,7 +1787,7 @@ class TestChatGPTModelNormalization:
             mock_comp.return_value = self._mock_response()
             call_llm(
                 None,
-                "chatgpt/chatgpt/gpt-5.3-codex",
+                "chatgpt/chatgpt/gpt-5.5",
                 [],
                 100,
                 0.5,
@@ -1748,7 +1798,7 @@ class TestChatGPTModelNormalization:
                 provider="chatgpt",
                 api_key=None,
             )
-            assert mock_comp.call_args[1]["model"] == "chatgpt/gpt-5.3-codex"
+            assert mock_comp.call_args[1]["model"] == "chatgpt/gpt-5.5"
 
 
 # ---------------------------------------------------------------------------
@@ -1789,7 +1839,7 @@ class TestChatGPTCLIValidation:
                 "--provider",
                 "chatgpt",
                 "--model",
-                "gpt-5.3-codex",
+                "gpt-5.5",
                 "--no-system-prompt",
                 "--base-dir",
                 str(tmp_path),
@@ -1822,7 +1872,7 @@ class TestChatGPTCLIValidation:
                 "--provider",
                 "chatgpt",
                 "--model",
-                "gpt-5.3-codex",
+                "gpt-5.5",
                 "--no-system-prompt",
                 "--base-dir",
                 str(tmp_path),
@@ -1943,9 +1993,9 @@ class TestResolveProviderChatGPT:
 
     def test_returns_model_id(self):
         model_id, _, _, _, _ = resolve_provider(
-            "chatgpt", "gpt-5.3-codex", None, None, None, False
+            "chatgpt", "gpt-5.5", None, None, None, False
         )
-        assert model_id == "gpt-5.3-codex"
+        assert model_id == "gpt-5.5"
 
     def test_no_model_raises(self):
         from swival.config import ConfigError
@@ -1958,31 +2008,31 @@ class TestResolveProviderChatGPT:
 
     def test_resolved_key_none_when_no_key(self):
         _, _, resolved_key, _, _ = resolve_provider(
-            "chatgpt", "gpt-5.3-codex", None, None, None, False
+            "chatgpt", "gpt-5.5", None, None, None, False
         )
         assert resolved_key is None
 
     def test_resolved_key_passthrough(self):
         _, _, resolved_key, _, _ = resolve_provider(
-            "chatgpt", "gpt-5.3-codex", "bearer-xyz", None, None, False
+            "chatgpt", "gpt-5.5", "bearer-xyz", None, None, False
         )
         assert resolved_key == "bearer-xyz"
 
     def test_api_base_none_by_default(self):
         _, api_base, _, _, _ = resolve_provider(
-            "chatgpt", "gpt-5.3-codex", None, None, None, False
+            "chatgpt", "gpt-5.5", None, None, None, False
         )
         assert api_base is None
 
     def test_api_base_passthrough(self):
         _, api_base, _, _, _ = resolve_provider(
-            "chatgpt", "gpt-5.3-codex", None, "https://proxy.example.com", None, False
+            "chatgpt", "gpt-5.5", None, "https://proxy.example.com", None, False
         )
         assert api_base == "https://proxy.example.com"
 
     def test_context_from_litellm_metadata(self):
         _, _, _, context_length, _ = resolve_provider(
-            "chatgpt", "gpt-5.3-codex", None, None, None, False
+            "chatgpt", "gpt-5.5", None, None, None, False
         )
         # Should resolve from litellm metadata (or None if not in cost map).
         # Don't assert a specific value since it depends on litellm version.
@@ -1998,13 +2048,13 @@ class TestResolveProviderChatGPT:
 
     def test_context_override(self):
         _, _, _, context_length, _ = resolve_provider(
-            "chatgpt", "gpt-5.3-codex", None, None, 65536, False
+            "chatgpt", "gpt-5.5", None, None, 65536, False
         )
         assert context_length == 65536
 
     def test_llm_kwargs_provider(self):
         _, _, _, _, llm_kwargs = resolve_provider(
-            "chatgpt", "gpt-5.3-codex", None, None, None, False
+            "chatgpt", "gpt-5.5", None, None, None, False
         )
         assert llm_kwargs["provider"] == "chatgpt"
 

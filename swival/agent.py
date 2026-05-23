@@ -1,6 +1,7 @@
 import argparse
 from collections.abc import Callable
 import contextlib
+import contextvars
 from contextlib import nullcontext
 import copy
 from dataclasses import dataclass
@@ -507,6 +508,87 @@ def _is_transient(exc):
 def _retries_from_exc(exc):
     """Extract provider retry count from an exception, if attached."""
     return getattr(exc, "_provider_retries", 0)
+
+
+def _swival_version() -> str:
+    try:
+        return metadata.version("swival")
+    except Exception:
+        return "unknown"
+
+
+def _swival_user_agent(user_agent: str | None = None) -> str:
+    return user_agent or f"Swival/{_swival_version()}"
+
+
+_CHATGPT_SWIVAL_INSTRUCTIONS = "You are Swival, a coding agent."
+_CHATGPT_IDENTITY = contextvars.ContextVar("swival_chatgpt_identity", default=None)
+_CHATGPT_IDENTITY_PATCH_LOCK = threading.Lock()
+_CHATGPT_IDENTITY_PATCH_WARNED = False
+
+
+@contextlib.contextmanager
+def _chatgpt_identity_context(user_agent: str | None = None):
+    """Apply Swival ChatGPT identity to the current call context only."""
+    token = _CHATGPT_IDENTITY.set(
+        {
+            "originator": "swival",
+            "user_agent": _swival_user_agent(user_agent),
+            "instructions": _CHATGPT_SWIVAL_INSTRUCTIONS,
+        }
+    )
+    try:
+        yield
+    finally:
+        _CHATGPT_IDENTITY.reset(token)
+
+
+def _patch_chatgpt_identity_hooks():
+    """Teach LiteLLM's ChatGPT provider to read Swival identity per call."""
+    global _CHATGPT_IDENTITY_PATCH_WARNED
+
+    with _CHATGPT_IDENTITY_PATCH_LOCK:
+        try:
+            from litellm.llms.chatgpt import common_utils
+            from litellm.llms.chatgpt.chat import transformation as chat_transform
+            from litellm.llms.chatgpt.responses import (
+                transformation as responses_transform,
+            )
+        except ImportError as exc:
+            if not _CHATGPT_IDENTITY_PATCH_WARNED:
+                fmt.warning(
+                    "Could not patch LiteLLM ChatGPT identity hooks; "
+                    f"falling back to extra_headers only: {exc}"
+                )
+                _CHATGPT_IDENTITY_PATCH_WARNED = True
+            return
+
+        if getattr(common_utils, "_swival_identity_patched", False):
+            return
+        common_utils._swival_identity_patched = True
+
+        original_headers = common_utils.get_chatgpt_default_headers
+        original_instructions = common_utils.get_chatgpt_default_instructions
+
+        def swival_headers(access_token, account_id, session_id=None):
+            headers = original_headers(access_token, account_id, session_id)
+            identity = _CHATGPT_IDENTITY.get()
+            if identity is not None:
+                headers["originator"] = identity["originator"]
+                headers["user-agent"] = identity["user_agent"]
+            return headers
+
+        def swival_instructions():
+            identity = _CHATGPT_IDENTITY.get()
+            if identity is not None:
+                return identity["instructions"]
+            return original_instructions()
+
+        common_utils.get_chatgpt_default_headers = swival_headers
+        common_utils.get_chatgpt_default_instructions = swival_instructions
+        chat_transform.get_chatgpt_default_headers = swival_headers
+        responses_transform.get_chatgpt_default_headers = swival_headers
+        responses_transform.get_chatgpt_default_instructions = swival_instructions
 
 
 def _patch_chatgpt_responses_empty_output():
@@ -3755,6 +3837,8 @@ def call_llm(
     litellm.suppress_debug_info = True
     litellm.drop_params = True
     _patch_chatgpt_responses_empty_output()
+    if provider == "chatgpt":
+        _patch_chatgpt_identity_hooks()
 
     # Resolve sanitize_thinking: opt-in only.
     if sanitize_thinking is None:
@@ -3787,18 +3871,18 @@ def call_llm(
         if base_url:
             kwargs["api_base"] = base_url
     elif provider in ("generic", "llamacpp"):
-        try:
-            _swival_ver = metadata.version("swival")
-        except Exception:
-            _swival_ver = "unknown"
-        _ua = user_agent or f"Swival/{_swival_ver}"
         kwargs = {
             "api_base": base_url,
             "api_key": api_key or "none",
-            "extra_headers": {"User-Agent": _ua},
+            "extra_headers": {"User-Agent": _swival_user_agent(user_agent)},
         }
     elif provider == "chatgpt":
-        kwargs = {}
+        kwargs = {
+            "extra_headers": {
+                "originator": "swival",
+                "user-agent": _swival_user_agent(user_agent),
+            }
+        }
         _skip_params = {"top_p", "seed"}
         _skip_tool_choice = True
         if api_key:
@@ -3942,14 +4026,23 @@ def call_llm(
     )
 
     retries = 0
-    try:
-        response, retries = _completion_with_retry(
-            completion_kwargs,
-            max_retries=max_retries,
-            verbose=verbose,
-            stream=_stream,
-            on_stream_start=on_stream_start if _stream else None,
+
+    def _identity_context():
+        return (
+            _chatgpt_identity_context(user_agent)
+            if provider == "chatgpt"
+            else nullcontext()
         )
+
+    try:
+        with _identity_context():
+            response, retries = _completion_with_retry(
+                completion_kwargs,
+                max_retries=max_retries,
+                verbose=verbose,
+                stream=_stream,
+                on_stream_start=on_stream_start if _stream else None,
+            )
     except ContextOverflowError:
         raise  # already has _provider_retries from _completion_with_retry
     except litellm.BadRequestError as e:
@@ -3989,11 +4082,12 @@ def call_llm(
                 if verbose:
                     fmt.warning("Fixed empty assistant message in history, retrying...")
                 try:
-                    response, retries = _completion_with_retry(
-                        completion_kwargs,
-                        max_retries=max_retries,
-                        verbose=verbose,
-                    )
+                    with _identity_context():
+                        response, retries = _completion_with_retry(
+                            completion_kwargs,
+                            max_retries=max_retries,
+                            verbose=verbose,
+                        )
                 except ContextOverflowError as coe2:
                     coe2._provider_retries = first_retries + getattr(
                         coe2, "_provider_retries", 0
@@ -4028,11 +4122,12 @@ def call_llm(
                 if verbose:
                     fmt.warning("Fixed orphaned tool calls in history, retrying...")
                 try:
-                    response, retries = _completion_with_retry(
-                        completion_kwargs,
-                        max_retries=max_retries,
-                        verbose=verbose,
-                    )
+                    with _identity_context():
+                        response, retries = _completion_with_retry(
+                            completion_kwargs,
+                            max_retries=max_retries,
+                            verbose=verbose,
+                        )
                 except ContextOverflowError as coe2:
                     coe2._provider_retries = first_retries + getattr(
                         coe2, "_provider_retries", 0
