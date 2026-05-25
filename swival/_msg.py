@@ -178,6 +178,50 @@ def _canonicalize_tool_calls(messages: list) -> None:
             msg["tool_calls"] = new_tcs
 
 
+_MARQUEE_PIECE_BUDGET = 2048
+_MARQUEE_SEPARATOR = "   ·   "
+
+
+def _trim_for_marquee(text: str, budget: int = _MARQUEE_PIECE_BUDGET) -> str:
+    if budget <= 0:
+        return ""
+    if len(text) <= budget:
+        return text
+    if budget == 1:
+        return "…"
+    return text[: budget - 1] + "…"
+
+
+def _marquee_text_for_turn(messages: list) -> str | None:
+    """Build a marquee string from the tail of messages since the last assistant.
+
+    Walks backward from the end of ``messages`` and collects every contiguous
+    non-assistant, non-system entry — i.e. the inputs that will be sent to
+    the model on the upcoming LLM call. Tool messages are prefixed with their
+    tool name. Each piece is capped via :func:`_trim_for_marquee`. Returns
+    ``None`` if no non-blank tail content exists.
+    """
+    pieces: list[str] = []
+    for m in reversed(messages):
+        role = _msg_role(m)
+        if role in ("assistant", "system"):
+            break
+        raw = _msg_content(m) or ""
+        if not raw.strip():
+            continue
+        content = _trim_for_marquee(raw)
+        if role == "tool":
+            name = _msg_name(m) or "tool"
+            pieces.append(f"{name}: {content}")
+        else:
+            pieces.append(content)
+
+    if not pieces:
+        return None
+    pieces.reverse()
+    return _MARQUEE_SEPARATOR.join(pieces)
+
+
 def _has_image_content(messages: list) -> bool:
     """Check if any message contains image_url parts."""
     return any(

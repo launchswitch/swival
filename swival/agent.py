@@ -33,6 +33,7 @@ from ._msg import (
     RECAP_MARKER,
     _canonicalize_tool_calls,
     _has_image_content,
+    _marquee_text_for_turn,
     _msg_get,
     _msg_role,
     _msg_content,
@@ -7494,11 +7495,14 @@ def run_agent_loop(
 
             if "command_tool_kwargs" in llm_kwargs:
                 llm_kwargs["command_tool_kwargs"]["outer_turn"] = turns
-            if verbose and repl_input_text is not None:
-                _waiting_cm = fmt.input_marquee(repl_input_text)
+            if verbose:
+                _spinner_label = f"Thinking (turn {turns}/{max_turns})"
+                _mtext = repl_input_text or _marquee_text_for_turn(messages)
+                if _mtext:
+                    _waiting_cm = fmt.input_marquee_then_spinner(_mtext, _spinner_label)
+                else:
+                    _waiting_cm = fmt.llm_spinner(_spinner_label)
                 repl_input_text = None
-            elif verbose:
-                _waiting_cm = fmt.llm_spinner(f"Thinking (turn {turns}/{max_turns})")
             else:
                 _waiting_cm = nullcontext()
             with _waiting_cm as _dismiss_waiting:

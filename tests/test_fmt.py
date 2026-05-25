@@ -94,6 +94,84 @@ class TestInputMarquee:
         assert len(line.plain) == 40
 
 
+class TestInputMarqueeThenSpinner:
+    def test_no_output_when_not_terminal(self):
+        buf = StringIO()
+        old = fmt._console
+        fmt._console = Console(file=buf, no_color=True, width=80)
+        try:
+            with fmt.input_marquee_then_spinner("hello", "label", delay=0.01):
+                pass
+        finally:
+            fmt._console = old
+        assert buf.getvalue() == ""
+
+    def test_dismiss_before_delay_keeps_marquee(self):
+        """Dismissing before the delay must not start the spinner."""
+        import time
+
+        buf = StringIO()
+        old = fmt._console
+        fmt._console = _styled_console(buf)
+        try:
+            with fmt.input_marquee_then_spinner(
+                "hello world", "spinner label", delay=1.0
+            ) as dismiss:
+                time.sleep(0.05)
+                dismiss()
+        finally:
+            fmt._console = old
+        out = buf.getvalue()
+        assert "spinner label" not in out
+
+    def test_dismiss_during_transition_cleans_up_spinner(self):
+        """A dismiss() arriving while the transition is mid-flight must not
+        leave the spinner running."""
+        import time
+
+        buf = StringIO()
+        old = fmt._console
+        fmt._console = _styled_console(buf)
+        try:
+            with fmt.input_marquee_then_spinner(
+                "hello world", "spinner label", delay=0.02
+            ) as dismiss:
+                deadline = time.monotonic() + 3.0
+                while (
+                    "spinner label" not in buf.getvalue()
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.005)
+                dismiss()
+                pre_dismiss_len = len(buf.getvalue())
+                time.sleep(0.2)
+                post_dismiss_len = len(buf.getvalue())
+        finally:
+            fmt._console = old
+        assert post_dismiss_len - pre_dismiss_len < 256
+
+    def test_transition_after_delay_shows_spinner(self):
+        """If not dismissed within ``delay``, the spinner label appears."""
+        import time
+
+        buf = StringIO()
+        old = fmt._console
+        fmt._console = _styled_console(buf)
+        try:
+            with fmt.input_marquee_then_spinner(
+                "hello world", "spinner label", delay=0.05
+            ):
+                deadline = time.monotonic() + 3.0
+                while (
+                    "spinner label" not in buf.getvalue()
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.02)
+        finally:
+            fmt._console = old
+        assert "spinner label" in buf.getvalue()
+
+
 class TestCompletion:
     def test_ok(self):
         out = _capture(fmt.completion, 5, "ok")

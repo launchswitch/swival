@@ -250,6 +250,85 @@ def input_marquee(text: str):
 
 
 @contextlib.contextmanager
+def input_marquee_then_spinner(text: str, spinner_label: str, delay: float = 4.0):
+    """Show the input marquee, then swap to the labeled spinner after ``delay``.
+
+    Gives instant feedback (the scrolling tail of what was sent to the model)
+    while keeping the turn-state spinner available for slower prefills. The
+    yielded ``dismiss()`` stops whichever indicator is currently active and
+    cancels any pending transition.
+    """
+    if not _console.is_terminal:
+        yield _noop
+        return
+
+    marquee_cm = input_marquee(text)
+    marquee_dismiss = marquee_cm.__enter__()
+
+    lock = threading.Lock()
+    state = {"phase": "marquee", "dismissed": False}
+    spinner_cm: dict = {"cm": None, "dismiss": None}
+    stop_timer = threading.Event()
+
+    def _transition():
+        if stop_timer.wait(delay):
+            return
+        try:
+            with lock:
+                if state["dismissed"] or state["phase"] != "marquee":
+                    return
+                state["phase"] = "transitioning"
+
+            marquee_dismiss()
+            cm = llm_spinner(spinner_label)
+            d = cm.__enter__()
+
+            with lock:
+                spinner_cm["cm"] = cm
+                spinner_cm["dismiss"] = d
+                if state["dismissed"]:
+                    state["phase"] = "spinner"
+                    needs_dismiss = True
+                else:
+                    state["phase"] = "spinner"
+                    needs_dismiss = False
+            if needs_dismiss:
+                d()
+        except Exception as exc:
+            with lock:
+                state["phase"] = "failed"
+            warning(f"prefill spinner transition failed: {exc!r}")
+
+    t = threading.Thread(target=_transition, daemon=True)
+    t.start()
+
+    def dismiss() -> None:
+        with lock:
+            if state["dismissed"]:
+                return
+            state["dismissed"] = True
+            stop_timer.set()
+            phase = state["phase"]
+            sd = spinner_cm["dismiss"]
+        if phase == "marquee":
+            marquee_dismiss()
+        elif phase == "spinner" and sd is not None:
+            sd()
+        # phase == "transitioning": the transition thread will observe
+        # state["dismissed"] after entering the spinner and dismiss it.
+        # phase == "failed": both CMs are already torn down.
+
+    try:
+        yield dismiss
+    finally:
+        dismiss()
+        t.join(timeout=0.5)
+        marquee_cm.__exit__(None, None, None)
+        if spinner_cm["cm"] is not None:
+            spinner_cm["cm"].__exit__(None, None, None)
+
+
+@contextlib.contextmanager
 def stream_marquee():
     """Context manager that displays streamed LLM output as a marquee on stderr.
 
