@@ -168,7 +168,7 @@ class GoalState:
             # Resume — reset accounting baseline.
             self.active_started_at = time.monotonic()
             self.continuation_suppressed = False
-        elif status == GoalStatus.PAUSED or status == GoalStatus.BUDGET_LIMITED:
+        elif status in (GoalStatus.PAUSED, GoalStatus.BUDGET_LIMITED):
             # Stop the wall-clock counter; preserve tokens.
             self._roll_in_wall_clock()
             self.active_started_at = None

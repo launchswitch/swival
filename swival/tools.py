@@ -2640,7 +2640,7 @@ def _capture_process(
     return result
 
 
-_SHELL_CHARS = set("|&;><$`\\\"'*?~#!{}()[]\n\r")
+_SHELL_CHARS = frozenset("|&;><$`\\\"'*?~#!{}()[]\n\r")
 
 
 def _safe_truncate(text: str, limit: int, suffix: str) -> str:
@@ -2999,12 +2999,6 @@ def _check_command_policy(
     return verdict
 
 
-_BUDGET_LIMITED_REJECT_MSG = (
-    "error: goal token budget is exhausted; only read-only wrap-up tools "
-    "and complete_goal are available"
-)
-
-
 def _dispatch_goal_tool(name: str, args: dict, kwargs: dict) -> str:
     """Handle complete_goal tool calls.
 
@@ -3038,16 +3032,15 @@ def _dispatch_goal_tool(name: str, args: dict, kwargs: dict) -> str:
             return f"error: {e}"
         rec = goal_state.get()
         payload: dict = {"goal": rec.to_json()}
+        est_tag = " (estimated)" if rec.usage_estimated else ""
         if rec.token_budget is not None:
             payload["completion_budget_report"] = (
                 f"used {rec.tokens_used} of {rec.token_budget} budgeted tokens "
-                f"in {rec.time_used_seconds:.1f}s"
-                + (" (estimated)" if rec.usage_estimated else "")
+                f"in {rec.time_used_seconds:.1f}s{est_tag}"
             )
         else:
             payload["completion_budget_report"] = (
-                f"used {rec.tokens_used} tokens in {rec.time_used_seconds:.1f}s"
-                + (" (estimated)" if rec.usage_estimated else "")
+                f"used {rec.tokens_used} tokens in {rec.time_used_seconds:.1f}s{est_tag}"
             )
         if report is not None and hasattr(report, "record_goal_event"):
             report.record_goal_event("completed", rec.to_json())
