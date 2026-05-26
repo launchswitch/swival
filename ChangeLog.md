@@ -2,6 +2,11 @@
 
 All notable user-facing changes to Swival.
 
+## 1.0.21
+
+- `/audit` severity is now anchored to a realistic threat model rather than worst-case framing.
+- Tool-call entries are now reduced to their canonical shape at the moment they enter the transcript. Doing the normalization once at append time leaves earlier turns byte-stable for the rest of the session, which improves prompt-cache hit rates.
+
 ## 1.0.20
 
 - Tool-calling reliability has been improved. Truncated tool-call arguments are now reassembled when the underlying JSON can be recovered cleanly, even when the provider reports `finish_reason=length`. Tool calls that the model accidentally emits as plain assistant text are scavenged from the content channel and rewired as real structured calls when multiple signals agree on the intent. And a sliding-window storm breaker detects when the model is stuck repeatedly issuing the same tool call with the same arguments and nudges it to try something different instead of letting the loop spin.
