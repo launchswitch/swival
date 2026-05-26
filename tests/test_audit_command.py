@@ -6872,3 +6872,41 @@ class TestResumeForceReview:
             "forced via swival.toml" in r
             for r in loaded.triage_records["a.py"].promotion_reasons
         )
+
+
+class TestWorktreeRecovery:
+    """The _worktree context manager must recover from stale leftover dirs."""
+
+    def test_stale_dir_without_git_metadata_is_removed(self, tmp_path):
+        from swival.audit import _worktree
+
+        _init_git(tmp_path)
+        _commit_file(tmp_path, "a.py", "pass")
+
+        stale = tmp_path / ".swival" / "audit" / "runid" / "patch-gen"
+        stale.mkdir(parents=True)
+        (stale / "leftover.txt").write_text("orphan")
+
+        with _worktree(str(tmp_path), stale) as wd:
+            assert wd.exists()
+            assert (wd / ".git").exists()
+            assert (wd / "a.py").exists()
+            assert not (wd / "leftover.txt").exists()
+
+        assert not stale.exists()
+
+    def test_dir_with_dangling_git_file_is_removed(self, tmp_path):
+        """Reproduces the resume bug: dir exists but .git pointer is invalid."""
+        from swival.audit import _worktree
+
+        _init_git(tmp_path)
+        _commit_file(tmp_path, "a.py", "pass")
+
+        stale = tmp_path / ".swival" / "audit" / "runid" / "patch-gen"
+        stale.mkdir(parents=True)
+        (stale / ".git").write_text("gitdir: /nonexistent/path\n")
+
+        with _worktree(str(tmp_path), stale):
+            pass
+
+        assert not stale.exists()

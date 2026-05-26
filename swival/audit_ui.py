@@ -158,6 +158,7 @@ class AuditUI:
         self._tally_verified = 0
         self._tally_discarded = 0
         self._tally_failed = 0
+        self._verified_by_sev: dict[str, int] = {}
         self._findings_seen: list[tuple[str, str, Optional[str]]] = []
         self._warnings_buffer: list[str] = []
         self._warnings_count = 0
@@ -298,11 +299,27 @@ class AuditUI:
             return
         self._enqueue(_Scrollback(text))
 
-    def tally(self, *, verified: int = 0, discarded: int = 0, failed: int = 0) -> None:
-        """Adjust the running outcome counters."""
+    def tally(
+        self,
+        *,
+        verified: int = 0,
+        discarded: int = 0,
+        failed: int = 0,
+        severity: Optional[str] = None,
+    ) -> None:
+        """Adjust the running outcome counters.
+
+        ``severity`` is recorded only when ``verified`` is non-zero, so the
+        summary's "By severity" row counts verified findings only — not the
+        proposal-time ticker entries (which include pre-dedup duplicates and
+        post-verification "VERIFIED:" echoes).
+        """
         self._tally_verified += verified
         self._tally_discarded += discarded
         self._tally_failed += failed
+        if verified and severity is not None:
+            key = (severity or "unknown").lower()
+            self._verified_by_sev[key] = self._verified_by_sev.get(key, 0) + verified
 
     def summary(self, *, artifact_dir: Optional[str], written: int) -> None:
         """Print the final summary panel.
@@ -333,10 +350,7 @@ class AuditUI:
 
     def _build_outcome_table(self) -> Table:
         elapsed = time.monotonic() - self._started_at
-        by_sev: dict[str, int] = {}
-        for sev, _, _ in self._findings_seen:
-            key = (sev or "unknown").lower()
-            by_sev[key] = by_sev.get(key, 0) + 1
+        by_sev = dict(self._verified_by_sev)
 
         table = Table.grid(padding=(0, 2))
         table.add_column(style="bold")

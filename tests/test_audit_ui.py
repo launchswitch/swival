@@ -160,10 +160,9 @@ class TestTtyMode:
         assert "Auth bypass" in captured
 
     def test_summary_panel_renders_severity(self, monkeypatch):
-        """Finding and summary back-to-back: summary must include the
-        finding's severity even with no sleep between them. The render
-        thread processes events in order, so the _Summary event handler
-        sees a fully populated _findings_seen list."""
+        """The summary's "By severity" row counts verified findings only,
+        sourced from severity-tagged tally() calls. Ticker-only ui.finding()
+        events (proposal-time or "VERIFIED:" echoes) do not affect it."""
         buf, console = _swap_console(monkeypatch, force_terminal=True)
         with audit_ui.AuditUI(
             run_id="r1",
@@ -172,9 +171,13 @@ class TestTtyMode:
             workers=1,
             total_files=1,
         ) as ui:
-            ui.finding("high", "Bug A", "x.py")
-            ui.finding("critical", "Bug B", "y.py")
-            ui.tally(verified=2)
+            ui.finding("high", "Bug A (proposal)", "x.py")
+            ui.finding("high", "Bug A (proposal duplicate)", "x.py")
+            ui.tally(verified=1, severity="high")
+            ui.finding("high", "VERIFIED: Bug A", "x.py")
+            ui.finding("critical", "Bug B (proposal)", "y.py")
+            ui.tally(verified=1, severity="critical")
+            ui.finding("critical", "VERIFIED: Bug B", "y.py")
             ui.summary(artifact_dir="audit-findings", written=2)
         out = console.export_text(clear=False)
         assert "Audit complete" in out

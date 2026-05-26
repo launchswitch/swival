@@ -7,6 +7,7 @@ import hashlib
 import json
 import queue
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -3272,10 +3273,25 @@ class _worktree:
         self.base_dir = base_dir
         self.work_dir = work_dir
 
+    def _cleanup(self) -> None:
+        try:
+            _git(["worktree", "prune"], self.base_dir)
+        except RuntimeError:
+            pass
+        if self.work_dir.exists():
+            try:
+                _git(
+                    ["worktree", "remove", "--force", str(self.work_dir)],
+                    self.base_dir,
+                )
+            except RuntimeError:
+                pass
+            if self.work_dir.exists():
+                shutil.rmtree(self.work_dir, ignore_errors=True)
+
     def __enter__(self) -> Path:
         self.work_dir.parent.mkdir(parents=True, exist_ok=True)
-        if self.work_dir.exists():
-            _git(["worktree", "remove", "--force", str(self.work_dir)], self.base_dir)
+        self._cleanup()
         _git(
             ["worktree", "add", "--detach", str(self.work_dir), "HEAD"],
             self.base_dir,
@@ -3283,13 +3299,7 @@ class _worktree:
         return self.work_dir
 
     def __exit__(self, *exc):
-        try:
-            _git(
-                ["worktree", "remove", "--force", str(self.work_dir)],
-                self.base_dir,
-            )
-        except RuntimeError:
-            pass
+        self._cleanup()
         return False
 
 
@@ -4212,7 +4222,7 @@ def _run_pipeline_body(
                     vs["summary"] = "verified by proof-of-concept reproduction"
                     state.verified_findings.append(result.verified_finding)
                     verified_count += 1
-                    ui.tally(verified=1)
+                    ui.tally(verified=1, severity=finding.severity)
                     if not ui.is_live:
                         fmt.info(f"  [{i + 1}/{total}] verified: {finding_title}")
                     ui.finding(
