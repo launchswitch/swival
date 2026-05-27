@@ -1649,35 +1649,103 @@ def _call_audit_llm(
     temperature: float | None = None,
     trace_task: str | None = None,
 ) -> str:
-    from .agent import call_llm, ContextOverflowError
+    from .agent import (
+        call_llm,
+        ContextOverflowError,
+        estimate_tokens,
+        _has_token_data,
+    )
     from ._msg import _msg_content
+    from .usage import LlmCallResult, LlmUsage
 
     kw = ctx.loop_kwargs
     llm_kwargs = kw.get("llm_kwargs", {})
 
     cache_info = None
+    session_usage = kw.get("session_usage")
+    report = kw.get("report")
+    turn_state = kw.get("turn_state") or {}
+    # Track the most recent estimate-based bill so the retry loop can commit
+    # exactly one estimate at the end (and avoid N× double-billing local
+    # providers across empty-response retries). Provider-reported usage is
+    # always billed immediately because the provider actually charged for
+    # that call.
+    pending_estimate = {"tokens": 0}
 
     def _do_call(msgs):
         nonlocal cache_info
-        msg, _finish, _activity, _retries, cache_info = call_llm(
-            kw["api_base"],
-            kw["model_id"],
-            msgs,
-            kw.get("max_output_tokens"),
-            temperature,
-            kw.get("top_p"),
-            kw.get("seed"),
-            None,  # tools
-            False,  # verbose
-            provider=llm_kwargs.get("provider", "lmstudio"),
-            api_key=llm_kwargs.get("api_key"),
-            user_agent=llm_kwargs.get("user_agent"),
-            prompt_cache=True,
-            aws_profile=llm_kwargs.get("aws_profile"),
-            vertex_project=llm_kwargs.get("vertex_project"),
-            vertex_location=llm_kwargs.get("vertex_location"),
+        import time as _time
+
+        _t0 = _time.monotonic()
+        result = LlmCallResult.normalize(
+            call_llm(
+                kw["api_base"],
+                kw["model_id"],
+                msgs,
+                kw.get("max_output_tokens"),
+                temperature,
+                kw.get("top_p"),
+                kw.get("seed"),
+                None,  # tools
+                False,  # verbose
+                provider=llm_kwargs.get("provider", "lmstudio"),
+                api_key=llm_kwargs.get("api_key"),
+                user_agent=llm_kwargs.get("user_agent"),
+                prompt_cache=True,
+                aws_profile=llm_kwargs.get("aws_profile"),
+                vertex_project=llm_kwargs.get("vertex_project"),
+                vertex_location=llm_kwargs.get("vertex_location"),
+            )
         )
-        return _msg_content(msg) or ""
+        elapsed = _time.monotonic() - _t0
+        if result.usage is not None:
+            cache_info = (
+                result.usage.cached_tokens,
+                result.usage.cache_write_tokens,
+            )
+        else:
+            cache_info = (0, 0)
+        # Provider-reported usage with non-zero token data: bill immediately
+        # into session_usage and the report. Providers charge for retries
+        # (including empty content), so each iteration is its own real spend.
+        # A `usage: {}` / all-zero payload is treated as "no metering" and
+        # falls through to the estimate path, matching the main loop's rule.
+        if _has_token_data(result.usage):
+            if session_usage is not None:
+                session_usage.add(result.usage)
+            if report is not None:
+                report.record_llm_call(
+                    turn_state.get("turns_used", 0),
+                    elapsed,
+                    0,
+                    "stop",
+                    usage=result.usage,
+                )
+            pending_estimate["tokens"] = 0
+        else:
+            # No usable provider usage (None, empty `usage: {}`, or all-zero
+            # counts). Stash the estimate and commit at most once after the
+            # retry loop settles, so empty-response retries don't multiply-
+            # bill the parent session.
+            pending_estimate["tokens"] = estimate_tokens(msgs, None)
+        return _msg_content(result.message) or ""
+
+    def _commit_pending_estimate():
+        n = pending_estimate["tokens"]
+        if n <= 0:
+            return
+        usage = LlmUsage.from_prompt_estimate(n)
+        if session_usage is not None:
+            session_usage.add(usage)
+        if report is not None:
+            report.record_llm_call(
+                turn_state.get("turns_used", 0),
+                0.0,
+                0,
+                "stop",
+                usage=usage,
+            )
+        pending_estimate["tokens"] = 0
 
     user_msg = messages[-1]
     original_text = user_msg.get("content", "")
@@ -1693,43 +1761,48 @@ def _call_audit_llm(
     )
 
     empty_retries = 0
-    while True:
-        try:
-            content = _do_call(messages)
-            if not content and limit > _AUDIT_TRUNCATION_FLOOR:
-                empty_retries += 1
-                if empty_retries > 3:
-                    break
-                _debug_log("llm_empty", task=trace_task, limit=limit)
+    try:
+        while True:
+            try:
+                content = _do_call(messages)
+                if not content and limit > _AUDIT_TRUNCATION_FLOOR:
+                    empty_retries += 1
+                    if empty_retries > 3:
+                        break
+                    _debug_log("llm_empty", task=trace_task, limit=limit)
+                    limit = limit // 2
+                    messages[-1] = {
+                        **user_msg,
+                        "content": original_text[:limit] + _AUDIT_TRUNCATION_MARKER,
+                    }
+                    continue
+                break
+            except ContextOverflowError:
+                _debug_log("llm_overflow", task=trace_task, limit=limit)
+                if not overflowed_once:
+                    overflowed_once = True
+                    _write_audit_trace(
+                        ctx,
+                        messages
+                        + [
+                            {
+                                "role": "assistant",
+                                "content": "[context overflow — retrying with truncation]",
+                            }
+                        ],
+                        task=(trace_task + " (overflow)" if trace_task else "overflow"),
+                    )
                 limit = limit // 2
+                if limit < _AUDIT_TRUNCATION_FLOOR:
+                    raise
                 messages[-1] = {
                     **user_msg,
                     "content": original_text[:limit] + _AUDIT_TRUNCATION_MARKER,
                 }
-                continue
-            break
-        except ContextOverflowError:
-            _debug_log("llm_overflow", task=trace_task, limit=limit)
-            if not overflowed_once:
-                overflowed_once = True
-                _write_audit_trace(
-                    ctx,
-                    messages
-                    + [
-                        {
-                            "role": "assistant",
-                            "content": "[context overflow — retrying with truncation]",
-                        }
-                    ],
-                    task=(trace_task + " (overflow)" if trace_task else "overflow"),
-                )
-            limit = limit // 2
-            if limit < _AUDIT_TRUNCATION_FLOOR:
-                raise
-            messages[-1] = {
-                **user_msg,
-                "content": original_text[:limit] + _AUDIT_TRUNCATION_MARKER,
-            }
+    finally:
+        # Commit at most one estimate-based bill for the whole logical call,
+        # regardless of how many empty-response retries ran.
+        _commit_pending_estimate()
 
     _debug_log(
         "llm_response",

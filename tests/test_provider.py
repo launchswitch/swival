@@ -131,7 +131,7 @@ class TestCallLlmRouting:
             patch("huggingface_hub.HfApi") as mock_hf_api,
         ):
             mock_hf_api.return_value.model_info.return_value = info
-            msg, finish_reason, cmd_activity, retries, cache_stats = call_llm(
+            r = call_llm(
                 None,
                 "google/gemma-4-E4B-it",
                 [{"role": "user", "content": "hi"}],
@@ -145,6 +145,9 @@ class TestCallLlmRouting:
                 api_key="hf_test",
                 max_retries=1,
             )
+            msg = r.message
+            finish_reason = r.finish_reason
+            cmd_activity = r.command_activity
 
         mock_comp.assert_called_once()
         mock_client.assert_called_once_with(provider="hf-inference", api_key="hf_test")
@@ -152,8 +155,9 @@ class TestCallLlmRouting:
         assert finish_reason == "stop"
         assert msg.content == "fallback ok"
         assert cmd_activity == []
-        assert retries == 0
-        assert cache_stats == (0, 0)
+        assert r.provider_retries == 0
+        # HF text-generation fallback path doesn't pull usage from the response.
+        assert r.usage is None
 
     def test_huggingface_non_chat_model_not_deployed_gets_clear_error(self):
         import litellm

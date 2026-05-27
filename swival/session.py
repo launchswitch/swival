@@ -16,6 +16,7 @@ from .snapshot import SnapshotState
 from .thinking import ThinkingState
 from .todo import TodoState
 from .tracker import FileAccessTracker
+from .usage import SessionUsage
 
 
 def _resolve_dir_list(dirs: list, label: str) -> list[Path]:
@@ -201,6 +202,10 @@ class Session:
         # cancel_flag: set the event to request graceful cancellation of the
         # running agent loop.
         self.cancel_flag: threading.Event | None = None
+
+        # Cumulative usage across all run/ask calls on this Session. Reset
+        # only when the Session is recreated (a new process).
+        self.session_usage = SessionUsage()
 
         # Setup state (cached after first _setup())
         self._setup_done = False
@@ -566,6 +571,7 @@ class Session:
             scavenge_content_calls=self.scavenge_content_calls,
             storm_breaker_enabled=self.storm_breaker,
             session=self,
+            session_usage=self.session_usage,
         )
         if state.get("compaction_state") is not None:
             kwargs["compaction_state"] = state["compaction_state"]
@@ -615,6 +621,8 @@ class Session:
         from .agent import run_agent_loop, append_history
 
         collector = ReportCollector() if report else None
+        if collector is not None:
+            collector.attach_session_usage(self.session_usage)
         system_content = self._system_with_memory(question, collector)
         state = self._make_per_run_state(system_content=system_content)
         messages = state["messages"]

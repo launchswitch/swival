@@ -115,7 +115,11 @@ A `success` outcome means the model produced a final non-tool response. An `exha
 
 `timeline` is an ordered array of event objects. Each event includes `type`, and most include `turn` (the turn number when the event occurred). Review events are an exception — they include `round` instead of `turn` since they occur between agent loop iterations.
 
-For `llm_call`, fields include `duration_s`, `prompt_tokens_est`, `finish_reason`, `is_retry`, and optionally `provider_retries` (number of transient-error retries within this call; omitted when 0). Retry calls include `retry_reason`, which is one of `compact_messages`, `drop_middle_turns`, or `aggressive_drop`. When the provider returned prompt cache data, `cached_tokens` and `cache_write_tokens` are included (both integers; omitted when zero).
+For `llm_call`, fields include `duration_s`, `finish_reason`, `is_retry`, and optionally `provider_retries` (number of transient-error retries within this call; omitted when 0). Retry calls include `retry_reason`, which is one of `compact_messages`, `drop_middle_turns`, or `aggressive_drop`.
+
+Successful calls carry a nested `usage` object with `prompt_tokens`, `completion_tokens`, `total_tokens`, `cached_tokens`, `cache_write_tokens`, `estimated_tokens`, `tokens_estimated`, `cost_usd` (omitted when null), `cost_unknown`, and `cost_estimated`. When the provider did not report usage (cache hit, command provider, local server) the event still carries a `usage` object with `estimated_tokens` and `tokens_estimated: true` so cumulative spend stays consistent with what the toolbar and `/status` show.
+
+Failed or in-flight diagnostic events (`finish_reason` of `context_overflow` or `error`) omit `usage` entirely and instead carry `prompt_tokens_estimate` and, when present, a `cache_stats` object with `cached_tokens` and `cache_write_tokens`. These per-event fields preserve diagnostic context but do not roll up into the aggregate `stats.usage` block, which is reserved for successful spend.
 
 For `tool_call`, fields include `name`, `arguments`, `succeeded`, `duration_s`, and `result_length`. If arguments were invalid JSON, `arguments` is `null`. Failed tool calls include `error`.
 

@@ -416,9 +416,9 @@ def test_cache_hit_poisoned_falls_through(tmp_path, monkeypatch):
     fake.get = always_poisoned
 
     clean_choice = _make_choice(content="fresh answer", finish_reason="stop")
-    msg, finish_reason, _, _, _ = _call_llm_with_fake_cache(
-        monkeypatch, fake, clean_choice
-    )
+    r = _call_llm_with_fake_cache(monkeypatch, fake, clean_choice)
+    msg = r.message
+    finish_reason = r.finish_reason
 
     # The live call must have run and returned the clean response.
     assert msg.content == "fresh answer"

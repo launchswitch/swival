@@ -220,7 +220,9 @@ class TestCompletionWithRetry:
 
 
 class TestCallLlmRetry:
-    def test_returns_5_tuple(self):
+    def test_returns_llm_call_result(self):
+        from swival.usage import LlmCallResult
+
         resp = _make_response()
         with patch("litellm.completion", return_value=resp):
             result = call_llm(
@@ -236,13 +238,13 @@ class TestCallLlmRetry:
                 provider="generic",
                 api_key="test",
             )
-        assert len(result) == 5
-        msg, finish_reason, cmd_activity, provider_retries, cache_stats = result
-        assert msg.content == "hello"
-        assert finish_reason == "stop"
-        assert cmd_activity == []
-        assert provider_retries == 0
-        assert cache_stats == (0, 0)
+        assert isinstance(result, LlmCallResult)
+        assert result.message.content == "hello"
+        assert result.finish_reason == "stop"
+        assert result.command_activity == []
+        assert result.provider_retries == 0
+        # Provider returned no usage object, so call_llm has no facts to record.
+        assert result.usage is None
 
     def test_provider_retries_reported(self):
         import litellm
@@ -266,7 +268,7 @@ class TestCallLlmRetry:
                 provider="generic",
                 api_key="test",
             )
-        assert result[3] == 1  # provider_retries
+        assert result.provider_retries == 1
 
     def test_retries_1_no_retry(self):
         import litellm
@@ -315,7 +317,9 @@ class TestCallLlmRetry:
                     api_key="test",
                 )
 
-    def test_command_provider_5_tuple(self):
+    def test_command_provider_result(self):
+        from swival.usage import LlmCallResult
+
         result = call_llm(
             None,
             "echo hello",
@@ -328,9 +332,9 @@ class TestCallLlmRetry:
             False,
             provider="command",
         )
-        assert len(result) == 5
-        assert result[4] == (0, 0)  # no cache stats for command provider
-        assert result[3] == 0  # provider_retries
+        assert isinstance(result, LlmCallResult)
+        assert result.usage is None  # command provider has no metering
+        assert result.provider_retries == 0
 
     def test_sanitization_retry_also_retries_transient(self):
         """Empty-assistant sanitization triggers a second _completion_with_retry
@@ -372,8 +376,8 @@ class TestCallLlmRetry:
                 api_key="test",
                 max_retries=5,
             )
-        assert result[0].content == "hello"
-        assert result[3] == 1  # one retry on the sanitization path
+        assert result.message.content == "hello"
+        assert result.provider_retries == 1  # one retry on the sanitization path
 
     def test_transient_then_empty_assistant_then_success(self):
         """Transient retry before BadRequestError(empty assistant) counts toward total."""
@@ -413,9 +417,9 @@ class TestCallLlmRetry:
                 api_key="test",
                 max_retries=5,
             )
-        assert result[0].content == "hello"
+        assert result.message.content == "hello"
         # 1 transient retry in first helper + 0 in second helper = 1 total
-        assert result[3] == 1
+        assert result.provider_retries == 1
 
     def test_empty_assistant_then_context_overflow_raises_coe(self):
         """BadRequestError(empty assistant) followed by BadRequestError(context overflow)

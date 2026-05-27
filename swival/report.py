@@ -4,6 +4,45 @@ import json
 from datetime import datetime, timezone
 
 
+def _coerce_usage(usage) -> dict | None:
+    """Normalize an `LlmUsage`, dict, or None into a flat dict for JSON.
+
+    The collector never imports `LlmUsage` to avoid an import cycle with
+    `swival.usage`. We probe attributes/keys instead.
+    """
+    if usage is None:
+        return None
+    if isinstance(usage, dict):
+        return {
+            "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
+            "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
+            "total_tokens": int(usage.get("total_tokens", 0) or 0),
+            "cached_tokens": int(usage.get("cached_tokens", 0) or 0),
+            "cache_write_tokens": int(usage.get("cache_write_tokens", 0) or 0),
+            "estimated_tokens": int(usage.get("estimated_tokens", 0) or 0),
+            "tokens_estimated": bool(usage.get("tokens_estimated", False)),
+            "cost_usd": (
+                None if usage.get("cost_usd") is None else float(usage["cost_usd"])
+            ),
+            "cost_unknown": bool(usage.get("cost_unknown", False)),
+            "cost_estimated": bool(usage.get("cost_estimated", False)),
+        }
+    return {
+        "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
+        "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+        "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
+        "cached_tokens": int(getattr(usage, "cached_tokens", 0) or 0),
+        "cache_write_tokens": int(getattr(usage, "cache_write_tokens", 0) or 0),
+        "estimated_tokens": int(getattr(usage, "estimated_tokens", 0) or 0),
+        "tokens_estimated": bool(getattr(usage, "tokens_estimated", False)),
+        "cost_usd": (
+            None if getattr(usage, "cost_usd", None) is None else float(usage.cost_usd)
+        ),
+        "cost_unknown": bool(getattr(usage, "cost_unknown", False)),
+        "cost_estimated": bool(getattr(usage, "cost_estimated", False)),
+    }
+
+
 class AgentError(Exception):
     """Raised by the agent loop or setup helpers for reportable runtime failures."""
 
@@ -53,6 +92,25 @@ class ReportCollector:
         self.truncation_repairs = 0
         self.scavenged_calls = 0
         self.stormed_calls = 0
+        # Cumulative provider-reported usage and pricing across this run's
+        # successful LLM calls. Updated by `record_llm_call(usage=...)`.
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
+        self.total_provider_tokens = 0
+        self.total_estimated_tokens = 0
+        self.total_cost_usd: float | None = None
+        self.any_tokens_estimated = False
+        self.any_cost_unknown = False
+        self.any_cost_estimated = False
+        # Optional reference to the parent's `SessionUsage`. When attached,
+        # `build_report` projects the aggregate `stats.usage` block from the
+        # session accumulator instead of the per-call sums — this keeps the
+        # report's aggregate consistent with toolbar/`/status` even for spend
+        # that the collector doesn't see directly (subagent threads, etc.).
+        self._session_usage = None
+
+    def attach_session_usage(self, session_usage) -> None:
+        self._session_usage = session_usage
 
     def record_goal_event(self, action: str, goal_payload: dict | None) -> None:
         """Log goal lifecycle events (created, replaced, paused, resumed,
@@ -79,17 +137,15 @@ class ReportCollector:
         provider_retries: int = 0,
         cached_tokens: int = 0,
         cache_write_tokens: int = 0,
+        usage=None,
     ):
         self.llm_calls += 1
         self.total_llm_time += duration
-        self.total_cached_tokens += cached_tokens
-        self.total_cache_write_tokens += cache_write_tokens
         self.max_turn_seen = max(self.max_turn_seen, turn)
         event = {
             "turn": turn,
             "type": "llm_call",
             "duration_s": round(duration, 3),
-            "prompt_tokens_est": token_est,
             "finish_reason": finish_reason,
             "is_retry": is_retry,
         }
@@ -97,6 +153,47 @@ class ReportCollector:
             event["retry_reason"] = retry_reason
         if provider_retries:
             event["provider_retries"] = provider_retries
+
+        usage_dict = _coerce_usage(usage)
+        if usage_dict is not None:
+            # Successful call with an explicit usage shape: roll it into
+            # cumulative `stats.usage`. Callers are expected to synthesize an
+            # `LlmUsage.from_prompt_estimate(...)` when a success path has no
+            # provider usage (cache hit, command provider, local server).
+            event["usage"] = usage_dict
+            self.total_cached_tokens += int(usage_dict.get("cached_tokens", 0) or 0)
+            self.total_cache_write_tokens += int(
+                usage_dict.get("cache_write_tokens", 0) or 0
+            )
+            self.total_prompt_tokens += int(usage_dict.get("prompt_tokens", 0) or 0)
+            self.total_completion_tokens += int(
+                usage_dict.get("completion_tokens", 0) or 0
+            )
+            self.total_provider_tokens += int(usage_dict.get("total_tokens", 0) or 0)
+            self.total_estimated_tokens += int(
+                usage_dict.get("estimated_tokens", 0) or 0
+            )
+            if usage_dict.get("tokens_estimated"):
+                self.any_tokens_estimated = True
+            if usage_dict.get("cost_unknown"):
+                self.any_cost_unknown = True
+            if usage_dict.get("cost_estimated"):
+                self.any_cost_estimated = True
+            c = usage_dict.get("cost_usd")
+            if c is not None:
+                self.total_cost_usd = (self.total_cost_usd or 0.0) + float(c)
+        else:
+            # No usage object — this is a diagnostic event for a failed or
+            # in-flight call (context overflow, generic AgentError, recovery
+            # attempts). Keep per-event diagnostic fields, but do NOT roll up
+            # into cumulative spend; spend is for successful calls only.
+            if token_est:
+                event["prompt_tokens_estimate"] = int(token_est)
+            if cached_tokens or cache_write_tokens:
+                event["cache_stats"] = {
+                    "cached_tokens": int(cached_tokens or 0),
+                    "cache_write_tokens": int(cache_write_tokens or 0),
+                }
         self.events.append(event)
 
     def record_tool_call(
@@ -307,6 +404,63 @@ class ReportCollector:
         """Record a /clear or /new command in the timeline."""
         self.events.append({"type": "session_clear"})
 
+    def _session_usage_snapshot(self) -> dict | None:
+        if self._session_usage is None:
+            return None
+        try:
+            return self._session_usage.snapshot()
+        except Exception:
+            return None
+
+    def _has_usage_to_report(self) -> bool:
+        snap = self._session_usage_snapshot()
+        if snap is not None:
+            return bool(
+                snap.get("total_tokens")
+                or snap.get("estimated_tokens")
+                or snap.get("cost_usd") is not None
+            )
+        return bool(
+            self.total_prompt_tokens
+            or self.total_completion_tokens
+            or self.total_provider_tokens
+            or self.total_estimated_tokens
+            or self.total_cost_usd is not None
+        )
+
+    def _build_usage_block(self) -> dict:
+        snap = self._session_usage_snapshot()
+        if snap is not None:
+            # Project from the cumulative `SessionUsage` so subagents and
+            # auxiliary helpers that update only the session accumulator are
+            # still reflected in the aggregate block. Per-event `usage` rows
+            # in `timeline` remain the per-call trace.
+            block: dict = {
+                "prompt_tokens": int(snap.get("prompt_tokens", 0) or 0),
+                "completion_tokens": int(snap.get("completion_tokens", 0) or 0),
+                "total_tokens": int(snap.get("total_tokens", 0) or 0),
+                "estimated_tokens": int(snap.get("estimated_tokens", 0) or 0),
+                "any_tokens_estimated": bool(snap.get("any_tokens_estimated", False)),
+                "any_cost_unknown": bool(snap.get("any_cost_unknown", False)),
+                "any_cost_estimated": bool(snap.get("any_cost_estimated", False)),
+            }
+            cost = snap.get("cost_usd")
+            if cost is not None:
+                block["cost_usd"] = round(float(cost), 6)
+            return block
+        block = {
+            "prompt_tokens": self.total_prompt_tokens,
+            "completion_tokens": self.total_completion_tokens,
+            "total_tokens": self.total_provider_tokens,
+            "estimated_tokens": self.total_estimated_tokens,
+            "any_tokens_estimated": self.any_tokens_estimated,
+            "any_cost_unknown": self.any_cost_unknown,
+            "any_cost_estimated": self.any_cost_estimated,
+        }
+        if self.total_cost_usd is not None:
+            block["cost_usd"] = round(float(self.total_cost_usd), 6)
+        return block
+
     def build_report(
         self,
         *,
@@ -384,6 +538,11 @@ class ReportCollector:
                         }
                     }
                     if self.total_cached_tokens or self.total_cache_write_tokens
+                    else {}
+                ),
+                **(
+                    {"usage": self._build_usage_block()}
+                    if self._has_usage_to_report()
                     else {}
                 ),
                 "total_tool_time_s": round(self.total_tool_time, 3),

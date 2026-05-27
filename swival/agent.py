@@ -68,6 +68,7 @@ from .goal import (
 from .thinking import ThinkingState
 from .todo import TodoState
 from .tracker import FileAccessTracker
+from .usage import LlmCallResult, LlmUsage, SessionUsage
 from .a2a_client import A2aShutdownError
 from .a2a_types import (
     EVENT_STATUS_UPDATE,
@@ -2355,21 +2356,23 @@ def _call_summarize_llm(
         {"role": "user", "content": text},
     ]
     try:
-        _result = call_llm_fn(
-            base_url=base_url,
-            model_id=model_id,
-            messages=prompt,
-            max_output_tokens=512,
-            temperature=0,
-            top_p=top_p,
-            seed=seed,
-            tools=None,
-            verbose=False,
-            api_key=api_key,
-            user_agent=user_agent,
-            provider=provider,
+        _result = LlmCallResult.normalize(
+            call_llm_fn(
+                base_url=base_url,
+                model_id=model_id,
+                messages=prompt,
+                max_output_tokens=512,
+                temperature=0,
+                top_p=top_p,
+                seed=seed,
+                tools=None,
+                verbose=False,
+                api_key=api_key,
+                user_agent=user_agent,
+                provider=provider,
+            )
         )
-        resp = _result[0]
+        resp = _result.message
         content = resp.content if hasattr(resp, "content") else resp.get("content", "")
         return content if content else None
     except Exception:
@@ -3724,7 +3727,10 @@ def _call_huggingface_text_generation(
     if not isinstance(response_text, str):
         response_text = getattr(response_text, "generated_text", str(response_text))
 
-    return _make_synthetic_message(response_text), "stop", [], 0, (0, 0)
+    return LlmCallResult(
+        message=_make_synthetic_message(response_text),
+        finish_reason="stop",
+    )
 
 
 def _call_command(command_str, messages, verbose, max_output_tokens=None):
@@ -3943,12 +3949,103 @@ def _is_vision_rejection(error: "AgentError") -> bool:
     return any(pattern in msg for pattern in _VISION_REJECTION_PATTERNS)
 
 
+def _has_token_data(usage: "LlmUsage | None") -> bool:
+    """True iff `usage` carries any non-zero token count.
+
+    A provider that returns `usage: {}` or all-zero token fields is
+    indistinguishable from "no metering" for accounting purposes; in both
+    cases we fall back to the local prompt estimate so the toolbar/report
+    don't silently record zero spend across many real calls.
+    """
+    if usage is None:
+        return False
+    return bool(
+        usage.total_tokens
+        or usage.prompt_tokens
+        or usage.completion_tokens
+        or usage.estimated_tokens
+        or usage.cached_tokens
+        or usage.cache_write_tokens
+    )
+
+
+def _make_secondary_call_wrapper(
+    *,
+    session_usage: "SessionUsage | None",
+    user_agent: str | None = None,
+    llm_filter=None,
+    cache=None,
+    secret_shield=None,
+):
+    """Build the secondary-call wrapper used by `run_agent_loop` for
+    compaction and summarization helpers.
+
+    The wrapper threads cache/secret-shield/filter kwargs into every call,
+    normalizes the return into an `LlmCallResult`, and rolls auxiliary spend
+    into the parent `SessionUsage` via `_roll_aux_usage_into_session`. Lives
+    at module level so tests can construct and invoke the actual production
+    wrapper rather than reimplementing its body.
+    """
+
+    def wrapper(*args, **kwargs):
+        # Secondary calls (compaction summaries, proactive checkpoints,
+        # continue-file enrichment) are not user-driven turns and must not
+        # stream to the terminal; the streaming gate in `call_llm` keys off
+        # `call_kind`, so tag it unconditionally.
+        kwargs.setdefault("call_kind", "summary")
+        if user_agent is not None:
+            kwargs.setdefault("user_agent", user_agent)
+        if llm_filter is not None:
+            kwargs.setdefault("llm_filter", llm_filter)
+        if cache is not None:
+            kwargs.setdefault("cache", cache)
+        if secret_shield is not None:
+            kwargs.setdefault("secret_shield", secret_shield)
+        aux = LlmCallResult.normalize(call_llm(*args, **kwargs))
+        _roll_aux_usage_into_session(aux, session_usage, args, kwargs)
+        return aux
+
+    return wrapper
+
+
+def _roll_aux_usage_into_session(
+    aux: "LlmCallResult",
+    session_usage: "SessionUsage | None",
+    call_args: tuple,
+    call_kwargs: dict,
+) -> None:
+    """Roll an auxiliary `call_llm` result into the parent `SessionUsage`.
+
+    Used by the secondary-call wrapper for compaction/summarization helpers.
+    Provider-reported usage is added directly; if the call succeeded with no
+    provider usage (cache hit, command provider, local server) we bill the
+    call against the local prompt-token estimate so auxiliary spend is not
+    silently dropped from the toolbar and `/status`.
+    """
+    if session_usage is None:
+        return
+    if _has_token_data(aux.usage):
+        session_usage.add(aux.usage)
+        return
+    msgs = call_kwargs.get("messages")
+    if msgs is None and call_args:
+        # `call_llm` positional shape: (base_url, model_id, messages, ...)
+        msgs = call_args[2] if len(call_args) >= 3 else None
+    estimate = estimate_tokens(msgs or [], None)
+    session_usage.add(LlmUsage.from_prompt_estimate(estimate))
+
+
 def _call_llm_with_dismiss(dismiss, llm_args, **llm_kwargs):
     """Call ``call_llm`` with *dismiss* threaded as ``on_stream_start`` if
-    callable. Caller's kwargs dict is not mutated — we receive a copy."""
+    callable. Caller's kwargs dict is not mutated — we receive a copy.
+
+    Normalizes the return value through `LlmCallResult.normalize`, which makes
+    the call sites tolerant of test mocks that return short tuples like
+    `(msg, finish_reason)`.
+    """
     if callable(dismiss):
         llm_kwargs["on_stream_start"] = dismiss
-    return call_llm(*llm_args, **llm_kwargs)
+    return LlmCallResult.normalize(call_llm(*llm_args, **llm_kwargs))
 
 
 def _completion_via_stream(completion_kwargs, on_stream_start=None):
@@ -4077,20 +4174,51 @@ def _completion_with_retry(
             time.sleep(delay)
 
 
-def _log_cache_stats(response, verbose) -> tuple[int, int]:
-    """Log prompt cache stats to stderr if verbose. Returns (cached_tokens, cache_write_tokens)."""
-    if not hasattr(response, "usage") or not response.usage:
-        return 0, 0
-    details = getattr(response.usage, "prompt_tokens_details", None)
-    cached = getattr(details, "cached_tokens", 0) if details else 0
-    written = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
-    cached = cached or 0
+def _extract_llm_usage(response, *, verbose: bool = False) -> LlmUsage | None:
+    """Build an `LlmUsage` from a LiteLLM response and price it via LiteLLM.
+
+    Reads provider usage fields only and asks `litellm.completion_cost` for the
+    price exactly once. Unknown pricing or missing usage are normal: the helper
+    returns `None` only when the response carries no usage object at all.
+    Caches stats are logged here when `verbose` is true so the diagnostic
+    line stays adjacent to the extraction site.
+    """
+    if response is None:
+        return None
+    usage_obj = getattr(response, "usage", None)
+    if usage_obj is None and isinstance(response, dict):
+        usage_obj = response.get("usage")
+    if usage_obj is None:
+        return None
+    cost_usd: float | None = None
+    try:
+        import litellm
+
+        c = litellm.completion_cost(completion_response=response)
+        if c is not None:
+            cost_usd = float(c)
+    except Exception:
+        cost_usd = None
+    # LiteLLM has occasionally returned 0.0 for unknown-pricing responses
+    # rather than raising. A literal zero from a call that had real tokens is
+    # almost certainly an unmapped-model fallthrough, not a genuinely free
+    # response; downgrade it to "unknown" so the toolbar's `$0.00` chip is
+    # not used to mean two different things.
+    if cost_usd is not None and cost_usd <= 0.0:
+        from .usage import _get as _usage_get
+
+        prompt = int(_usage_get(usage_obj, "prompt_tokens", 0) or 0)
+        completion = int(_usage_get(usage_obj, "completion_tokens", 0) or 0)
+        total = int(_usage_get(usage_obj, "total_tokens", 0) or 0)
+        if prompt or completion or total:
+            cost_usd = None
+    out = LlmUsage.from_provider_response(response, cost_usd=cost_usd)
     if verbose:
-        if cached:
-            fmt.info(f"Prompt cache: {cached} tokens cached")
-        if written:
-            fmt.info(f"Prompt cache: {written} tokens written to cache")
-    return cached, written
+        if out.cached_tokens:
+            fmt.info(f"Prompt cache: {out.cached_tokens} tokens cached")
+        if out.cache_write_tokens:
+            fmt.info(f"Prompt cache: {out.cache_write_tokens} tokens written to cache")
+    return out
 
 
 def call_llm(
@@ -4124,12 +4252,12 @@ def call_llm(
 ):
     """Call LiteLLM with the appropriate provider.
 
-    Returns (message, finish_reason, cmd_activity, provider_retries, cache_stats).
-    cmd_activity is a list of {"name": str, "succeeded": bool} dicts
-    (non-empty only for command provider with tool calls).
-    provider_retries is the number of transient-error retries (0 = first attempt ok).
-    cache_stats is (cached_tokens, cache_write_tokens); both 0 for command provider
-    and SQLite cache-hit paths.
+    Returns an `LlmCallResult`. `command_activity` is non-empty only for the
+    command provider when tool calls were made. `provider_retries` is the
+    number of transient-error retries (0 = first attempt ok). `usage` carries
+    provider-reported tokens plus an optional LiteLLM-computed `cost_usd`;
+    it is `None` for the command provider and the cache-hit fast path where
+    no provider usage exists.
     """
     # --- Outbound: user-defined filter ---
     if llm_filter is not None:
@@ -4159,10 +4287,14 @@ def call_llm(
                 **command_tool_kwargs,
             )
             _post_process_assistant_message(cmd_msg, sanitize_thinking)
-            return cmd_msg, cmd_stop, cmd_activity, 0, (0, 0)
+            return LlmCallResult(
+                message=cmd_msg,
+                finish_reason=cmd_stop,
+                command_activity=cmd_activity,
+            )
         msg, stop = _call_command(model_id, messages, verbose, max_output_tokens)
         _post_process_assistant_message(msg, sanitize_thinking)
-        return msg, stop, [], 0, (0, 0)
+        return LlmCallResult(message=msg, finish_reason=stop)
 
     # --- Outbound: escape special tokens in user/system messages ---
     _escape_special_tokens_in_messages(messages)
@@ -4355,7 +4487,7 @@ def call_llm(
                 # cache is disabled when secret_shield is active, so no
                 # decrypt is needed here; guarded defensively in case the
                 # logic changes
-                return msg, finish_reason, [], 0, (0, 0)
+                return LlmCallResult(message=msg, finish_reason=finish_reason)
 
     def _cache_store(choice):
         if cache is None:
@@ -4430,7 +4562,7 @@ def call_llm(
                 )
                 tne._provider_retries = retries
                 raise tne
-            msg, finish_reason, cmd_activity, _, cache_stats = (
+            _hf_result = LlmCallResult.normalize(
                 _call_huggingface_text_generation(
                     base_url,
                     model_id,
@@ -4442,8 +4574,9 @@ def call_llm(
                     api_key,
                 )
             )
-            _post_process_assistant_message(msg, sanitize_thinking)
-            return msg, finish_reason, cmd_activity, retries, cache_stats
+            _post_process_assistant_message(_hf_result.message, sanitize_thinking)
+            _hf_result.provider_retries = retries
+            return _hf_result
         if _EMPTY_ASSISTANT_RE.search(msg_text):
             # Provider rejected an assistant message with no content and no
             # tool_calls (common with Mistral via OpenRouter).  Fix the
@@ -4483,10 +4616,15 @@ def call_llm(
                     ae._provider_retries = combined
                     _raise_with_retries(ae)
                 retries += first_retries
-                cache_stats = _log_cache_stats(response, verbose)
+                usage = _extract_llm_usage(response, verbose=verbose)
                 choice = _pick_best_choice(response.choices)
                 msg, finish_reason = _finalize_choice(choice)
-                return msg, finish_reason, [], retries, cache_stats
+                return LlmCallResult(
+                    message=msg,
+                    finish_reason=finish_reason,
+                    provider_retries=retries,
+                    usage=usage,
+                )
         if _ORPHANED_TOOL_CALL_RE.search(msg_text):
             first_retries = _retries_from_exc(e)
             if _fix_orphaned_tool_calls(messages):
@@ -4525,10 +4663,15 @@ def call_llm(
                     ae._provider_retries = combined
                     _raise_with_retries(ae)
                 retries += first_retries
-                cache_stats = _log_cache_stats(response, verbose)
+                usage = _extract_llm_usage(response, verbose=verbose)
                 choice = _pick_best_choice(response.choices)
                 msg, finish_reason = _finalize_choice(choice)
-                return msg, finish_reason, [], retries, cache_stats
+                return LlmCallResult(
+                    message=msg,
+                    finish_reason=finish_reason,
+                    provider_retries=retries,
+                    usage=usage,
+                )
         if tools is not None and _TOOLS_NOT_SUPPORTED_RE.search(msg_text):
             tne = ToolsNotSupportedError(
                 f"model does not support function calling: {e}"
@@ -4572,10 +4715,15 @@ def call_llm(
         ae._provider_retries = _retries_from_exc(e)
         _raise_with_retries(ae)
 
-    cache_stats = _log_cache_stats(response, verbose)
+    usage = _extract_llm_usage(response, verbose=verbose)
     choice = _pick_best_choice(response.choices)
     msg, finish_reason = _finalize_choice(choice)
-    return msg, finish_reason, [], retries, cache_stats
+    return LlmCallResult(
+        message=msg,
+        finish_reason=finish_reason,
+        provider_retries=retries,
+        usage=usage,
+    )
 
 
 # Provider → env var that resolve_provider() checks for that provider
@@ -7147,6 +7295,7 @@ def _run_main(args, report, _write_report, parser):
         repair_truncated_args=getattr(args, "repair_truncated_args", True),
         scavenge_content_calls=getattr(args, "scavenge_content_calls", True),
         storm_breaker_enabled=getattr(args, "storm_breaker", True),
+        session_usage=SessionUsage(),
     )
 
     # Validate and thread llm_filter
@@ -7239,6 +7388,7 @@ def _run_main(args, report, _write_report, parser):
                 loop_kwargs["turn_state"] = _script_turn_state
                 if report:
                     loop_kwargs["report"] = report
+                    report.attach_session_usage(loop_kwargs.get("session_usage"))
                 ctx = InputContext(
                     messages=messages,
                     tools=tools,
@@ -7435,6 +7585,7 @@ def _run_main(args, report, _write_report, parser):
     # REPL path
     if report:
         loop_kwargs["report"] = report
+        report.attach_session_usage(loop_kwargs.get("session_usage"))
     _sa_holder = [subagent_manager]
     try:
         if args.question:
@@ -7574,6 +7725,7 @@ def run_agent_loop(
     scavenge_content_calls: bool = True,
     storm_breaker_enabled: bool = True,
     session: object | None = None,
+    session_usage: SessionUsage | None = None,
 ) -> tuple[str | None, bool]:
     """Run the tool-calling loop until a final answer or max turns.
 
@@ -7600,20 +7752,16 @@ def run_agent_loop(
         or secret_shield is not None
         or llm_filter is not None
         or _secondary_user_agent is not None
+        or session_usage is not None
     )
     if _need_secondary_wrapper:
-
-        def _call_llm_for_secondary(*args, **kwargs):
-            if _secondary_user_agent is not None:
-                kwargs.setdefault("user_agent", _secondary_user_agent)
-            if llm_filter is not None:
-                kwargs.setdefault("llm_filter", llm_filter)
-                kwargs.setdefault("call_kind", "summary")
-            if cache is not None:
-                kwargs.setdefault("cache", cache)
-            if secret_shield is not None:
-                kwargs.setdefault("secret_shield", secret_shield)
-            return call_llm(*args, **kwargs)
+        _call_llm_for_secondary = _make_secondary_call_wrapper(
+            session_usage=session_usage,
+            user_agent=_secondary_user_agent,
+            llm_filter=llm_filter,
+            cache=cache,
+            secret_shield=secret_shield,
+        )
 
     def _write_turns():
         if turn_state is not None:
@@ -7673,6 +7821,29 @@ def run_agent_loop(
     _goal_launch_pending = bool(goal_launch_turn)
     _final_attempt_injected_for_goal: str | None = None
     _turn_token_baseline: int | None = None
+
+    def _account_session_usage(
+        usage: LlmUsage | None, prompt_estimate: int
+    ) -> LlmUsage:
+        """Roll a successful LLM call into the shared `SessionUsage`.
+
+        Returns the resolved usage so callers can hand the same object to the
+        report. When `usage` is `None` (cache hit, command provider, local
+        server with no metering) — or when the provider returned a `usage`
+        object whose token fields are all zero (some OAI-compatible servers
+        emit `usage: {}` or all-zero counts) — the helper synthesizes usage
+        from the local prompt estimate so spend is not silently dropped.
+        Failed calls must not go through this path: spend is for successful
+        calls only.
+        """
+        resolved = (
+            usage
+            if _has_token_data(usage)
+            else LlmUsage.from_prompt_estimate(prompt_estimate)
+        )
+        if session_usage is not None:
+            session_usage.add(resolved)
+        return resolved
 
     def _account_goal_usage(
         prompt_tokens: int, cache_stats: tuple, elapsed_s: float
@@ -7963,10 +8134,16 @@ def run_agent_loop(
                 _llm_result = _call_llm_with_dismiss(
                     _dismiss_waiting, _llm_args, **llm_kwargs
                 )
-                msg, finish_reason = _llm_result[0], _llm_result[1]
-                cmd_activity = _llm_result[2] if len(_llm_result) > 2 else []
-                _provider_retries = _llm_result[3] if len(_llm_result) > 3 else 0
-                _cache_stats = _llm_result[4] if len(_llm_result) > 4 else (0, 0)
+                msg = _llm_result.message
+                finish_reason = _llm_result.finish_reason
+                cmd_activity = _llm_result.command_activity
+                _provider_retries = _llm_result.provider_retries
+                _llm_usage = _llm_result.usage
+                _cache_stats = (
+                    (_llm_usage.cached_tokens, _llm_usage.cache_write_tokens)
+                    if _llm_usage is not None
+                    else (0, 0)
+                )
                 _maybe_scavenge_tool_calls(
                     msg,
                     finish_reason,
@@ -8097,13 +8274,18 @@ def run_agent_loop(
                         _llm_result = _call_llm_with_dismiss(
                             _dismiss_waiting, _llm_args, **llm_kwargs
                         )
-                        msg, finish_reason = _llm_result[0], _llm_result[1]
-                        cmd_activity = _llm_result[2] if len(_llm_result) > 2 else []
-                        _provider_retries = (
-                            _llm_result[3] if len(_llm_result) > 3 else 0
-                        )
+                        msg = _llm_result.message
+                        finish_reason = _llm_result.finish_reason
+                        cmd_activity = _llm_result.command_activity
+                        _provider_retries = _llm_result.provider_retries
+                        _llm_usage = _llm_result.usage
                         _cache_stats = (
-                            _llm_result[4] if len(_llm_result) > 4 else (0, 0)
+                            (
+                                _llm_usage.cached_tokens,
+                                _llm_usage.cache_write_tokens,
+                            )
+                            if _llm_usage is not None
+                            else (0, 0)
                         )
                         _maybe_scavenge_tool_calls(
                             msg,
@@ -8157,6 +8339,7 @@ def run_agent_loop(
                     elapsed = time.monotonic() - t0
                     if verbose:
                         fmt.llm_timing(elapsed, finish_reason)
+                    _resolved_usage = _account_session_usage(_llm_usage, tokens_after)
                     if report:
                         report.record_llm_call(
                             turns + turn_offset,
@@ -8168,6 +8351,7 @@ def run_agent_loop(
                             provider_retries=_provider_retries,
                             cached_tokens=_cache_stats[0],
                             cache_write_tokens=_cache_stats[1],
+                            usage=_resolved_usage,
                         )
                     _account_goal_usage(tokens_after, _cache_stats, elapsed)
                     break  # success
@@ -8250,15 +8434,18 @@ def run_agent_loop(
                             _llm_result = _call_llm_with_dismiss(
                                 _dismiss_waiting, _llm_args, **llm_kwargs
                             )
-                            msg, finish_reason = _llm_result[0], _llm_result[1]
-                            cmd_activity = (
-                                _llm_result[2] if len(_llm_result) > 2 else []
-                            )
-                            _provider_retries = (
-                                _llm_result[3] if len(_llm_result) > 3 else 0
-                            )
+                            msg = _llm_result.message
+                            finish_reason = _llm_result.finish_reason
+                            cmd_activity = _llm_result.command_activity
+                            _provider_retries = _llm_result.provider_retries
+                            _llm_usage = _llm_result.usage
                             _cache_stats = (
-                                _llm_result[4] if len(_llm_result) > 4 else (0, 0)
+                                (
+                                    _llm_usage.cached_tokens,
+                                    _llm_usage.cache_write_tokens,
+                                )
+                                if _llm_usage is not None
+                                else (0, 0)
                             )
                             _maybe_scavenge_tool_calls(
                                 msg,
@@ -8286,6 +8473,9 @@ def run_agent_loop(
                         if verbose:
                             fmt.llm_timing(elapsed, finish_reason)
                         _post_drop_tokens = estimate_tokens(messages, None)
+                        _resolved_usage = _account_session_usage(
+                            _llm_usage, _post_drop_tokens
+                        )
                         if report:
                             report.record_llm_call(
                                 turns + turn_offset,
@@ -8297,6 +8487,7 @@ def run_agent_loop(
                                 provider_retries=_provider_retries,
                                 cached_tokens=_cache_stats[0],
                                 cache_write_tokens=_cache_stats[1],
+                                usage=_resolved_usage,
                             )
                         _account_goal_usage(_post_drop_tokens, _cache_stats, elapsed)
                         _drop_tools_ok = True
@@ -8352,18 +8543,18 @@ def run_agent_loop(
                                 _llm_result = _call_llm_with_dismiss(
                                     _dismiss_waiting, _llm_args, **llm_kwargs
                                 )
-                                msg, finish_reason = (
-                                    _llm_result[0],
-                                    _llm_result[1],
-                                )
-                                cmd_activity = (
-                                    _llm_result[2] if len(_llm_result) > 2 else []
-                                )
-                                _provider_retries = (
-                                    _llm_result[3] if len(_llm_result) > 3 else 0
-                                )
+                                msg = _llm_result.message
+                                finish_reason = _llm_result.finish_reason
+                                cmd_activity = _llm_result.command_activity
+                                _provider_retries = _llm_result.provider_retries
+                                _llm_usage = _llm_result.usage
                                 _cache_stats = (
-                                    _llm_result[4] if len(_llm_result) > 4 else (0, 0)
+                                    (
+                                        _llm_usage.cached_tokens,
+                                        _llm_usage.cache_write_tokens,
+                                    )
+                                    if _llm_usage is not None
+                                    else (0, 0)
                                 )
                                 _maybe_scavenge_tool_calls(
                                     msg,
@@ -8391,6 +8582,9 @@ def run_agent_loop(
                             if verbose:
                                 fmt.llm_timing(elapsed, finish_reason)
                             _post_drop_tokens = estimate_tokens(messages, None)
+                            _resolved_usage = _account_session_usage(
+                                _llm_usage, _post_drop_tokens
+                            )
                             if report:
                                 report.record_llm_call(
                                     turns + turn_offset,
@@ -8402,6 +8596,7 @@ def run_agent_loop(
                                     provider_retries=_provider_retries,
                                     cached_tokens=_cache_stats[0],
                                     cache_write_tokens=_cache_stats[1],
+                                    usage=_resolved_usage,
                                 )
                             _account_goal_usage(
                                 _post_drop_tokens, _cache_stats, elapsed
@@ -8462,6 +8657,7 @@ def run_agent_loop(
             elapsed = time.monotonic() - t0
             if verbose:
                 fmt.llm_timing(elapsed, finish_reason)
+            _resolved_usage = _account_session_usage(_llm_usage, token_est)
             if report:
                 report.record_llm_call(
                     turns + turn_offset,
@@ -8471,6 +8667,7 @@ def run_agent_loop(
                     provider_retries=_provider_retries,
                     cached_tokens=_cache_stats[0],
                     cache_write_tokens=_cache_stats[1],
+                    usage=_resolved_usage,
                     **_tools_retry_kwargs(_is_tools_retry),
                 )
             _is_tools_retry = False
@@ -9325,6 +9522,7 @@ def _repl_status(
     current_profile: str | None = None,
     goal_state=None,
     loop_registry=None,
+    session_usage: SessionUsage | None = None,
 ) -> str:
     """Build a compact session overview."""
     from .continue_here import load_continue_file
@@ -9353,6 +9551,28 @@ def _repl_status(
         lines.append(f"context: {tokens:,} tokens")
 
     lines.append(f"messages: {msg_count}  |  turns: {turns_used} / {max_turns}")
+
+    if session_usage is not None:
+        snap = session_usage.snapshot()
+        used = int(snap.get("total_tokens", 0) or 0) + int(
+            snap.get("estimated_tokens", 0) or 0
+        )
+        if used > 0:
+            prefix = "~" if snap.get("any_tokens_estimated") else ""
+            usage_line = f"usage: {prefix}{used:,} tok"
+            cost = snap.get("cost_usd")
+            if cost is not None:
+                if cost >= 0.01:
+                    usage_line += f", est. ${cost:.2f}"
+                elif cost > 0:
+                    usage_line += ", est. <$0.01"
+                else:
+                    usage_line += ", est. $0.00"
+                if snap.get("any_cost_unknown"):
+                    usage_line += " (partial; some calls unpriced)"
+            elif snap.get("any_cost_unknown"):
+                usage_line += " (no pricing available)"
+            lines.append(usage_line)
 
     file_info = None
     if file_tracker:
@@ -10352,6 +10572,7 @@ def execute_input(
                 current_profile=ctx.current_profile,
                 goal_state=ctx.goal_state,
                 loop_registry=ctx.loop_registry,
+                session_usage=ctx.loop_kwargs.get("session_usage"),
             )
             return StepResult(kind="info", text=msg)
 
@@ -11319,6 +11540,7 @@ def repl_loop(
     scavenge_content_calls: bool = True,
     storm_breaker_enabled: bool = True,
     session: object | None = None,
+    session_usage: SessionUsage | None = None,
 ):
     """Interactive read-eval-print loop."""
     from prompt_toolkit import PromptSession
@@ -11385,7 +11607,9 @@ def repl_loop(
         "git_dirty": 0,
         "tip_idx": 0,
         "ctx_pct": 0,
-        "total_tok": 0,
+        "tok": 0,
+        "tok_estimated": False,
+        "cost_usd": None,
     }
 
     def _refresh_toolbar_state():
@@ -11403,12 +11627,13 @@ def repl_loop(
             _toolbar_state["git_dirty"] = 0
         ctx_tokens = estimate_tokens(messages, tools)
         _toolbar_state["ctx_pct"] = min(100, int(ctx_tokens * 100 / _context_limit))
-        if report:
-            _toolbar_state["total_tok"] = sum(
-                e.get("prompt_tokens_est", 0)
-                for e in report.events
-                if e.get("type") == "llm_call"
+        if session_usage is not None:
+            snap = session_usage.snapshot()
+            _toolbar_state["tok"] = int(snap.get("total_tokens", 0) or 0) + int(
+                snap.get("estimated_tokens", 0) or 0
             )
+            _toolbar_state["tok_estimated"] = bool(snap.get("any_tokens_estimated"))
+            _toolbar_state["cost_usd"] = snap.get("cost_usd")
         _toolbar_state["tip_idx"] += 1
 
     _refresh_toolbar_state()
@@ -11420,12 +11645,24 @@ def repl_loop(
 
     def _bottom_toolbar():
         parts = []
-        total_tok = _toolbar_state["total_tok"]
-        if report:
-            if total_tok >= 1000:
-                parts.append((_S, f" {total_tok // 1000}k tok"))
+        tok = _toolbar_state["tok"]
+        tok_est = _toolbar_state["tok_estimated"]
+        cost = _toolbar_state["cost_usd"]
+        if tok > 0:
+            prefix = "~" if tok_est else ""
+            if tok >= 1_000_000:
+                parts.append((_S, f" {prefix}{tok / 1_000_000:.1f}m tok"))
+            elif tok >= 1000:
+                parts.append((_S, f" {prefix}{tok / 1000:.1f}k tok"))
             else:
-                parts.append((_S, f" {total_tok} tok"))
+                parts.append((_S, f" {prefix}{tok} tok"))
+        if cost is not None:
+            if cost >= 0.01:
+                parts.append((_S, f" │ ~${cost:.2f}"))
+            elif cost > 0:
+                parts.append((_S, " │ ~<$0.01"))
+            else:
+                parts.append((_S, " │ ~$0.00"))
         parts.append((_S, f" │ ctx {_toolbar_state['ctx_pct']}%"))
 
         dirty = _toolbar_state["git_dirty"]
@@ -11552,6 +11789,7 @@ def repl_loop(
         scavenge_content_calls=scavenge_content_calls,
         storm_breaker_enabled=storm_breaker_enabled,
         session=session,
+        session_usage=session_usage,
     )
 
     ctx = InputContext(

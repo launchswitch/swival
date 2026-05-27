@@ -364,7 +364,7 @@ class TestCacheIntegration:
 
         with patch("litellm.completion", return_value=mock_response) as mock_comp:
             # First call — should hit litellm
-            msg1, fr1, *_ = call_llm(
+            r1 = call_llm(
                 "http://127.0.0.1:1234",
                 "test-model",
                 [{"role": "user", "content": "hello"}],
@@ -378,10 +378,10 @@ class TestCacheIntegration:
                 cache=cache,
             )
             assert mock_comp.call_count == 1
-            assert fr1 == "stop"
+            assert r1.finish_reason == "stop"
 
             # Second identical call — should hit cache, not litellm
-            msg2, fr2, *_ = call_llm(
+            r2 = call_llm(
                 "http://127.0.0.1:1234",
                 "test-model",
                 [{"role": "user", "content": "hello"}],
@@ -395,8 +395,8 @@ class TestCacheIntegration:
                 cache=cache,
             )
             assert mock_comp.call_count == 1  # still 1
-            assert fr2 == "stop"
-            assert msg2.content == "Sure, here's the file."
+            assert r2.finish_reason == "stop"
+            assert r2.message.content == "Sure, here's the file."
 
         cache.close()
 

@@ -406,12 +406,13 @@ class TestReplLoop:
         assert kwargs.get("multiline", False) is not True
 
     def test_bottom_toolbar_shows_context_and_tokens(self, tmp_path):
-        """Toolbar shows token spend and context utilization."""
-        from swival.report import ReportCollector
+        """Toolbar shows running token spend and context utilization."""
+        from swival.usage import LlmUsage, SessionUsage
 
-        report = ReportCollector()
-        report.record_llm_call(1, 0.5, 2500, "stop")
-        report.record_llm_call(2, 0.3, 1800, "stop")
+        session_usage = SessionUsage()
+        # 2500 + 1800 = 4300 provider-reported tokens across two calls.
+        session_usage.add(LlmUsage(total_tokens=2500))
+        session_usage.add(LlmUsage(total_tokens=1800))
 
         mock_session = self._mock_session(["/exit"])
 
@@ -427,13 +428,16 @@ class TestReplLoop:
                 [],
                 [],
                 **_loop_kwargs(
-                    tmp_path, max_turns=25, context_length=100, report=report
+                    tmp_path,
+                    max_turns=25,
+                    context_length=100,
+                    session_usage=session_usage,
                 ),
             )
             _, kwargs = mock_cls.call_args
             toolbar_text = "".join(text for _style, text in kwargs["bottom_toolbar"]())
 
-        assert "4k tok" in toolbar_text
+        assert "4.3k tok" in toolbar_text
         assert "ctx 42%" in toolbar_text
 
     def test_bottom_toolbar_shows_only_contextual_state(self, tmp_path):

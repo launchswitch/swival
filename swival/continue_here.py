@@ -243,21 +243,25 @@ def _try_llm_summary(
         {"role": "system", "content": _CONTINUE_SUMMARY_PROMPT},
         {"role": "user", "content": text},
     ]
+    from .usage import LlmCallResult
+
     try:
-        _result = call_llm_fn(
-            base_url=base_url,
-            model_id=model_id,
-            messages=prompt,
-            max_output_tokens=1024,
-            temperature=0,
-            top_p=top_p,
-            seed=seed,
-            tools=None,
-            verbose=False,
-            api_key=api_key,
-            provider=provider,
+        _result = LlmCallResult.normalize(
+            call_llm_fn(
+                base_url=base_url,
+                model_id=model_id,
+                messages=prompt,
+                max_output_tokens=1024,
+                temperature=0,
+                top_p=top_p,
+                seed=seed,
+                tools=None,
+                verbose=False,
+                api_key=api_key,
+                provider=provider,
+            )
         )
-        resp = _result[0]
+        resp = _result.message
         content = resp.content if hasattr(resp, "content") else resp.get("content", "")
         return content if content else None
     except Exception:

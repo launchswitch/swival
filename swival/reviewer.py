@@ -165,33 +165,39 @@ def run_as_reviewer(args, base_dir: str) -> int:
         extra_kwargs = {}
         if secret_shield is not None:
             extra_kwargs["secret_shield"] = secret_shield
-        _llm_result = call_llm(
-            api_base,
-            model_id,
-            messages,
-            args.max_output_tokens,
-            args.temperature,
-            args.top_p,
-            args.seed,
-            None,  # no tools
-            args.verbose,
-            provider=llm_kwargs.get("provider", args.provider),
-            api_key=api_key,
-            user_agent=llm_kwargs.get("user_agent"),
-            max_retries=getattr(args, "retries", 5),
-            aws_profile=llm_kwargs.get("aws_profile"),
-            vertex_project=llm_kwargs.get("vertex_project"),
-            vertex_location=llm_kwargs.get("vertex_location"),
-            **extra_kwargs,
+        from .usage import LlmCallResult
+
+        _llm_result = LlmCallResult.normalize(
+            call_llm(
+                api_base,
+                model_id,
+                messages,
+                args.max_output_tokens,
+                args.temperature,
+                args.top_p,
+                args.seed,
+                None,  # no tools
+                args.verbose,
+                provider=llm_kwargs.get("provider", args.provider),
+                api_key=api_key,
+                user_agent=llm_kwargs.get("user_agent"),
+                max_retries=getattr(args, "retries", 5),
+                aws_profile=llm_kwargs.get("aws_profile"),
+                vertex_project=llm_kwargs.get("vertex_project"),
+                vertex_location=llm_kwargs.get("vertex_location"),
+                **extra_kwargs,
+            )
         )
-        msg = _llm_result[0]
+        msg = _llm_result.message
     except AgentError as e:
         print(f"reviewer error: LLM call failed: {e}", file=sys.stderr)
         if secret_shield is not None:
             secret_shield.destroy()
         return 2
 
-    response_text = msg.content or ""
+    from ._msg import _msg_content
+
+    response_text = _msg_content(msg) or ""
 
     if secret_shield is not None:
         secret_shield.destroy()
