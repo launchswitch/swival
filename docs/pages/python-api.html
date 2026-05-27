@@ -170,6 +170,8 @@ print(answer)
     lifecycle_enabled: bool = True,
     command_middleware: str | None = None,
     aws_profile: str | None = None,
+    project: str | None = None,
+    location: str | None = None,
     approved_buckets: set[str] | None = None,
     metaskills: str = &quot;local&quot;,  # &quot;local&quot;, &quot;all&quot;, or &quot;off&quot;
     repair_truncated_args: bool = True,
@@ -193,7 +195,7 @@ print(answer)
 </tr>
 <tr>
 <td><code>provider</code></td>
-<td>LLM provider: <code>"lmstudio"</code>, <code>"llamacpp"</code>, <code>"huggingface"</code>, <code>"openrouter"</code>, <code>"chatgpt"</code>, <code>"google"</code>, <code>"bedrock"</code>, <code>"generic"</code>, <code>"command"</code>, or a command string.</td>
+<td>LLM provider: <code>"lmstudio"</code>, <code>"llamacpp"</code>, <code>"huggingface"</code>, <code>"openrouter"</code>, <code>"chatgpt"</code>, <code>"google"</code>, <code>"geap"</code> (alias <code>"vertexai"</code>), <code>"bedrock"</code>, <code>"generic"</code>, <code>"command"</code>, or a command string.</td>
 </tr>
 <tr>
 <td><code>model</code></td>
@@ -306,6 +308,14 @@ print(answer)
 <tr>
 <td><code>aws_profile</code></td>
 <td>AWS profile name for the <code>bedrock</code> provider.</td>
+</tr>
+<tr>
+<td><code>project</code></td>
+<td>Google Cloud project ID for the <code>geap</code> provider (Gemini Enterprise Agent Platform / Vertex AI). Also picked up from <code>GOOGLE_CLOUD_PROJECT</code>.</td>
+</tr>
+<tr>
+<td><code>location</code></td>
+<td>Google Cloud region for the <code>geap</code> provider (e.g. <code>us-central1</code>).</td>
 </tr>
 <tr>
 <td><code>approved_buckets</code></td>
