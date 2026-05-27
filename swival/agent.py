@@ -25,7 +25,7 @@ from pathlib import Path
 
 warnings.filterwarnings(
     "ignore",
-    message=".*PydanticSerializationUnexpectedValue.*",
+    message=r"Pydantic serializer warnings",
 )
 
 from importlib import metadata
