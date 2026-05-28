@@ -1346,14 +1346,20 @@ def _needs_reasoning_content(model_id: str, base_url: str | None) -> bool:
     Moonshot (Kimi) rejects tool-calling conversations when assistant
     messages with tool_calls lack reasoning_content; Xiaomi MiMo returns
     a 400 when historical reasoning is missing from any tool-calling
-    assistant turn in the conversation history.
+    assistant turn in the conversation history. DeepSeek V4 thinking
+    models behave the same way; the older deepseek-reasoner tolerates the
+    field either way, so a broad "deepseek" match is safe.
     """
     model_lower = model_id.lower()
-    if "kimi" in model_lower or "mimo" in model_lower:
+    if "kimi" in model_lower or "mimo" in model_lower or "deepseek" in model_lower:
         return True
     if base_url:
         base_lower = base_url.lower()
-        if "moonshot" in base_lower or "xiaomimimo" in base_lower:
+        if (
+            "moonshot" in base_lower
+            or "xiaomimimo" in base_lower
+            or "api.deepseek.com" in base_lower
+        ):
             return True
     return False
 

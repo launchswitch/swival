@@ -3132,6 +3132,76 @@ class TestMimoReasoningContent:
             asst = [m for m in sent if m.get("role") == "assistant"][0]
             assert asst["reasoning_content"] == "I should call f to look up the answer."
 
+    def test_deepseek_detected_by_model_id(self):
+        messages = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc1", "content": "data"},
+        ]
+        with patch("litellm.completion") as mock_comp:
+            mock_comp.return_value = self._mock_response()
+            call_llm(
+                "http://proxy.local/v1",
+                "deepseek-v4-flash",
+                messages,
+                100,
+                None,
+                None,
+                None,
+                None,
+                False,
+                provider="generic",
+                api_key="sk-test",
+            )
+            sent = mock_comp.call_args[1]["messages"]
+            asst = [m for m in sent if m.get("role") == "assistant"][0]
+            assert asst["reasoning_content"] == " "
+
+    def test_deepseek_detected_by_base_url(self):
+        messages = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc1", "content": "data"},
+        ]
+        with patch("litellm.completion") as mock_comp:
+            mock_comp.return_value = self._mock_response()
+            call_llm(
+                "https://api.deepseek.com/v1",
+                "aliased-model",
+                messages,
+                100,
+                None,
+                None,
+                None,
+                None,
+                False,
+                provider="generic",
+                api_key="sk-test",
+            )
+            sent = mock_comp.call_args[1]["messages"]
+            asst = [m for m in sent if m.get("role") == "assistant"][0]
+            assert asst["reasoning_content"] == " "
+
 
 # ---------------------------------------------------------------------------
 # reasoning_content round-trip helpers
