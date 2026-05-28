@@ -6,7 +6,8 @@ expose each open conversation as an ACP session backed by a swival Session.
 
 v1 surface (intentionally narrow):
   - initialize / authenticate (no-op)
-  - session/new
+  - session/new (followed by an available_commands_update advertising the
+    slash commands this agent supports)
   - session/prompt (request-response, returns when the turn ends; a prompt
     that begins with a slash or bang command runs that command, the same as
     the REPL would)
@@ -38,6 +39,8 @@ from .acp_types import (
     ERROR_PARSE,
     ERROR_SESSION_NOT_FOUND,
     UnsupportedContentBlockError,
+    acp_command_descriptors,
+    available_commands_update,
     METHOD_AUTHENTICATE,
     METHOD_INITIALIZE,
     METHOD_SESSION_CANCEL,
@@ -344,6 +347,19 @@ class AcpServer:
             cancel_flag=cancel_flag,
         )
         await self._send(make_result(request_id, {"sessionId": session_id}))
+        await self._announce_commands(session_id)
+
+    async def _announce_commands(self, session_id: str) -> None:
+        """Tell the client which slash commands this session supports."""
+        commands = acp_command_descriptors()
+        if not commands:
+            return
+        await self._send(
+            make_notification(
+                METHOD_SESSION_UPDATE,
+                session_update_payload(session_id, available_commands_update(commands)),
+            )
+        )
 
     async def _handle_session_prompt(self, request_id, params: dict) -> None:
         session_id = params.get("sessionId")

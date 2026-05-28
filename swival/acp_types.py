@@ -42,6 +42,7 @@ UPDATE_TOOL_CALL = "tool_call"
 UPDATE_TOOL_CALL_UPDATE = "tool_call_update"
 UPDATE_PLAN = "plan"
 UPDATE_USER_MESSAGE_CHUNK = "user_message_chunk"
+UPDATE_AVAILABLE_COMMANDS = "available_commands_update"
 
 
 TOOL_STATUS_PENDING = "pending"
@@ -259,6 +260,44 @@ def initialize_response(*, protocol_version: int = PROTOCOL_VERSION) -> dict:
 def session_update_payload(session_id: str, update: dict) -> dict:
     """Wrap an update body in the {sessionId, update} envelope."""
     return {"sessionId": session_id, "update": update}
+
+
+def available_commands_update(commands: list[dict]) -> dict:
+    """An available_commands_update update body advertising slash commands."""
+    return {
+        "sessionUpdate": UPDATE_AVAILABLE_COMMANDS,
+        "availableCommands": commands,
+    }
+
+
+def acp_command_descriptors() -> list[dict]:
+    """Build ACP AvailableCommand objects from the shared command registry.
+
+    Advertises the slash commands that behave sensibly over ACP, where a
+    session is persistent and multi-turn and every command runs through the
+    REPL executor. Commands tied to the interactive REPL itself are left out
+    via the registry's ``acp`` flag: the ``!!`` shell escape, the flow-control
+    exit/quit/copy commands, and the background-loop family (whose loop
+    registry is not wired up on the ACP path).
+
+    Names drop the leading slash to match the ACP convention: the client
+    re-adds it and sends the command back as ordinary session/prompt text.
+    """
+    from .input_commands import INPUT_COMMANDS
+
+    out: list[dict] = []
+    for cmd in sorted(INPUT_COMMANDS):
+        info = INPUT_COMMANDS[cmd]
+        if not info.acp or not cmd.startswith("/") or "repl" not in info.modes:
+            continue
+        descriptor: dict[str, Any] = {
+            "name": cmd[1:],
+            "description": info.desc,
+        }
+        if info.arg:
+            descriptor["input"] = {"hint": info.arg}
+        out.append(descriptor)
+    return out
 
 
 def text_chunk_update(text: str) -> dict:

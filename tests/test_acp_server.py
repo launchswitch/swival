@@ -272,6 +272,27 @@ class TestSessionNew:
         _run(server._handle_session_new(1, {"cwd": str(tmp_path), "mcpServers": []}))
         assert "result" in captured[0]
 
+    def test_advertises_commands_after_result(self, server, fake_session_cls, tmp_path):
+        server._initialized = True
+        captured = _attach_capture(server)
+        _run(server._handle_session_new(1, {"cwd": str(tmp_path), "mcpServers": []}))
+
+        # The session/new result comes first, then the command advertisement.
+        assert len(captured) >= 2
+        assert captured[0]["id"] == 1
+        sid = captured[0]["result"]["sessionId"]
+        notif = captured[1]
+        assert notif["method"] == METHOD_SESSION_UPDATE
+        assert notif["params"]["sessionId"] == sid
+        update = notif["params"]["update"]
+        assert update["sessionUpdate"] == "available_commands_update"
+        names = {c["name"] for c in update["availableCommands"]}
+        # A representative useful command is present; names carry no slash.
+        assert "help" in names
+        assert all(not n.startswith("/") for n in names)
+        # REPL-only commands are not advertised.
+        assert names.isdisjoint({"exit", "quit", "copy", "loop", "loops", "unloop"})
+
 
 def sid_count(server) -> int:
     return len(server._sessions)
@@ -314,7 +335,7 @@ class TestSessionPrompt:
             await server._handle_session_new(
                 1, {"cwd": str(tmp_path), "mcpServers": []}
             )
-            sid = captured[-1]["result"]["sessionId"]
+            sid = captured[0]["result"]["sessionId"]
             return sid
 
         sid = _run(boot())
@@ -546,7 +567,7 @@ class TestCancellation:
             await server._handle_session_new(
                 1, {"cwd": str(tmp_path), "mcpServers": []}
             )
-            sid = captured[-1]["result"]["sessionId"]
+            sid = captured[0]["result"]["sessionId"]
             captured.clear()
             fake = fake_session_cls["last"]
             fake.script([], answer="never", delay_sec=2.0, honor_cancel=True)
@@ -605,7 +626,7 @@ class TestStdoutDiscipline:
             await server._handle_session_new(
                 1, {"cwd": str(tmp_path), "mcpServers": []}
             )
-            sid = json.loads(captured_bytes[-1].decode("utf-8"))["result"]["sessionId"]
+            sid = json.loads(captured_bytes[0].decode("utf-8"))["result"]["sessionId"]
             fake_session_cls["last"].script(
                 [(EVENT_TEXT_CHUNK, {"text": "hi", "turn": 1})], answer="hi"
             )

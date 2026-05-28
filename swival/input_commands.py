@@ -12,6 +12,7 @@ class CommandInfo(NamedTuple):
     kind: str = "state_change"
     modes: tuple[str, ...] = ("repl", "oneshot")
     options: tuple[tuple[str, str], ...] | None = None
+    acp: bool = True
 
 
 INPUT_COMMANDS: dict[str, CommandInfo] = {
@@ -20,6 +21,7 @@ INPUT_COMMANDS: dict[str, CommandInfo] = {
         arg="<command>",
         kind="state_change",
         modes=("repl",),
+        acp=False,
     ),
     "/audit": CommandInfo(
         desc="Run a staged security audit over tracked committed code",
@@ -84,10 +86,12 @@ INPUT_COMMANDS: dict[str, CommandInfo] = {
         desc="Copy last output to clipboard",
         kind="flow_control",
         modes=("repl",),
+        acp=False,
     ),
     "/exit": CommandInfo(
         desc="Exit the REPL",
         kind="flow_control",
+        acp=False,
     ),
     "/extend": CommandInfo(
         desc="Double max turns, or set to N",
@@ -117,17 +121,20 @@ INPUT_COMMANDS: dict[str, CommandInfo] = {
         arg="[interval] <prompt>",
         kind="agent_turn",
         modes=("repl", "oneshot"),
+        acp=False,
     ),
     "/loops": CommandInfo(
         desc="List active background loops (REPL only)",
         kind="info",
         modes=("repl",),
+        acp=False,
     ),
     "/unloop": CommandInfo(
         desc="Cancel a background loop by id, or 'all'",
         arg="<id|all>",
         kind="state_change",
         modes=("repl",),
+        acp=False,
     ),
     "/new": CommandInfo(
         desc="Reset conversation to initial state",
@@ -141,6 +148,7 @@ INPUT_COMMANDS: dict[str, CommandInfo] = {
     "/quit": CommandInfo(
         desc="Exit the REPL",
         kind="flow_control",
+        acp=False,
     ),
     "/remember": CommandInfo(
         desc="Add a durable project fact to AGENTS.md",
