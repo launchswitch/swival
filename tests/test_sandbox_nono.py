@@ -397,6 +397,26 @@ class TestMaybeReexec:
         maybe_reexec(sandbox="nono", base_dir=str(tmp_path), add_dirs=[])
         assert len(called) == 1
 
+    def test_reexec_grants_geap_gcloud_credentials(self, tmp_path, monkeypatch):
+        """geap re-exec must pass the gcloud credential dir through as a --read grant."""
+        _clear_sandboxed(monkeypatch)
+        _mock_nono_script(tmp_path)
+        monkeypatch.setenv("PATH", str(tmp_path))
+        monkeypatch.setattr(sys, "argv", ["swival", "task"])
+        gcloud = tmp_path / "gcloud"
+        gcloud.mkdir()
+        monkeypatch.setenv("CLOUDSDK_CONFIG", str(gcloud))
+        monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+
+        captured = {}
+        monkeypatch.setattr(os, "execvpe", lambda f, a, e: captured.update(args=a))
+        maybe_reexec(
+            sandbox="nono", base_dir=str(tmp_path), add_dirs=[], provider="geap"
+        )
+        argv = captured["args"]
+        reads = {argv[i + 1] for i, a in enumerate(argv) if a == "--read"}
+        assert str(gcloud.resolve()) in reads
+
 
 # ===========================================================================
 # External wrapping: nono marker present, Swival marker absent
