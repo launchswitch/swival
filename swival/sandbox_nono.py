@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from .report import ConfigError
@@ -128,6 +129,36 @@ def _runtime_read_paths() -> list[str]:
     return paths
 
 
+def writable_temp_dirs() -> list[str]:
+    """Return the platform temporary directories to grant read+write inside nono.
+
+    Tools routinely scratch in the system temp directory: compilers, package
+    managers, and Swival's own large-output spool all expect it to be writable.
+    The built-in nono ``swival`` profile does not cover it, so without an
+    explicit grant those tools fail the moment they touch ``/tmp``.
+
+    ``tempfile.gettempdir()`` honours ``$TMPDIR`` and is the canonical answer
+    per platform.  On macOS that resolves to a per-user ``/var/folders/...``
+    path, but plenty of tools hardcode ``/tmp`` regardless, so we add it too
+    whenever it exists and differs from the resolved temp dir.
+    """
+    paths: list[str] = []
+    seen: set[str] = set()
+
+    def _add(p: "str | Path | None") -> None:
+        if not p:
+            return
+        resolved = str(Path(p).resolve())
+        if resolved not in seen:
+            seen.add(resolved)
+            paths.append(resolved)
+
+    _add(tempfile.gettempdir())
+    if os.path.isdir("/tmp"):
+        _add("/tmp")
+    return paths
+
+
 def provider_state_dirs(provider: str | None) -> list[str]:
     """Return writable directories a provider needs for its credentials/state.
 
@@ -184,16 +215,18 @@ def build_nono_argv(
 
     The writable base directory is granted with ``--allow`` (read+write,
     recursive).  Extra ``--add-dir`` entries map to additional ``--allow``
-    grants.  When no profile is requested, the built-in ``swival`` profile is
-    applied so the Python runtime and Swival's config/state directories are
-    reachable inside the sandbox.
+    grants.  The platform temporary directory is always granted so tools that
+    scratch in ``/tmp`` keep working.  When no profile is requested, the
+    built-in ``swival`` profile is applied so the Python runtime and Swival's
+    config/state directories are reachable inside the sandbox.
     """
     argv = [nono_bin, "run"]
 
     resolved_base = str(Path(base_dir).resolve())
     argv.extend(["--allow", resolved_base])
 
-    for d in list(add_dirs) + list(extra_allow_dirs or []):
+    allow_dirs = list(add_dirs) + list(extra_allow_dirs or []) + writable_temp_dirs()
+    for d in allow_dirs:
         resolved = str(Path(d).expanduser().resolve())
         argv.extend(["--allow", resolved])
 

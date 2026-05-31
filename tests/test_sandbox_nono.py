@@ -3,6 +3,7 @@
 import os
 import stat
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -23,6 +24,7 @@ from swival.sandbox_nono import (
     probe_nono,
     provider_state_dirs,
     rollback_hint,
+    writable_temp_dirs,
 )
 
 
@@ -237,6 +239,17 @@ class TestBuildArgv:
         )
         allow_paths = [argv[i + 1] for i, v in enumerate(argv) if v == "--allow"]
         assert str(d.resolve()) in allow_paths
+
+    def test_temp_dir_becomes_allow(self, tmp_path):
+        argv = build_nono_argv(
+            nono_bin="nono",
+            base_dir=str(tmp_path),
+            add_dirs=[],
+            swival_argv=["swival"],
+        )
+        allow_paths = [argv[i + 1] for i, v in enumerate(argv) if v == "--allow"]
+        for d in writable_temp_dirs():
+            assert d in allow_paths
 
     def test_rollback_and_block_net(self, tmp_path):
         argv = build_nono_argv(
@@ -467,3 +480,24 @@ class TestProviderStateDirs:
         monkeypatch.setenv("CHATGPT_TOKEN_DIR", str(token_dir))
         dirs = provider_state_dirs("chatgpt")
         assert dirs == [str(token_dir.parent)]
+
+
+class TestWritableTempDirs:
+    def test_includes_system_temp_dir(self):
+        import tempfile
+
+        dirs = writable_temp_dirs()
+        assert str(Path(tempfile.gettempdir()).resolve()) in dirs
+
+    def test_honours_gettempdir(self, monkeypatch, tmp_path):
+        import swival.sandbox_nono as mod
+
+        custom = tmp_path / "scratch"
+        custom.mkdir()
+        monkeypatch.setattr(mod.tempfile, "gettempdir", lambda: str(custom))
+        dirs = writable_temp_dirs()
+        assert str(custom.resolve()) in dirs
+
+    def test_no_duplicates(self):
+        dirs = writable_temp_dirs()
+        assert len(dirs) == len(set(dirs))
