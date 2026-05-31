@@ -22,6 +22,7 @@ from swival.sandbox_nono import (
     is_sandboxed,
     maybe_reexec,
     probe_nono,
+    provider_credential_read_dirs,
     provider_state_dirs,
     rollback_hint,
     writable_temp_dirs,
@@ -480,6 +481,66 @@ class TestProviderStateDirs:
         monkeypatch.setenv("CHATGPT_TOKEN_DIR", str(token_dir))
         dirs = provider_state_dirs("chatgpt")
         assert dirs == [str(token_dir.parent)]
+
+
+class TestProviderCredentialReadDirs:
+    def test_plain_provider_has_none(self, monkeypatch):
+        monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+        assert provider_credential_read_dirs("lmstudio") == []
+        assert provider_credential_read_dirs("chatgpt") == []
+        assert provider_credential_read_dirs(None) == []
+
+    def test_geap_grants_gcloud_config(self, monkeypatch):
+        monkeypatch.delenv("CLOUDSDK_CONFIG", raising=False)
+        monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+        dirs = provider_credential_read_dirs("geap")
+        assert dirs == [str(Path("~/.config/gcloud").expanduser().resolve())]
+
+    def test_vertexai_alias_grants_gcloud_config(self, monkeypatch):
+        monkeypatch.delenv("CLOUDSDK_CONFIG", raising=False)
+        monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+        dirs = provider_credential_read_dirs("vertexai")
+        assert dirs == [str(Path("~/.config/gcloud").expanduser().resolve())]
+
+    def test_geap_honours_cloudsdk_config(self, monkeypatch, tmp_path):
+        custom = tmp_path / "gcloud"
+        custom.mkdir()
+        monkeypatch.setenv("CLOUDSDK_CONFIG", str(custom))
+        monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+        dirs = provider_credential_read_dirs("geap")
+        assert dirs == [str(custom.resolve())]
+
+    def test_geap_adds_service_account_key_parent(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("CLOUDSDK_CONFIG", raising=False)
+        key = tmp_path / "creds" / "sa.json"
+        key.parent.mkdir()
+        key.write_text("{}")
+        monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(key))
+        dirs = provider_credential_read_dirs("geap")
+        assert str(key.parent.resolve()) in dirs
+
+    def test_bedrock_grants_aws_dir(self, monkeypatch):
+        monkeypatch.delenv("AWS_SHARED_CREDENTIALS_FILE", raising=False)
+        monkeypatch.delenv("AWS_CONFIG_FILE", raising=False)
+        dirs = provider_credential_read_dirs("bedrock")
+        assert dirs == [str(Path("~/.aws").expanduser().resolve())]
+
+    def test_bedrock_honours_credential_file_envs(self, monkeypatch, tmp_path):
+        creds = tmp_path / "awsdir" / "credentials"
+        config = tmp_path / "awscfg" / "config"
+        creds.parent.mkdir()
+        config.parent.mkdir()
+        monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(creds))
+        monkeypatch.setenv("AWS_CONFIG_FILE", str(config))
+        dirs = provider_credential_read_dirs("bedrock")
+        assert str(creds.parent.resolve()) in dirs
+        assert str(config.parent.resolve()) in dirs
+
+    def test_no_duplicates(self, monkeypatch):
+        monkeypatch.delenv("CLOUDSDK_CONFIG", raising=False)
+        monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+        dirs = provider_credential_read_dirs("geap")
+        assert len(dirs) == len(set(dirs))
 
 
 class TestWritableTempDirs:

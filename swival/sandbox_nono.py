@@ -176,6 +176,45 @@ def provider_state_dirs(provider: str | None) -> list[str]:
     return []
 
 
+def provider_credential_read_dirs(provider: str | None) -> list[str]:
+    """Return read-only directories holding a provider's login credentials.
+
+    Some providers authenticate against credential files that the built-in nono
+    ``swival`` profile denies.  Unlike ``provider_state_dirs``, these are granted
+    read-only: the provider reads a long-lived credential from disk and exchanges
+    it for a short-lived access token over the network, so it never writes the
+    file back from inside the sandbox.
+
+    - ``geap``/``vertexai`` (Vertex AI): litellm's vertex path loads Application
+      Default Credentials from ``~/.config/gcloud`` (``CLOUDSDK_CONFIG`` relocates
+      that directory).  ``GOOGLE_APPLICATION_CREDENTIALS`` may point a service
+      account key anywhere, so its parent is granted too when set.
+    - ``bedrock`` (AWS): boto3 reads credentials and config from ``~/.aws``.
+      ``AWS_SHARED_CREDENTIALS_FILE`` and ``AWS_CONFIG_FILE`` relocate those
+      files, so their parents are granted when set.
+    """
+    dirs: list[str] = []
+    seen: set[str] = set()
+
+    if provider in ("geap", "vertexai"):
+        _append_resolved_unique(
+            dirs,
+            seen,
+            os.path.expanduser(os.environ.get("CLOUDSDK_CONFIG") or "~/.config/gcloud"),
+        )
+        adc = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+        if adc:
+            _append_resolved_unique(dirs, seen, Path(adc).expanduser().parent)
+    elif provider == "bedrock":
+        _append_resolved_unique(dirs, seen, os.path.expanduser("~/.aws"))
+        for env in ("AWS_SHARED_CREDENTIALS_FILE", "AWS_CONFIG_FILE"):
+            val = os.environ.get(env)
+            if val:
+                _append_resolved_unique(dirs, seen, Path(val).expanduser().parent)
+
+    return dirs
+
+
 def get_nono_version() -> str | None:
     """Return the nono version if running inside a nono sandbox.
 
@@ -297,7 +336,7 @@ def maybe_reexec(
         network_profile=network_profile,
         credential=credential,
         audit_integrity=audit_integrity,
-        read_dirs=_runtime_read_paths(),
+        read_dirs=_runtime_read_paths() + provider_credential_read_dirs(provider),
         extra_allow_dirs=provider_state_dirs(provider),
         swival_argv=child_argv,
     )
