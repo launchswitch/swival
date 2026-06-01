@@ -130,7 +130,7 @@ export OPENROUTER_API_KEY=sk_or_your_token_here
 Then pass the model you want to use. OpenRouter has both free and paid tiers.
 
 ```sh
-swival "Hello world" --provider openrouter --model z-ai/glm-5
+swival "Hello world" --provider openrouter --model z-ai/glm-5.1
 ```
 
 OpenRouter models vary widely in context limits, so you should set `--max-context-tokens` to match the model you chose. Without it, Swival falls back to a conservative default that may not use the full window your model supports.
@@ -138,7 +138,7 @@ OpenRouter models vary widely in context limits, so you should set `--max-contex
 ```sh
 swival "Hello world" \
     --provider openrouter \
-    --model z-ai/glm-5 \
+    --model z-ai/glm-5.1 \
     --max-context-tokens 131072
 ```
 

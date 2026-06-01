@@ -116,7 +116,7 @@ reasoning_effort = "high"
 
 [profiles.router-main]
 provider = "openrouter"
-model = "z-ai/glm-5"
+model = "z-ai/glm-5.1"
 max_context_tokens = 131072
 
 [profiles.ollama]
@@ -184,7 +184,7 @@ Profiles defined in global config and project config merge per-key for the same 
 # In global config: defines the base profile
 [profiles.shared]
 provider = "openrouter"
-model = "z-ai/glm-5"
+model = "z-ai/glm-5.1"
 max_context_tokens = 131072
 
 # In project swival.toml: overrides just the model
