@@ -3125,6 +3125,28 @@ def _post_tool_bookkeeping(
     return interventions
 
 
+_COMMAND_LABEL_MAX = 140
+
+
+def _command_label(command) -> str:
+    """Render a command-tool argument into a single-line spinner label."""
+    try:
+        if isinstance(command, (list, tuple)):
+            text = shlex.join(str(part) for part in command)
+        elif isinstance(command, str):
+            text = command
+        else:
+            text = ""
+    except Exception:
+        text = ""
+    text = " ".join(text.split())
+    if not text:
+        return "command"
+    if len(text) > _COMMAND_LABEL_MAX:
+        text = text[: _COMMAND_LABEL_MAX - 1] + "…"
+    return text
+
+
 def handle_tool_call(
     tool_call,
     base_dir,
@@ -3209,42 +3231,58 @@ def handle_tool_call(
             },
         )
 
+    _is_cmd = name in ("run_command", "run_shell_command")
+    _args_ok = isinstance(parsed_args, dict)
+    _background = bool(parsed_args.get("background")) if _args_ok else False
+    _show_spinner = _is_cmd and verbose and not is_subagent and not _background
+    _command = parsed_args.get("command") if _args_ok else None
+    # Rich allows only one active live display; this is safe because the LLM
+    # spinner has stopped before dispatch begins and subagents are excluded.
+    spinner_cm = (
+        fmt.command_spinner(_command_label(_command))
+        if _show_spinner
+        else nullcontext()
+    )
+
     t0 = time.monotonic()
     try:
-        result = dispatch(
-            name,
-            parsed_args,
-            base_dir,
-            thinking_state=thinking_state,
-            todo_state=todo_state,
-            snapshot_state=snapshot_state,
-            goal_state=goal_state,
-            resolved_commands=resolved_commands or {},
-            skills_catalog=skills_catalog or {},
-            skill_read_roots=skill_read_roots if skill_read_roots is not None else [],
-            extra_write_roots=extra_write_roots
-            if extra_write_roots is not None
-            else [],
-            files_mode=files_mode,
-            commands_unrestricted=commands_unrestricted,
-            shell_allowed=shell_allowed,
-            file_tracker=file_tracker,
-            tool_call_id=tool_call.id,
-            mcp_manager=mcp_manager,
-            a2a_manager=a2a_manager,
-            messages=messages,
-            verbose=verbose,
-            image_stash=image_stash,
-            scratch_dir=scratch_dir,
-            subagent_manager=subagent_manager,
-            command_policy=command_policy,
-            command_middleware=command_middleware,
-            is_subagent=is_subagent,
-            report=report,
-            metaskill_loop_kwargs=metaskill_loop_kwargs,
-            cancel_flag=cancel_flag,
-            enabled_metaskills=enabled_metaskills,
-        )
+        with spinner_cm:
+            result = dispatch(
+                name,
+                parsed_args,
+                base_dir,
+                thinking_state=thinking_state,
+                todo_state=todo_state,
+                snapshot_state=snapshot_state,
+                goal_state=goal_state,
+                resolved_commands=resolved_commands or {},
+                skills_catalog=skills_catalog or {},
+                skill_read_roots=skill_read_roots
+                if skill_read_roots is not None
+                else [],
+                extra_write_roots=extra_write_roots
+                if extra_write_roots is not None
+                else [],
+                files_mode=files_mode,
+                commands_unrestricted=commands_unrestricted,
+                shell_allowed=shell_allowed,
+                file_tracker=file_tracker,
+                tool_call_id=tool_call.id,
+                mcp_manager=mcp_manager,
+                a2a_manager=a2a_manager,
+                messages=messages,
+                verbose=verbose,
+                image_stash=image_stash,
+                scratch_dir=scratch_dir,
+                subagent_manager=subagent_manager,
+                command_policy=command_policy,
+                command_middleware=command_middleware,
+                is_subagent=is_subagent,
+                report=report,
+                metaskill_loop_kwargs=metaskill_loop_kwargs,
+                cancel_flag=cancel_flag,
+                enabled_metaskills=enabled_metaskills,
+            )
     except McpShutdownError:
         result = "error: MCP server is shutting down"
     except A2aShutdownError:

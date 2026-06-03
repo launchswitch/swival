@@ -74,6 +74,43 @@ class TestLlmSpinner:
         assert "Custom label" in buf.getvalue()
 
 
+class TestCommandSpinner:
+    def test_no_output_when_not_terminal(self):
+        buf = StringIO()
+        old = fmt._console
+        fmt._console = Console(file=buf, no_color=True, width=80)
+        try:
+            with fmt.command_spinner("git status"):
+                pass
+        finally:
+            fmt._console = old
+        assert buf.getvalue() == ""
+
+    def test_label_shown_on_terminal(self):
+        buf = StringIO()
+        old = fmt._console
+        fmt._console = _styled_console(buf)
+        try:
+            with fmt.command_spinner("git status"):
+                pass
+        finally:
+            fmt._console = old
+        out = buf.getvalue()
+        assert "Running" in out
+        assert "git status" in out
+
+    def test_yields_dismiss_callable_when_not_terminal(self):
+        buf = StringIO()
+        old = fmt._console
+        fmt._console = Console(file=buf, no_color=True, width=80)
+        try:
+            with fmt.command_spinner("ls") as dismiss:
+                assert callable(dismiss)
+                dismiss()
+        finally:
+            fmt._console = old
+
+
 class TestInputMarquee:
     def test_short_prompt_fills_line_width(self):
         line = fmt._input_marquee_text("yo", offset=0, width=40)

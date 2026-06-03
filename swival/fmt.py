@@ -190,6 +190,48 @@ def llm_spinner(label: str = "Thinking"):
         dismiss()
 
 
+@contextlib.contextmanager
+def command_spinner(label: str):
+    """Steady spinner on stderr while a shell command runs.
+
+    Transient: the line is wiped on exit so the command's captured output
+    prints cleanly afterwards. No-op when stderr is not a terminal. Yields a
+    ``dismiss()`` callable that early-stops the display.
+
+    Unlike :func:`llm_spinner`, no animation thread is needed: an active
+    ``Progress`` self-refreshes its spinner and elapsed timer. Only one Rich
+    live display may be active at a time, so callers must not start this while
+    another live display (e.g. the LLM spinner) is running.
+    """
+    if not _console.is_terminal:
+        yield _noop
+        return
+
+    progress = Progress(
+        SpinnerColumn("dots", style="cyan", speed=1.5),
+        TextColumn("  Running {task.description}"),
+        TimeElapsedColumn(),
+        console=_console,
+        transient=True,
+        refresh_per_second=12,
+    )
+
+    dismissed = threading.Event()
+    progress.start()
+    progress.add_task(escape(label or "command"), total=None)
+
+    def dismiss() -> None:
+        if dismissed.is_set():
+            return
+        dismissed.set()
+        progress.stop()
+
+    try:
+        yield dismiss
+    finally:
+        dismiss()
+
+
 _INPUT_MARQUEE_PREFIX = "  > "
 _INPUT_MARQUEE_SEPARATOR = "   ·   "
 
