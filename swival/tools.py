@@ -667,7 +667,7 @@ RUN_COMMAND_TOOL = {
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Timeout in seconds (1-120). Defaults to 30.",
+                    "description": "Timeout in seconds (1-240). Defaults to 30.",
                     "default": 30,
                 },
                 "background": {
@@ -701,7 +701,7 @@ RUN_SHELL_COMMAND_TOOL = {
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Timeout in seconds (1-120). Defaults to 30.",
+                    "description": "Timeout in seconds (1-240). Defaults to 30.",
                     "default": 30,
                 },
                 "background": {
@@ -2268,7 +2268,7 @@ LARGE_OUTPUT_PREVIEW_LINES = 50  # max lines in inline preview
 LARGE_OUTPUT_PREVIEW_BYTES = 2048  # max bytes in inline preview body
 SWIVAL_DIR = ".swival"
 OUTPUT_FILE_TTL = 600  # seconds before temp file cleanup
-MAX_TIMEOUT = 120
+MAX_TIMEOUT = 240
 
 
 def cleanup_old_cmd_outputs(base_dir: str) -> int:

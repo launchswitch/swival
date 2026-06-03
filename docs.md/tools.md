@@ -117,7 +117,7 @@ swival --commands ask "Run the tests"
 
 In ask mode, Swival prompts before each new command bucket. Interpreter inline-code flags (`bash -c`, `python3 -c`, `node -e`, `bun -e`) are classified as separate high-risk buckets distinct from the plain interpreter name, so approving `bash` to run scripts does not also approve `bash -c` for arbitrary code. See [Safety and Sandboxing](safety-and-sandboxing.md#ask-mode) for details.
 
-Timeout defaults to 30 seconds and is clamped to a maximum of 120 seconds. Inline command output is capped at 10 KB. Larger output is written to `.swival/cmd_output_*.txt` and hard-capped at 1 MB before writing to disk. Those files are cleaned up automatically after roughly ten minutes.
+Timeout defaults to 30 seconds and is clamped to a maximum of 240 seconds. Inline command output is capped at 10 KB. Larger output is written to `.swival/cmd_output_*.txt` and hard-capped at 1 MB before writing to disk. Those files are cleaned up automatically after roughly ten minutes.
 
 ## `run_shell_command`
 
