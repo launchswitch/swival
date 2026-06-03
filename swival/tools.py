@@ -2271,6 +2271,14 @@ OUTPUT_FILE_TTL = 600  # seconds before temp file cleanup
 MAX_TIMEOUT = 240
 
 
+def clamp_timeout(value, default: int = 30) -> int:
+    """Clamp a command timeout to the [1, MAX_TIMEOUT] range, with a fallback."""
+    try:
+        return max(1, min(int(value), MAX_TIMEOUT))
+    except (TypeError, ValueError):
+        return default
+
+
 def cleanup_old_cmd_outputs(base_dir: str) -> int:
     """Remove cmd_output_* files older than OUTPUT_FILE_TTL from .swival/.
 
@@ -2791,7 +2799,7 @@ def _run_shell_command(
     if _CD_ROOT_RE.search(command):
         return _CD_ROOT_ERROR.format(base_dir=base_dir)
 
-    timeout = max(1, min(timeout, MAX_TIMEOUT))
+    timeout = clamp_timeout(timeout)
 
     if sys.platform == "win32":
         shell_cmd = ["cmd.exe", "/c", command]
@@ -2971,7 +2979,7 @@ def _run_argv_command(
             allowed = ", ".join(sorted(resolved_commands)) or "(none)"
             return f"error: command {cmd_name!r} is not allowed. Allowed commands: {allowed}"
 
-    timeout = max(1, min(timeout, MAX_TIMEOUT))
+    timeout = clamp_timeout(timeout)
 
     if background:
         try:
