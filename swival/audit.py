@@ -1914,6 +1914,11 @@ Security review lenses to consider. These are hints, not sufficient reasons to e
 - business_logic
 - cross_component_contracts
 - sandbox_escapes
+- state_amplification_dos: compact encoded/referenced/streamed input, including
+  parse/decode loops that append or materialize one object per unit, creates
+  disproportionate decoded objects, retained state, refcounts, queued work, or
+  pre-rejection work because limits count bytes/frames, check too late, or
+  there is no decoded-unit cap
 - taxonomy_free_unknowns_with_security_impact
 
 You have no tools, no shell access, and no ability to run commands.
@@ -2019,6 +2024,8 @@ Severity (anchor to the target's deployment surface, not worst case):
 
 For CLI tools, libraries, and local-only services, bugs only triggerable by the user running them are rarely high or critical. Tie-break downward. The security_control_failure carve-out below forces high or critical and overrides this when it applies.
 
+For state-amplification DoS, default to medium unless the evidence shows unrecoverable process/service exhaustion, cross-tenant impact, or amplified state that persists after the attacker-controlled connection/request closes.
+
 Worked example:
 
 {_PHASE3A_WORKED_EXAMPLE}
@@ -2042,6 +2049,14 @@ Rules:
   caches, namespace or capability confusion, protocol desynchronization,
   downgrade paths, and privilege-boundary mistakes. Do not stop at common
   checklist categories.
+- For denial-of-service candidates, actively inspect parse/decode loops where
+  one attacker-controlled encoded/referenced/streamed unit appends or
+  materializes one server object or unit of work. Do not dismiss because encoded
+  bytes or frames are bounded; ask whether decoded-item count, materialized
+  object count, or pre-rejection work is capped before creation.
+- For this class, source evidence of unbounded per-unit materialization before
+  such a cap is enough to emit a medium candidate; Phase 3B/4 will validate
+  practicality.
 
 Scope gate — apply to every candidate finding before emitting it:
 
@@ -2067,6 +2082,8 @@ Explicitly out of scope — emit nothing for these even when the bug is real:
 - protocol-framing, short-write, or partial-IO bugs whose only effect is local correctness within the same trust domain
 - DoS that requires an admin or operator to author the malicious config, regex, or input
 - defense-in-depth: "an additional check would be safer", "this should also validate X", "this could leak in some other deployment", "redundant guard missing"
+
+Resource-lifetime findings are in scope only when the untrusted actor controls the resource creation and the delay/release condition; cleanup-only bugs without that trigger remain out of scope.
 
 Only report bugs where the structured fields specifically answer attacker / trigger / gain — for example "unauthenticated open redirect on failed form auth" or "out-of-bounds read on attacker-supplied trailing CR" — or where the security_control_failure carve-out lets the cited function's own job (an Ed25519 verifier, a seccomp policy enforcer) supply the security context.
 
@@ -2193,6 +2210,15 @@ Rules:
   whose closest plain-English fit would be "logic error", "data integrity",
   "error handling", "resource lifecycle", or "invariant violation"; if the bug
   matches one of those without further security framing, it is out of scope.
+- For a denial-of-service finding where attacker-cheap encoded, referenced,
+  streamed, or deferred input creates disproportionate decoded, materialized,
+  or retained state, keep `type: denial of service` and make the proof carry
+  this five-fact ledger:
+  - unit: attacker-controlled compact action or input
+  - resource: server state/work created per unit
+  - limit: existing bound that appears relevant, or no decoded-unit cap visible
+  - gap: dimension the bound misses or checks too late
+  - timing: whether work happens before rejection or remains live afterward
 
 `security_control_failure` rules — apply only when the cited code itself
 implements a named security control:
@@ -2249,6 +2275,7 @@ Rules:
   - You must be able to name an untrusted actor (remote client, malicious peer, attacker-controlled file or backend, lower-privileged local user) who controls the trigger. If the only way to reach the bug is through an admin, operator, or otherwise trusted process authoring the malicious config, regex, or input, the finding is out of scope.
   - You must be able to name a security-relevant outcome from this list: denial of service triggered by attacker-controlled input, information disclosure, integrity bypass an attacker can weaponize (smuggling, cache poisoning, log/header injection, auth desync), authentication or authorization bypass, privilege escalation, arbitrary code/command execution, or repudiation. "The function returns success when it should not", "the protocol can desync between two trusted endpoints", "a worker thread hangs at shutdown", and "a missed wakeup leaves a producer asleep" are not security-relevant outcomes on their own.
   - Generic correctness, contract, robustness, error-handling, resource-lifecycle, missed-wakeup, partial-IO, or invariant-violation bugs without an untrusted trigger AND a concrete attacker gain must be rejected as NOTREPRODUCED. Reproducibility of the bug behavior is not enough; the security impact must also reproduce.
+- For a denial-of-service finding whose proof presents a state-amplification five-fact ledger, accept only when source evidence or a bounded PoC proves that ledger and practical DoS. Do not require OOMing the machine.
 - Narrow exception — `security_control_failure` findings: a high or critical, deterministic logic bug **inside code that itself implements a named security control** is in scope even when the attacker is implicit. Verify these claims, in order, before accepting:
   1. The cited function or module **is itself the security control** named in the proof — a signature/MAC verifier, an authentication check, an authorization decision, a sandbox or seccomp boundary, an access-control filter, a crypto primitive, or a parser whose declared purpose is accepting hostile input. Not "called from a security path", not "handles untrusted data on the way somewhere else".
   2. The proof names that specific control by purpose. Generic phrases like "validation", "input handling", or "the parser" do not satisfy this — reject as NOTREPRODUCED.
@@ -2284,6 +2311,7 @@ Rules:
 - Confidence must be certain.
 - Provenance must include a link to the Swival.dev Security Scanner URL: {provenance_url}
 - Residual Risk must be `None` unless a narrow evidence-based concern remains.
+- For a denial-of-service finding whose proof presents a state-amplification five-fact ledger, the Proof or Why This Is A Real Bug section must explain it.
 - Be terse, factual, and evidence-driven."""
 
 # ---------------------------------------------------------------------------

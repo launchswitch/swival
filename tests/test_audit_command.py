@@ -2106,6 +2106,174 @@ class TestPhase3bExpansion:
 
 
 # ---------------------------------------------------------------------------
+# State-amplification DoS lens (prompt wording + parser contract)
+# ---------------------------------------------------------------------------
+
+
+class TestStateAmplificationDos:
+    """Prompt wording and parser-contract guards for the state-amplification
+    DoS lens. These protect the intended words; model output is not asserted."""
+
+    def test_phase2_has_lens_and_definition(self):
+        from swival.audit import _PHASE2_SYSTEM
+
+        assert "state_amplification_dos" in _PHASE2_SYSTEM
+        assert "parse/decode loops" in _PHASE2_SYSTEM
+        assert "there is no decoded-unit cap" in _PHASE2_SYSTEM
+
+    def test_phase3a_has_review_question(self):
+        from swival.audit import _PHASE3A_SYSTEM
+
+        assert "denial-of-service candidates" in _PHASE3A_SYSTEM
+        assert "actively inspect parse/decode loops" in _PHASE3A_SYSTEM
+        assert "Do not dismiss because encoded" in _PHASE3A_SYSTEM
+        assert "decoded-item count" in _PHASE3A_SYSTEM
+        assert "enough to emit a medium candidate" in _PHASE3A_SYSTEM
+
+    def test_phase3a_has_severity_tiebreaker(self):
+        from swival.audit import _PHASE3A_SYSTEM
+
+        assert "state-amplification DoS, default to medium" in _PHASE3A_SYSTEM
+        assert "persists after the attacker-controlled connection/request closes" in (
+            _PHASE3A_SYSTEM
+        )
+
+    def test_phase3a_clarifies_lifetime_scope(self):
+        from swival.audit import _PHASE3A_SYSTEM
+
+        assert "Resource-lifetime findings are in scope only when" in _PHASE3A_SYSTEM
+        assert "cleanup-only bugs without that trigger remain out of scope" in (
+            _PHASE3A_SYSTEM
+        )
+
+    def test_phase3b_defines_ledger_once(self):
+        from swival.audit import _PHASE3B_SYSTEM
+
+        assert _PHASE3B_SYSTEM.count("five-fact ledger") == 1
+        for label in ("unit:", "resource:", "limit:", "gap:", "timing:"):
+            assert label in _PHASE3B_SYSTEM
+        assert "no decoded-unit cap visible" in _PHASE3B_SYSTEM
+        assert "keep `type: denial of service`" in _PHASE3B_SYSTEM
+        # The ledger trigger keys on the observable DoS shape, not the Phase 2
+        # taxonomy token, which never reaches Phase 3B (and is absent entirely
+        # on the --all path that bypasses triage).
+        assert "denial-of-service finding where" in _PHASE3B_SYSTEM
+        assert "state_amplification_dos" not in _PHASE3B_SYSTEM
+
+    def test_state_amplification_prompt_is_not_protocol_specific(self):
+        from swival.audit import _PHASE3A_SYSTEM, _PHASE3B_SYSTEM
+
+        combined = _PHASE3A_SYSTEM + "\n" + _PHASE3B_SYSTEM
+        for term in ("H2O", "HPACK", "HTTP/2", "hpack.c"):
+            assert term not in combined
+
+    def test_phase4_and_phase5_reference_ledger_without_restating(self):
+        from swival.audit import _PHASE4_VERIFY_SYSTEM, _PHASE5_REPORT_TEMPLATE
+
+        for prompt in (_PHASE4_VERIFY_SYSTEM, _PHASE5_REPORT_TEMPLATE):
+            assert "five-fact ledger" in prompt
+            # Shape-based trigger: these phases see finding_type "denial of
+            # service" plus proof prose, never the taxonomy token.
+            assert "denial-of-service finding whose proof presents" in prompt
+            assert "state_amplification_dos" not in prompt
+            assert "gap: dimension" not in prompt
+            assert "resource: server state" not in prompt
+
+    def test_attack_surface_patterns_unchanged_in_first_pass(self):
+        from swival.audit import _ATTACK_SURFACE_PATTERNS
+
+        sources = " ".join(p.pattern for p, _ in _ATTACK_SURFACE_PATTERNS)
+        for reserved in ("limit", "append", "insert", "queue", "refcount"):
+            assert reserved not in sources
+
+    def test_dos_expansion_parses_without_new_fields(self, monkeypatch, tmp_path):
+        """A denial-of-service expansion carrying the five-fact ledger in prose
+        still parses into the existing FindingRecord with no new fields."""
+        from dataclasses import fields
+        from types import SimpleNamespace
+        from swival.audit import _deep_review_one
+
+        scope = AuditScope(
+            branch="main",
+            commit="abc123",
+            tracked_files=["hpack.c"],
+            mandatory_files=["hpack.c"],
+            focus=[],
+        )
+        state = AuditRunState(
+            run_id="dos",
+            scope=scope,
+            queued_files=["hpack.c"],
+            triage_records={},
+            repo_profile={"summary": "tiny repo"},
+            import_index={},
+            caller_index={},
+            state_dir=tmp_path,
+        )
+        ctx = SimpleNamespace(base_dir=str(tmp_path), loop_kwargs={})
+        calls = {"n": 0}
+
+        monkeypatch.setattr(
+            "swival.audit._git_show",
+            lambda path, base_dir: "h2o_add_header(...)",
+        )
+
+        def fake_call(ctx, messages, temperature=0.0, trace_task=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                assert "Focus bug classes: all" in messages[1]["content"]
+                assert "actively inspect parse/decode loops" in messages[0]["content"]
+                return (
+                    "@@ finding @@\n"
+                    "title: decoded header count unbounded\n"
+                    "severity: medium\n"
+                    "location: hpack.c:200\n"
+                    "attacker: remote HTTP/2 peer\n"
+                    "trigger: many compact encoded header field entries\n"
+                    "impact: request worker denial of service\n"
+                    "claim: encoded limit does not cap decoded field count\n"
+                )
+            assert "state_amplification_dos" not in messages[0]["content"]
+            assert "no decoded-unit cap visible" in messages[0]["content"]
+            return (
+                "@@ expansion @@\n"
+                "type: denial of service\n"
+                "attacker: remote HTTP/2 peer\n"
+                "trigger: many compact encoded header field entries\n"
+                "impact: request worker denial of service\n"
+                "preconditions: peer opens a normal HTTP/2 connection\n"
+                "proof:\n"
+                "  unit: one compact HPACK header field entry.\n"
+                "  resource: a materialized decoded header entry per field.\n"
+                "  limit: encoded byte and soft request-field limits.\n"
+                "  gap: decoded field count is not capped at materialization.\n"
+                "  timing: entries are added before the soft limit rejects.\n"
+                "fix_outline: count decoded fields and stop adding above the cap\n"
+            )
+
+        monkeypatch.setattr("swival.audit._call_audit_llm", fake_call)
+
+        result = _deep_review_one("hpack.c", state, ctx)
+        assert result.error is None
+        assert len(result.findings) == 1
+        f = result.findings[0]
+        assert f.finding_type == "denial of service"
+        assert f.severity == "medium"
+        assert "decoded field count is not capped" in f.proof[0]
+        assert {fld.name for fld in fields(FindingRecord)} == {
+            "title",
+            "finding_type",
+            "severity",
+            "locations",
+            "preconditions",
+            "proof",
+            "fix_outline",
+            "source_file",
+            "triage_decision",
+        }
+
+
+# ---------------------------------------------------------------------------
 # Phase 2 triage contract (fail-closed, no repair)
 # ---------------------------------------------------------------------------
 
