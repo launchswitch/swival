@@ -10,8 +10,6 @@ a tool a child process tries to run by name.
 ``PATH``, unless the user has deliberately activated this venv (in
 which case ``sys.prefix/bin`` *is* their active environment and we
 leave it alone).
-
-See ``PLAN-subprocess-path-leak.md`` in the repo root.
 """
 
 import os
