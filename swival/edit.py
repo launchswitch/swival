@@ -286,6 +286,29 @@ def _filter_by_line(
     return matching, candidate_lines
 
 
+def _span_contains(outer: tuple[int, int], inner: tuple[int, int]) -> bool:
+    return outer[0] <= inner[0] and inner[1] <= outer[1]
+
+
+def _stale_line_fallback(
+    spans: list[tuple[int, int]],
+) -> tuple[int, int] | None:
+    """Return the lone span to edit when a stale line_number missed every
+    strict match but old_string still resolves to one location.
+
+    Dedup is by containment, not overlap: the same logical match nests across
+    passes (the exact substring sits inside the enclosing whole-line fuzzy or
+    Unicode span), while distinct matches never nest, so overlapping-but-separate
+    targets stay distinct and block auto-apply. Returns None when zero or several
+    distinct matches survive, leaving the caller to raise its usual error.
+    """
+    kept: list[tuple[int, int]] = []
+    for span in spans:
+        if not any(_span_contains(span, k) or _span_contains(k, span) for k in kept):
+            kept.append(span)
+    return kept[0] if len(kept) == 1 else None
+
+
 def _format_candidate_lines(lines: list[int]) -> str:
     """Format candidate line numbers for error messages."""
     unique = sorted(set(lines))
@@ -348,6 +371,7 @@ def replace(
 
     any_candidates_found = False
     all_candidate_lines: list[int] = []
+    fallback_spans: list[tuple[int, int]] = []
 
     passes: list[tuple[str, object]] = [
         ("exact", None),
@@ -382,6 +406,7 @@ def replace(
                     f"multiple matches on line {line_number}; "
                     f"add more context to old_string"
                 )
+            fallback_spans.extend(spans)
             continue
 
         if len(spans) == 1:
@@ -401,6 +426,11 @@ def replace(
             "from read_file to target one match, or set replace_all=true."
             + snippet_block
         )
+
+    if fallback_spans:
+        target = _stale_line_fallback(fallback_spans)
+        if target is not None:
+            return _replace_span(content, target, new_string, old_string)
 
     if line_number is not None and any_candidates_found:
         raise ValueError(

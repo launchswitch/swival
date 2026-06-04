@@ -283,6 +283,81 @@ class TestLineNumberTargeting:
             replace(content, "aaa", "XXX", line_number=100)
 
 
+class TestStaleLineAutoApply:
+    """A stale line_number is ignored when old_string resolves to exactly one
+    location in the whole file."""
+
+    def test_single_match_off_by_a_few_lines_applies(self):
+        content = "header\nx = 1\nfooter\n"
+        result = replace(content, "x = 1", "x = 99", line_number=10)
+        assert result == "header\nx = 99\nfooter\n"
+
+    def test_single_match_off_by_hundreds_still_applies(self):
+        content = "pad\npad\ntarget = 1\npad\npad\n"
+        result = replace(content, "target = 1", "target = 2", line_number=999)
+        assert result == "pad\npad\ntarget = 2\npad\npad\n"
+
+    def test_multiline_single_match_stale_line_past_span_applies(self):
+        content = "x\naaa\nbbb\nx\n"
+        result = replace(content, "aaa\nbbb", "AAA\nBBB", line_number=99)
+        assert result == "x\nAAA\nBBB\nx\n"
+
+    def test_single_fuzzy_match_stale_line_applies(self):
+        content = "header\naaa\nfooter\n"
+        result = replace(content, "   aaa", "XXX", line_number=99)
+        assert result == "header\nXXX\nfooter\n"
+
+    def test_single_unicode_match_stale_line_applies(self):
+        content = "header\nprint(“hello”)\nfooter\n"
+        result = replace(content, 'print("hello")', 'print("world")', line_number=99)
+        assert result == 'header\nprint("world")\nfooter\n'
+
+    def test_later_fuzzy_pass_wins_over_stale_exact(self):
+        content = "  aaa\nbbb\naaa\nccc\n"
+        result = replace(content, "  aaa", "XXX", line_number=3)
+        assert result == "  aaa\nbbb\nXXX\nccc\n"
+
+    def test_later_unicode_pass_wins_over_stale_exact(self):
+        content = 'print("hi")\nx\nprint(“hi”)\ny\n'
+        result = replace(content, 'print("hi")', "PRINT", line_number=3)
+        assert result == 'print("hi")\nx\nPRINT\ny\n'
+
+    def test_two_matches_stale_line_blocks_autoapply(self):
+        content = "aaa\nbbb\naaa\nccc\n"
+        with pytest.raises(ValueError, match="no match at line"):
+            replace(content, "aaa", "XXX", line_number=99)
+
+    def test_two_matches_same_line_stale_line_blocks(self):
+        content = "aaa bbb aaa\nccc\n"
+        with pytest.raises(ValueError, match="no match at line 2"):
+            replace(content, "aaa", "XXX", line_number=2)
+
+    def test_distinct_exact_and_fuzzy_blocks_autoapply(self):
+        content = "  aaa\nbbb\naaa\nccc\n"
+        with pytest.raises(ValueError, match="no match at line"):
+            replace(content, "  aaa", "XXX", line_number=99)
+
+    def test_exact_wins_over_overlapping_fuzzy(self):
+        content = "  target\n"
+        result = replace(content, "target", "X", line_number=99)
+        assert result == "  X\n"
+
+    def test_overlapping_fuzzy_windows_block_autoapply(self):
+        content = " a\n a\n a\n"
+        with pytest.raises(ValueError, match="no match at line"):
+            replace(content, "a\na", "X\nY", line_number=99)
+
+    def test_exact_and_overlapping_fuzzy_window_block_autoapply(self):
+        content = "a\na\n a\n"
+        with pytest.raises(ValueError, match="no match at line"):
+            replace(content, "a\na", "X\nY", line_number=99)
+
+    def test_not_found_with_stale_line_unchanged(self):
+        content = "aaa\nbbb\nccc\n"
+        with pytest.raises(ValueError, match="not found"):
+            replace(content, "zzz", "XXX", line_number=99)
+
+
 class TestExactMatchSpans:
     """Tests for the _exact_match_spans helper."""
 

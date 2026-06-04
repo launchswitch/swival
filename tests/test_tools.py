@@ -976,6 +976,13 @@ class TestEditFileLineNumber:
         content = (tmp_path / "f.txt").read_text(encoding="utf-8")
         assert content == "XXX\nbbb\nXXX\n"
 
+    def test_stale_line_number_applies_to_unique_match(self, tmp_path):
+        (tmp_path / "f.txt").write_text("header\nx = 1\nfooter\n", encoding="utf-8")
+        result = _edit_file("f.txt", "x = 1", "x = 99", str(tmp_path), line_number=99)
+        assert "Edited" in result
+        content = (tmp_path / "f.txt").read_text(encoding="utf-8")
+        assert content == "header\nx = 99\nfooter\n"
+
 
 # =========================================================================
 # Other
