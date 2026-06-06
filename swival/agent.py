@@ -106,6 +106,7 @@ from .tools import (
     set_output_caps,
 )
 from .repair import format_repair_feedback, repair_tool_args, validate_required_args
+from .keepawake import keep_awake
 from .tool_call_repair import (
     StormBreaker,
     content_is_pure_tool_call,
@@ -7945,6 +7946,7 @@ def _run_main(args, report, _write_report, parser):
     _show_sandbox_review_hint(args)
 
 
+@keep_awake(reason="swival agent turn")
 def run_agent_loop(
     messages: list,
     tools: list,
