@@ -67,7 +67,7 @@ _PROVIDERS = [
     ),
     (
         "geap",
-        "Gemini Enterprise Agent Platform",
+        "Gemini Enterprise",
         "Gemini through Google Cloud (formerly Vertex AI)",
         "enterprise setups with Google Cloud credentials",
     ),
