@@ -105,6 +105,7 @@ from .tools import (
     dispatch,
     cleanup_old_cmd_outputs,
     get_tool_schema,
+    sanitize_tools_for_applefm,
     set_output_caps,
 )
 from .repair import format_repair_feedback, repair_tool_args, validate_required_args
@@ -148,6 +149,8 @@ MAX_HISTORY_SIZE = 500 * 1024  # 500KB
 TODO_REMINDER_INTERVAL = 3  # remind after N turns of no todo usage
 _GOOGLE_PROVIDER = "google"
 CHATGPT_PROVIDER_DOCS_URL = "https://docs.litellm.ai/docs/providers/chatgpt"
+_APPLEFM_DEFAULT_BASE = "http://127.0.0.1:1976/v1"
+_APPLEFM_DROP_LOGGED: set[str] = set()
 
 _IMAGE_SYNTHETIC_PREFIX = "[image]"
 
@@ -3622,7 +3625,7 @@ def _resolve_model_str(provider: str, model_id: str) -> str:
             else model_id
         )
         return f"openrouter/{bare}"
-    elif provider in ("generic", "llamacpp"):
+    elif provider in ("generic", "llamacpp", "applefm"):
         return f"openai/{model_id}"
     elif provider == "chatgpt":
         bare = model_id.removeprefix("chatgpt/").removeprefix("chatgpt/")
@@ -4188,12 +4191,16 @@ def _call_llm_with_dismiss(dismiss, llm_args, **llm_kwargs):
     return call_llm(*llm_args, **llm_kwargs)
 
 
-def _completion_via_stream(completion_kwargs, on_stream_start=None):
+def _completion_via_stream(completion_kwargs, on_stream_start=None, display=True):
     """Run litellm.completion with stream=True, displaying a marquee, and
     reassemble a non-streaming response object via stream_chunk_builder.
 
     *on_stream_start*, if provided, is invoked once before the first marquee
     update so a caller-owned waiting display can be dismissed cleanly.
+
+    When *display* is False the chunks are consumed silently — used for servers
+    that only ever speak SSE (Apple Foundation Models) where we must stream to
+    parse the reply but have no reason to show a live marquee.
     """
     import litellm
 
@@ -4214,6 +4221,8 @@ def _completion_via_stream(completion_kwargs, on_stream_start=None):
 
         def _on_delta(text: str) -> None:
             nonlocal tail, update
+            if not display:
+                return
             tail += text
             if len(tail) > tail_cap:
                 tail = tail[-tail_cap // 2 :]
@@ -4263,6 +4272,7 @@ def _completion_with_retry(
     verbose,
     stream=False,
     on_stream_start=None,
+    stream_display=True,
 ):
     """Call litellm.completion() with retry on transient errors.
 
@@ -4285,7 +4295,9 @@ def _completion_with_retry(
             if stream:
                 return (
                     _completion_via_stream(
-                        completion_kwargs, on_stream_start=on_stream_start
+                        completion_kwargs,
+                        on_stream_start=on_stream_start,
+                        display=stream_display,
                     ),
                     attempt,
                 )
@@ -4476,7 +4488,7 @@ def call_llm(
         }
         if base_url:
             kwargs["api_base"] = base_url
-    elif provider in ("generic", "llamacpp"):
+    elif provider in ("generic", "llamacpp", "applefm"):
         kwargs = {
             "api_base": base_url,
             "api_key": api_key or "none",
@@ -4538,9 +4550,18 @@ def call_llm(
         **kwargs,
     )
     if tools is not None:
-        completion_kwargs["tools"] = tools
-        if not _skip_tool_choice:
-            completion_kwargs["tool_choice"] = "auto"
+        if provider == "applefm":
+            tools, _dropped = sanitize_tools_for_applefm(tools)
+            if _dropped and verbose and not _APPLEFM_DROP_LOGGED:
+                _APPLEFM_DROP_LOGGED.update(_dropped)
+                fmt.model_info(
+                    "applefm: dropped tools unsupported by the Foundation Models "
+                    f"schema (nested objects / arrays of objects): {', '.join(_dropped)}"
+                )
+        if tools:
+            completion_kwargs["tools"] = tools
+            if not _skip_tool_choice:
+                completion_kwargs["tool_choice"] = "auto"
     for key, val in [("temperature", temperature), ("top_p", top_p), ("seed", seed)]:
         if val is not None and key not in _skip_params:
             completion_kwargs[key] = val
@@ -4633,12 +4654,17 @@ def call_llm(
                 tc.function.arguments = secret_shield.reverse_known(args_str)
         return msg
 
-    _stream = (
+    _show_stream = (
         provider in ("generic", "llamacpp", "lmstudio", "huggingface", "openrouter")
         and verbose
         and call_kind == "agent"
         and sys.stderr.isatty()
     )
+    # Apple's Foundation Models server only ever answers with SSE, even when the
+    # request does not ask to stream, so we must consume it as a stream to parse
+    # the reply at all — independently of whether we show a live marquee.
+    _must_stream = provider == "applefm"
+    _stream = _show_stream or _must_stream
 
     retries = 0
 
@@ -4656,7 +4682,8 @@ def call_llm(
                 max_retries=max_retries,
                 verbose=verbose,
                 stream=_stream,
-                on_stream_start=on_stream_start if _stream else None,
+                on_stream_start=on_stream_start if _show_stream else None,
+                stream_display=_show_stream,
             )
     except ContextOverflowError:
         raise  # already has _provider_retries from _completion_with_retry
@@ -5418,6 +5445,7 @@ def build_parser():
             "huggingface",
             "openrouter",
             "generic",
+            "applefm",
             "google",
             "geap",
             "vertexai",
@@ -5426,7 +5454,7 @@ def build_parser():
             "command",
         ],
         default=_UNSET,
-        help="LLM provider: lmstudio (local), llamacpp (llama.cpp server, auto-discovers model), huggingface (HF API), openrouter (multi-provider API), generic (any OpenAI-compatible server), google (Gemini via OpenAI-compatible endpoint), geap (Gemini Enterprise Agent Platform / Vertex AI, auth via Google Cloud credentials), chatgpt (ChatGPT Plus/Pro subscription via OAuth), bedrock (AWS Bedrock, auth via AWS credential chain), command (external command as LLM, --model is the command to run). 'vertexai' is an alias for 'geap'.",
+        help="LLM provider: lmstudio (local), llamacpp (llama.cpp server, auto-discovers model), huggingface (HF API), openrouter (multi-provider API), generic (any OpenAI-compatible server), applefm (Apple Foundation Models local server, --model system or pcc, defaults to http://127.0.0.1:1976/v1), google (Gemini via OpenAI-compatible endpoint), geap (Gemini Enterprise Agent Platform / Vertex AI, auth via Google Cloud credentials), chatgpt (ChatGPT Plus/Pro subscription via OAuth), bedrock (AWS Bedrock, auth via AWS credential chain), command (external command as LLM, --model is the command to run). 'vertexai' is an alias for 'geap'.",
     )
     output_group.add_argument(
         "-q",
@@ -6557,6 +6585,25 @@ def resolve_provider(
                 api_base, model_id, verbose
             )
         resolved_key = api_key or os.environ.get("OPENAI_API_KEY")
+
+    elif provider == "applefm":
+        if not model:
+            raise ConfigError(
+                "--model is required when --provider is applefm "
+                "(e.g. --model system, or --model pcc for Private Cloud Compute)"
+            )
+        api_base = _normalize_openai_base(base_url or _APPLEFM_DEFAULT_BASE)
+        model_id = model
+        context_length = max_context_tokens
+        if context_length is None:
+            # The on-device model ("system") tops out around 4K tokens, while
+            # Private Cloud Compute ("pcc") accepts roughly 32K. The server does
+            # not report either through /v1/models, so fall back to measured
+            # defaults that the user can still override with --max-context-tokens.
+            context_length = discover_generic_context_length(
+                api_base, model_id, verbose
+            ) or (32768 if model_id == "pcc" else 4096)
+        resolved_key = api_key
 
     elif provider == _GOOGLE_PROVIDER:
         if not model:

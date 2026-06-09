@@ -26,6 +26,7 @@ from swival.agent import (
 )
 from swival.config import ConfigError
 from swival.report import AgentError
+from swival.tools import sanitize_tools_for_applefm
 
 
 def _patch_urlopen_json(monkeypatch, payload):
@@ -1371,6 +1372,127 @@ class TestGenericProviderRouting:
                 api_key="sk-real",
             )
             assert mock_comp.call_args[1]["api_key"] == "sk-real"
+
+
+class TestAppleFoundationModelsProvider:
+    """Apple Foundation Models local server routing and tool-schema sanitizing."""
+
+    def test_model_str_routes_as_openai(self):
+        assert _resolve_model_str("applefm", "system") == "openai/system"
+
+    def test_resolve_defaults_base_url(self):
+        _, api_base, _, _, _ = resolve_provider(
+            "applefm", "system", None, None, None, False
+        )
+        assert api_base == "http://127.0.0.1:1976/v1"
+
+    def test_resolve_normalizes_custom_base_url(self):
+        _, api_base, _, _, _ = resolve_provider(
+            "applefm", "system", None, "http://host:1976", None, False
+        )
+        assert api_base == "http://host:1976/v1"
+
+    def test_resolve_requires_model(self):
+        with pytest.raises(ConfigError):
+            resolve_provider("applefm", None, None, None, None, False)
+
+    def test_on_device_context_default(self, monkeypatch):
+        monkeypatch.setattr(
+            agent, "discover_generic_context_length", lambda *a, **k: None
+        )
+        _, _, _, ctx, _ = resolve_provider("applefm", "system", None, None, None, False)
+        assert ctx == 4096
+
+    def test_pcc_context_default(self, monkeypatch):
+        monkeypatch.setattr(
+            agent, "discover_generic_context_length", lambda *a, **k: None
+        )
+        _, _, _, ctx, _ = resolve_provider("applefm", "pcc", None, None, None, False)
+        assert ctx == 32768
+
+    def test_explicit_context_overrides_default(self):
+        _, _, _, ctx, _ = resolve_provider("applefm", "system", None, None, 8000, False)
+        assert ctx == 8000
+
+
+class TestAppleFoundationModelsToolSanitizer:
+    """sanitize_tools_for_applefm drops what Apple's GenerationSchema can't read."""
+
+    @staticmethod
+    def _tool(name, params):
+        return {"type": "function", "function": {"name": name, "parameters": params}}
+
+    def test_injects_missing_required(self):
+        tool = self._tool("noargs", {"type": "object", "properties": {}})
+        kept, dropped = sanitize_tools_for_applefm([tool])
+        assert dropped == []
+        assert kept[0]["function"]["parameters"]["required"] == []
+
+    def test_does_not_mutate_original(self):
+        tool = self._tool("noargs", {"type": "object", "properties": {}})
+        sanitize_tools_for_applefm([tool])
+        assert "required" not in tool["function"]["parameters"]
+
+    def test_keeps_scalars_and_scalar_arrays(self):
+        tool = self._tool(
+            "ok",
+            {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "count": {"type": "integer"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["name"],
+            },
+        )
+        kept, dropped = sanitize_tools_for_applefm([tool])
+        assert dropped == [] and len(kept) == 1
+
+    def test_drops_nested_object(self):
+        tool = self._tool(
+            "nested",
+            {
+                "type": "object",
+                "properties": {"cfg": {"type": "object", "properties": {}}},
+                "required": ["cfg"],
+            },
+        )
+        _, dropped = sanitize_tools_for_applefm([tool])
+        assert dropped == ["nested"]
+
+    def test_drops_array_of_objects(self):
+        tool = self._tool(
+            "batch",
+            {
+                "type": "object",
+                "properties": {"files": {"type": "array", "items": {"type": "object"}}},
+                "required": ["files"],
+            },
+        )
+        _, dropped = sanitize_tools_for_applefm([tool])
+        assert dropped == ["batch"]
+
+    def test_drops_oneof_union(self):
+        tool = self._tool(
+            "todo",
+            {
+                "type": "object",
+                "properties": {
+                    "tasks": {"oneOf": [{"type": "string"}, {"type": "array"}]}
+                },
+                "required": ["tasks"],
+            },
+        )
+        _, dropped = sanitize_tools_for_applefm([tool])
+        assert dropped == ["todo"]
+
+    def test_missing_parameters_gets_empty_object(self):
+        tool = {"type": "function", "function": {"name": "bare"}}
+        kept, dropped = sanitize_tools_for_applefm([tool])
+        assert dropped == []
+        params = kept[0]["function"]["parameters"]
+        assert params == {"type": "object", "properties": {}, "required": []}
 
 
 class TestGenericProviderValidation:

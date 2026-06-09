@@ -2,6 +2,7 @@
 
 import base64
 import contextlib
+import copy
 import fnmatch
 import hashlib
 import json
@@ -787,6 +788,87 @@ _build_schema_index()
 def get_tool_schema(name: str) -> dict | None:
     """Return the parameters schema for a built-in tool, or None."""
     return _TOOL_SCHEMA_INDEX.get(name)
+
+
+_APPLEFM_SCALARS = frozenset({"string", "integer", "number", "boolean"})
+_APPLEFM_UNSUPPORTED_KEYS = ("anyOf", "oneOf", "allOf", "not", "$ref")
+
+
+def _applefm_property_ok(spec) -> bool:
+    """Whether a single property schema is expressible in Apple's GenerationSchema.
+
+    Apple supports only scalars and arrays of scalars at the leaves. Unions
+    (``type`` as a list, or ``anyOf``/``oneOf``/``allOf``/``not``/``$ref``),
+    nested objects, and arrays of objects or arrays are all rejected.
+    """
+    if not isinstance(spec, dict):
+        return False
+    if any(key in spec for key in _APPLEFM_UNSUPPORTED_KEYS):
+        return False
+    spec_type = spec.get("type")
+    if spec_type in _APPLEFM_SCALARS:
+        return True
+    if spec_type == "array":
+        items = spec.get("items")
+        if not isinstance(items, dict):
+            return False
+        if any(key in items for key in _APPLEFM_UNSUPPORTED_KEYS):
+            return False
+        return items.get("type") in _APPLEFM_SCALARS
+    return False
+
+
+def _applefm_fit_object_schema(schema: dict) -> bool:
+    """Adapt a tool's top-level parameter schema for Apple Foundation Models.
+
+    Apple's GenerationSchema decoder demands a 'required' array on every object
+    (an empty one is fine) and accepts only a flat object whose properties are
+    scalars or arrays of scalars. This injects the missing 'required' key and
+    returns whether the schema is expressible: when it leans on a construct the
+    decoder cannot read (nested objects, arrays of objects, unions, ``$ref``),
+    it returns False so the caller can drop the whole tool rather than send a
+    request the server will reject outright.
+    """
+    if schema.get("type") != "object":
+        return False
+    if any(key in schema for key in _APPLEFM_UNSUPPORTED_KEYS):
+        return False
+    props = schema.get("properties")
+    if not isinstance(props, dict):
+        return False
+    schema.setdefault("required", [])
+    return all(_applefm_property_ok(spec) for spec in props.values())
+
+
+def sanitize_tools_for_applefm(tools: list) -> tuple[list, list[str]]:
+    """Rewrite OpenAI tool schemas to satisfy Apple Foundation Models' decoder.
+
+    Returns (kept, dropped_names). Schemas that only need a 'required' array are
+    fixed in a copy; tools that rely on nested objects or arrays of objects are
+    dropped, since the server returns a 400 for the entire request if a single
+    tool definition is unreadable.
+    """
+    kept: list = []
+    dropped: list[str] = []
+    for tool in tools or []:
+        fn = tool.get("function") if isinstance(tool, dict) else None
+        if not isinstance(fn, dict):
+            kept.append(tool)
+            continue
+        clone = copy.deepcopy(tool)
+        params = clone["function"].get("parameters")
+        if params is None:
+            clone["function"]["parameters"] = {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            }
+            kept.append(clone)
+        elif _applefm_fit_object_schema(params):
+            kept.append(clone)
+        else:
+            dropped.append(fn.get("name", "?"))
+    return kept, dropped
 
 
 MAX_OUTPUT_BYTES = 50 * 1024  # 50 KB
