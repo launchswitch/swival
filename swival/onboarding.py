@@ -36,6 +36,12 @@ _PROVIDERS = [
         "running llama.cpp directly with OpenAI-compatible APIs",
     ),
     (
+        "mlx",
+        "MLX",
+        "Apple-silicon models served by mlx-lm or omlx",
+        "fast local inference on Apple silicon via mlx_lm.server",
+    ),
+    (
         "chatgpt",
         "ChatGPT",
         "Use your ChatGPT Plus or Pro subscription",
@@ -67,7 +73,7 @@ _PROVIDERS = [
     ),
     (
         "geap",
-        "Gemini Enterprise Agent Platform",
+        "Gemini Enterprise",
         "Gemini through Google Cloud (formerly Vertex AI)",
         "enterprise setups with Google Cloud credentials",
     ),
@@ -333,6 +339,8 @@ def _collect_settings() -> dict | None:
         _ask_lmstudio(settings)
     elif provider_name == "llamacpp":
         _ask_llamacpp(settings)
+    elif provider_name == "mlx":
+        _ask_mlx(settings)
     elif provider_name == "chatgpt":
         _ask_chatgpt(settings)
     elif provider_name == "openrouter":
@@ -503,6 +511,31 @@ def _ask_llamacpp(s: dict) -> None:
     model = _prompt_text("Model name (blank for auto-discovery)", default="")
     if model:
         s["model"] = model
+
+
+def _ask_mlx(s: dict) -> None:
+    _console.print(
+        Text(
+            "MLX runs models natively on Apple silicon. Start the server with\n"
+            "`mlx_lm.server` and Swival will talk to it like any OpenAI-compatible\n"
+            "endpoint.",
+            style="dim",
+        )
+    )
+    _console.print()
+
+    s["provider"] = "generic"
+    s["base_url"] = "http://127.0.0.1:8000"
+
+    use_default = _prompt_confirm(
+        "Use the default server at http://127.0.0.1:8000?", default=True
+    )
+    if not use_default:
+        url = _prompt_text("Server URL", default="http://127.0.0.1:8000")
+        if url:
+            s["base_url"] = url
+
+    s["model"] = _prompt_text_required("Model name")
 
 
 def _ask_chatgpt(s: dict) -> None:
