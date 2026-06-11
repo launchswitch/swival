@@ -8,7 +8,7 @@ It triages files by attack surface, performs deep review on escalated files, ver
 /audit [path|glob ...] [--resume] [--regen] [--finding N[,M-R]] [--all] [--measure-triage] [--workers N] [--patch-max-turns N] [--debug]
 ```
 
-Works in both interactive (REPL) and one-shot mode (requires `--oneshot-commands`). Runs against `HEAD`, so dirty working-directory changes are ignored.
+Works in both interactive (REPL) and one-shot mode (requires `--oneshot-commands`). Runs against `HEAD`, so dirty working-directory changes are ignored; a fresh run warns when the working tree differs from what will be audited (see Scope, below).
 
 ## Quick Start
 
@@ -83,6 +83,7 @@ The triage prompt is intentionally precision-biased: it prefers SKIP under uncer
 - A triage record with `needs_followup: true` is escalated outright. Triage already produces this signal; we now act on it.
 - A file whose triage call timed out, raised a network error, or produced an unparseable response is escalated. This is fail-open behavior: the model never gave a real verdict, so we err on the side of looking.
 - Any file matched by a `[audit] force_review` glob in `swival.toml` (see Configuration, below).
+- Any file named exactly as an `/audit` focus argument (no wildcard, not a directory). Naming a specific file on the command line is a stronger escalation signal than any triage heuristic, and it makes `/audit src/foo.py` directly comparable to asking a model to review that one file. Directory and glob focus arguments only narrow scope; they do not bypass triage.
 - A second confirmation pass for any file the LLM marked SKIP with low confidence: the same file is re-triaged with richer evidence (its dependency list and the contents of its highest-scoring dependency). The confirmation pass typically affects 10 to 20 percent of triage targets.
 
 Triage runs in parallel with configurable worker count. The end-of-phase output breaks down the escalated count by reason and prints the top five SKIPped files by attack-surface score, so a wrong call is catchable before Phase 3 begins.
@@ -97,7 +98,9 @@ Each escalated file goes through a two-step deep review.
 
 Both steps see more than the file itself. Swival resolves the cross-file functions the file actually calls, preferring explicit imports and falling back to the dependency index built in Phase 1, and appends their exact committed bodies as a "Called function definitions" section, each labeled with its own path and line span. A validation helper that lives two files away is reviewed next to its call site, which is what lets a finding land on the helper that is actually broken rather than on the caller. The section is budgeted (8000 bytes per definition, 24000 bytes per prompt); callees that do not fit degrade to one-line pointers instead of vanishing. The same enrichment rides along on the evidence bundles used in verification, adjudication, and report generation.
 
-The two are merged into canonical `FindingRecord` objects. JSON parse failures trigger an automatic LLM repair pass; if repair also fails, the entire file gets one analytical retry.
+The two are merged into canonical `FindingRecord` objects. JSON parse failures trigger an automatic LLM repair pass; if repair also fails, the entire file gets one analytical retry. When a file rated ESCALATE_HIGH by triage comes back with an empty inventory, the inventory call is re-asked once with the identical prompt: an empty result on the files triage rated highest is the most likely place for a small model to over-suppress, and one bounded re-ask catches the sampling noise.
+
+When a file plus its context exceeds the model's context window, the evidence is head-truncated to fit. The prompts are ordered so the least valuable content goes first: the cross-file callee section, then the tail of the file, never the path declaration or the finding under expansion. Truncation is no longer silent: each truncated call emits a warning during the run, shows up in the end-of-phase metrics, and any file deep-reviewed on partial evidence is listed in the README ("N file(s) deep-reviewed with truncated Phase 3 evidence"). Partial evidence means the context window was too small for the file; re-run with a larger context or split the file.
 
 ### Phase 4: Verification
 
@@ -108,7 +111,9 @@ The verifier can inspect code and optionally compile or run small proof-of-conce
 - **REPRODUCED**: the finding is real and the verifier demonstrated it
 - **NOTREPRODUCED**: the code does not support a practical trigger path
 
-Verified findings advance to artifact generation. Discarded findings are dropped. Failed verifications (infrastructure errors, timeouts) are retried once for transient errors and can be resumed with `--resume`.
+The verdict has to appear on its own line; the parser scans the answer from the end for an exact `REPRODUCED` or `NOTREPRODUCED` line. An answer that never commits to a verdict (empty output, a turn budget exhausted before the token, prose that only mentions the keywords) is treated as an infrastructure failure, not as a negative verdict: the finding is marked failed and retried rather than silently discarded. This distinction matters most on small local models, which drop the token far more often than they genuinely refute a finding.
+
+Verified findings advance to artifact generation. Discarded findings are dropped. Failed verifications (infrastructure errors, timeouts, missing verdict tokens) are retried once for transient errors, then up to three batch attempts; whatever still fails is reported as incomplete and can be resumed with `--resume`.
 
 Verification runs in parallel, capped at 2 concurrent workers regardless of the `--workers` setting.
 
@@ -119,6 +124,8 @@ Reproduction proves a bug exists. It does not prove the bug matters. The verifie
 The adjudication gate is the answer to that. It runs after verification and before any report or patch is written, so the expensive Phase 5 work only happens for findings that survive.
 
 Each verified finding faces a panel of three independent reviewers, each told to *refute* it and to default to false positive when unsure. The three look through different lenses: one asks whether an untrusted actor can really reach the code, one asks whether it matters in the project's expected threat model, and one asks whether the severity is justified or the issue is already mitigated. A finding is kept only when a majority of the panel confirms it is both real and relevant. Ties drop, because the whole point is to stop shipping false positives.
+
+A reviewer whose response fails to parse is re-asked once; if it still fails, that lens abstains. Abstentions do not vote, and dropping requires at least two usable verdicts: a panel that mostly failed to respond has not earned the right to overrule a reproduced finding, so the finding is kept with an explicit "adjudication inconclusive" reason instead.
 
 Reviewers judge against the deployment surface drawn from the Phase 1 profile, so a denial of service that only the local user can inflict on their own CLI is recognized for what it is and dropped rather than filed as high severity.
 
@@ -271,6 +278,14 @@ Adding a glob between runs takes effect on resume: if a saved run has a SKIP rec
 
 The audit examines only committed Git-tracked files at HEAD. Unstaged or uncommitted changes are invisible to the audit.
 
+Because that is an easy thing to forget, a fresh run checks the working tree right after resolving scope and warns when it diverges from HEAD, counting tracked in-scope files that differ (modifications, deletions, renames) and untracked auditable files that the focus would otherwise select:
+
+```text
+audit reviews committed content at 64bed45a; 3 tracked file(s) differ from HEAD and 2 untracked file(s) are not audited
+```
+
+The warning is informational; the run continues against HEAD. Commit your changes first if you want them reviewed. Resumed runs skip the check, since their commit is already pinned and the warning fired at the original start.
+
 Only files with recognized source or configuration extensions are auditable:
 
 **Source:** `.py`, `.js`, `.ts`, `.tsx`, `.jsx`, `.go`, `.rs`, `.java`, `.kt`, `.rb`, `.php`, `.c`, `.cc`, `.cpp`, `.h`, `.hpp`, `.cs`, `.swift`, `.scala`, `.sh`, `.zig`, `.d`, `.pl`, `.pm`, `.psgi`
@@ -281,7 +296,7 @@ Other file types (`.md`, `.png`, `.csv`, etc.) are excluded.
 
 A focus argument is matched against each repo-relative path with three rules, evaluated in order:
 
-1. Exact match. `src/foo.py` selects only `src/foo.py`.
+1. Exact match. `src/foo.py` selects only `src/foo.py`. An exact match does more than narrow scope: the named file bypasses triage and is guaranteed to reach deep review (see Phase 2, above).
 2. Prefix match for entries with no wildcard. `src` and `src/` both expand to "anything under top-level `src/`".
 3. Wildcard match via `pathlib.PurePosixPath.full_match`. A single `*` matches one path segment and does not cross `/`, `?` matches one non-separator character, `**` matches any number of intermediate directories, and `[abc]` is a character class.
 
@@ -306,7 +321,8 @@ Audit state is persisted in `.swival/audit/<run_id>/state.json`. This includes:
 - All triage records, including the LLM verdict, promotion reasons, any infrastructure-failure tag, and the confirmation-pass outcome
 - Proposed and verified findings
 - Verification status for each finding (pending, running, verified, discarded, failed)
-- Metrics (parse failures, repair successes, analytical retries)
+- Metrics (parse failures, repair successes, analytical retries, verifier answers without a verdict token, adjudication lens retries, truncated calls, empty-response retries, ESCALATE_HIGH second opinions)
+- Files whose Phase 3 evidence was truncated to fit the context window
 - Per-file attack-surface scores cached from Phase 1
 - Current phase and per-finding artifact state (status, stable index, filenames, attempts, last error code, last patch budget used)
 - `select_all` flag (whether the run was started with `--all`) and `measure_triage` flag (whether the run was started with `--measure-triage`)

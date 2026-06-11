@@ -1781,7 +1781,7 @@ class TestParseRecordsWithRepair:
         metrics = {"parse_failures": 0, "repair_successes": 0, "repair_failures": 0}
         monkeypatch.setattr(
             "swival.audit._call_audit_llm",
-            lambda ctx, messages, temperature=0.0, trace_task=None: "@@ none @@",
+            lambda ctx, messages, *args, **kwargs: "@@ none @@",
         )
         result = _parse_records_with_repair(
             ctx=SimpleNamespace(),
@@ -1800,7 +1800,7 @@ class TestParseRecordsWithRepair:
         metrics = {"parse_failures": 0, "repair_successes": 0, "repair_failures": 0}
         monkeypatch.setattr(
             "swival.audit._call_audit_llm",
-            lambda ctx, messages, temperature=0.0, trace_task=None: (
+            lambda ctx, messages, *args, **kwargs: (
                 "@@ finding @@\ntitle: still incomplete\n"
             ),
         )
@@ -1916,7 +1916,7 @@ class TestPhase3bExpansion:
         }
         monkeypatch.setattr(
             "swival.audit._call_audit_llm",
-            lambda ctx, messages, temperature=0.0, trace_task=None: (
+            lambda ctx, messages, *args, **kwargs: (
                 "@@ expansion @@\n"
                 "type: code execution\n"
                 "attacker: remote client\n"
@@ -1973,7 +1973,7 @@ class TestPhase3bExpansion:
         }
         monkeypatch.setattr(
             "swival.audit._call_audit_llm",
-            lambda ctx, messages, temperature=0.0, trace_task=None: (
+            lambda ctx, messages, *args, **kwargs: (
                 "@@ expansion @@\n"
                 "type: code execution\n"
                 "attacker: remote client\n"
@@ -2001,7 +2001,7 @@ class TestPhase3bExpansion:
 
         captured: list = []
 
-        def fake(ctx, messages, temperature=0.0, trace_task=None):
+        def fake(ctx, messages, *args, **kwargs):
             captured.append(messages)
             return (
                 "@@ expansion @@\n"
@@ -2079,7 +2079,7 @@ class TestPhase3bExpansion:
             "swival.audit._git_show", lambda path, base_dir: "eval(input())"
         )
 
-        def fake_call(ctx, messages, temperature=0.0, trace_task=None):
+        def fake_call(ctx, messages, *args, **kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
                 return (
@@ -2237,10 +2237,13 @@ class TestStateAmplificationDos:
             lambda path, base_dir: "h2o_add_header(...)",
         )
 
-        def fake_call(ctx, messages, temperature=0.0, trace_task=None):
+        def fake_call(ctx, messages, *args, **kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
-                assert "Focus bug classes: all" in messages[1]["content"]
+                assert (
+                    "Focus bug classes (triage hints, not limits): all"
+                    in messages[1]["content"]
+                )
                 assert "actively inspect parse/decode loops" in messages[0]["content"]
                 return (
                     "@@ finding @@\n"
@@ -2330,7 +2333,7 @@ class TestPhase2Triage:
     def _patch_llm(self, monkeypatch, response):
         calls = {"n": 0}
 
-        def fake(ctx, messages, temperature=None, trace_task=None):
+        def fake(ctx, messages, *args, **kwargs):
             calls["n"] += 1
             return response
 
@@ -2603,7 +2606,7 @@ class TestPhase1Profile:
         monkeypatch.setattr("swival.audit._git_show", lambda p, b: "x = 1")
         monkeypatch.setattr(
             "swival.audit._call_audit_llm",
-            lambda ctx, messages, temperature=0.0, trace_task=None: (
+            lambda ctx, messages, *args, **kwargs: (
                 "@@ profile @@\n"
                 "language: python\n"
                 "framework: pytest\n"
@@ -2638,7 +2641,7 @@ class TestPhase1Profile:
                 return "libsodium_la_SOURCES = crypto_auth/auth.c\n"
             raise AssertionError(f"unexpected git show path: {path}")
 
-        def fake_call(ctx, messages, temperature=0.0, trace_task=None):
+        def fake_call(ctx, messages, *args, **kwargs):
             captured["user"] = messages[1]["content"]
             return "@@ profile @@\nlanguage: c\nsummary: scoped c library\n"
 
@@ -2680,7 +2683,7 @@ class TestPhase1Profile:
         monkeypatch.setattr("swival.audit._git_show", lambda p, b: "x = 1")
         calls = {"n": 0}
 
-        def fake_call(ctx, messages, temperature=0.0, trace_task=None):
+        def fake_call(ctx, messages, *args, **kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
                 # Initial response: missing required summary
@@ -2738,9 +2741,7 @@ class TestParseFailureBreakdown:
         # without succeeding, so we can pin the typed counter to one event.
         monkeypatch.setattr(
             "swival.audit._call_audit_llm",
-            lambda ctx, messages, temperature=0.0, trace_task=None: (
-                "@@ finding @@\ntitle: bad\n"
-            ),
+            lambda ctx, messages, *args, **kwargs: "@@ finding @@\ntitle: bad\n",
         )
         with pytest.raises(ValueError):
             _parse_records_with_repair(
@@ -2766,7 +2767,7 @@ class TestParseFailureBreakdown:
         metrics = self._new_metrics()
         monkeypatch.setattr(
             "swival.audit._call_audit_llm",
-            lambda ctx, messages, temperature=0.0, trace_task=None: (
+            lambda ctx, messages, *args, **kwargs: (
                 "@@ expansion @@\ntype: code execution\n"
             ),
         )
@@ -2789,9 +2790,7 @@ class TestParseFailureBreakdown:
         metrics = self._new_metrics()
         monkeypatch.setattr(
             "swival.audit._call_audit_llm",
-            lambda ctx, messages, temperature=0.0, trace_task=None: (
-                "@@ profile @@\nlanguage: python\n"
-            ),
+            lambda ctx, messages, *args, **kwargs: "@@ profile @@\nlanguage: python\n",
         )
         with pytest.raises(ValueError):
             _parse_records_with_repair(
@@ -2827,7 +2826,7 @@ class TestParseFailureBreakdown:
         monkeypatch.setattr("swival.audit._git_show", lambda p, b: "x = 1")
         monkeypatch.setattr(
             "swival.audit._call_audit_llm",
-            lambda ctx, messages, temperature=0.0, trace_task=None: "garbage",
+            lambda ctx, messages, *args, **kwargs: "garbage",
         )
 
         _phase2_triage_one("a.py", state, ctx)
@@ -2962,6 +2961,38 @@ class TestStatePersistence:
         assert loaded.phase == "verification"
         state_path = state.state_dir / state.run_id / "state.json"
         assert "next_index" not in state_path.read_text()
+
+    def test_truncated_files_round_trip(self, tmp_path):
+        state = self._make_state(tmp_path)
+        state.truncated_files = {"a.py": 2}
+        state.save()
+
+        loaded = AuditRunState.load(state.state_dir, "test-run")
+        assert loaded.truncated_files == {"a.py": 2}
+
+    def test_legacy_state_defaults_truncated_files_and_metrics(self, tmp_path):
+        import json
+
+        state = self._make_state(tmp_path)
+        state.save()
+        state_path = state.state_dir / "test-run" / "state.json"
+        blob = json.loads(state_path.read_text())
+        blob.pop("truncated_files")
+        blob["metrics"] = {"parse_failures": 7}
+        state_path.write_text(json.dumps(blob))
+
+        loaded = AuditRunState.load(state.state_dir, "test-run")
+        assert loaded.truncated_files == {}
+        assert loaded.metrics["parse_failures"] == 7
+        for key in (
+            "verifier_no_verdict",
+            "phase45_lens_retries",
+            "truncated_calls",
+            "empty_response_retries",
+            "high_none_retries",
+        ):
+            loaded.metrics[key] += 1
+            assert loaded.metrics[key] == 1
 
     def test_resume_matches_commit_and_focus(self, tmp_path):
         state = self._make_state(tmp_path)
@@ -3103,7 +3134,9 @@ class TestDeepReviewRecovery:
             triage_records={
                 "a.py": TriageRecord(
                     path="a.py",
-                    priority="ESCALATE_HIGH",
+                    # MEDIUM so the ESCALATE_HIGH empty-inventory second
+                    # opinion stays out of this repair-focused test.
+                    priority="ESCALATE_MEDIUM",
                     confidence="high",
                     bug_classes=["unsafe_data_flow"],
                     summary="x",
@@ -3124,7 +3157,7 @@ class TestDeepReviewRecovery:
             "swival.audit._git_show", lambda path, base_dir: "print('x')"
         )
 
-        def fake_call(ctx, messages, temperature=0.0, trace_task=None):
+        def fake_call(ctx, messages, *args, **kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
                 return "@@ finding @@\ntitle: incomplete\n"
@@ -3138,6 +3171,101 @@ class TestDeepReviewRecovery:
         assert calls["n"] == 2
         assert state.metrics["parse_failures"] == 1
         assert state.metrics["repair_successes"] == 1
+
+
+_3A_FINDING_RESPONSE = (
+    "@@ finding @@\n"
+    "title: eval of request data\n"
+    "severity: high\n"
+    "location: a.py:1\n"
+    "attacker: remote client\n"
+    "trigger: request body reaches eval\n"
+    "impact: arbitrary code execution as server user\n"
+    "claim: user input reaches eval\n"
+)
+
+_3B_EXPANSION_RESPONSE = (
+    "@@ expansion @@\n"
+    "type: code execution\n"
+    "attacker: remote client\n"
+    "trigger: request body reaches eval\n"
+    "impact: arbitrary code execution as server user\n"
+    "preconditions: none\n"
+    "proof: direct\n"
+    "fix_outline: fix it\n"
+)
+
+
+class TestHighNoneSecondOpinion:
+    """One identical 3A re-ask when ESCALATE_HIGH triage meets an empty inventory."""
+
+    def _state(self, tmp_path, priority):
+        scope = AuditScope(
+            branch="main",
+            commit="abc123",
+            tracked_files=["a.py"],
+            mandatory_files=["a.py"],
+            focus=[],
+        )
+        return AuditRunState(
+            run_id="x",
+            scope=scope,
+            queued_files=["a.py"],
+            triage_records={
+                "a.py": TriageRecord(
+                    path="a.py",
+                    priority=priority,
+                    confidence="high",
+                    bug_classes=["unsafe_data_flow"],
+                    summary="x",
+                    relevant_symbols=[],
+                    suspicious_flows=[],
+                    needs_followup=False,
+                )
+            },
+            repo_profile={"summary": "tiny repo"},
+            import_index={},
+            caller_index={},
+            state_dir=tmp_path,
+        )
+
+    def _run(self, monkeypatch, tmp_path, priority):
+        from types import SimpleNamespace
+        from swival.audit import _phase3_deep_review
+
+        state = self._state(tmp_path, priority)
+        ctx = SimpleNamespace(base_dir=str(tmp_path), loop_kwargs={})
+        counts = {"3a": 0}
+
+        monkeypatch.setattr(
+            "swival.audit._git_show", lambda path, base_dir: "eval(input())"
+        )
+
+        def fake_call(ctx, messages, *args, **kwargs):
+            task = kwargs.get("trace_task", "")
+            if "phase 3a" in task:
+                counts["3a"] += 1
+                return "@@ none @@" if counts["3a"] == 1 else _3A_FINDING_RESPONSE
+            return _3B_EXPANSION_RESPONSE
+
+        monkeypatch.setattr("swival.audit._call_audit_llm", fake_call)
+        findings = _phase3_deep_review("a.py", state, ctx)
+        return state, counts, findings
+
+    def test_high_priority_empty_inventory_gets_second_opinion(
+        self, monkeypatch, tmp_path
+    ):
+        state, counts, findings = self._run(monkeypatch, tmp_path, "ESCALATE_HIGH")
+        assert counts["3a"] == 2
+        assert len(findings) == 1
+        assert findings[0].title == "eval of request data"
+        assert state.metrics["high_none_retries"] == 1
+
+    def test_medium_priority_empty_inventory_no_retry(self, monkeypatch, tmp_path):
+        state, counts, findings = self._run(monkeypatch, tmp_path, "ESCALATE_MEDIUM")
+        assert counts["3a"] == 1
+        assert findings == []
+        assert state.metrics["high_none_retries"] == 0
 
 
 class TestVerificationGates:
@@ -3782,7 +3910,7 @@ class TestMessageLayout:
 
         monkeypatch.setattr("swival.audit._git_show", lambda p, b: "x = 1")
 
-        def fake_call(ctx, messages, temperature=None, trace_task=None):
+        def fake_call(ctx, messages, *args, **kwargs):
             captured["messages"] = messages
             return (
                 "@@ triage @@\n"
@@ -3809,7 +3937,7 @@ class TestMessageLayout:
         ctx = SimpleNamespace(base_dir=str(tmp_path), loop_kwargs={})
         captured = {}
 
-        def fake_call(ctx, messages, temperature=None, trace_task=None):
+        def fake_call(ctx, messages, *args, **kwargs):
             captured["messages"] = messages
             return "@@ none @@"
 
@@ -3822,7 +3950,7 @@ class TestMessageLayout:
         assert "unsafe_data_flow" in user_content
         assert "injection" in user_content
 
-    def test_phase3b_evidence_before_finding_metadata(self, monkeypatch, tmp_path):
+    def test_phase3b_finding_metadata_before_evidence(self, monkeypatch, tmp_path):
         from types import SimpleNamespace
         from swival.audit import _phase3b_expand_one, _PHASE3B_SYSTEM
 
@@ -3830,7 +3958,7 @@ class TestMessageLayout:
         ctx = SimpleNamespace(base_dir=str(tmp_path), loop_kwargs={})
         captured = {}
 
-        def fake_call(ctx, messages, temperature=None, trace_task=None):
+        def fake_call(ctx, messages, *args, **kwargs):
             captured["messages"] = messages
             return (
                 "@@ expansion @@\n"
@@ -3860,8 +3988,9 @@ class TestMessageLayout:
         assert system_content == _PHASE3B_SYSTEM
         evidence_pos = user_content.index("Committed evidence")
         finding_pos = user_content.index("Finding to expand:")
-        assert evidence_pos < finding_pos, (
-            "evidence must come before finding metadata for prefix caching"
+        assert finding_pos < evidence_pos, (
+            "the finding under expansion must lead so head-truncation can "
+            "never delete it"
         )
         assert "eval injection" in user_content
         assert "user input reaches eval" in user_content
@@ -4255,6 +4384,113 @@ class TestPhase4Parallelism:
         result = _verify_one_finding((key, finding), state, ctx)
         assert result.discarded
         assert result.error is None
+
+    def _run_verifier_with_answer(
+        self, monkeypatch, tmp_path, state, answer, exhausted=False
+    ):
+        from types import SimpleNamespace
+
+        finding = self._make_finding()
+        key = _finding_key(finding)
+
+        class DummyWorktree:
+            def __init__(self, base_dir, work_dir):
+                pass
+
+            def __enter__(self):
+                return tmp_path / "wt"
+
+            def __exit__(self, *exc):
+                return False
+
+        monkeypatch.setattr("swival.audit._worktree", DummyWorktree)
+        monkeypatch.setattr(
+            "swival.audit._gather_evidence", lambda f, s, c: ("evidence", 1)
+        )
+        monkeypatch.setattr(
+            "swival.agent.run_agent_loop",
+            lambda msgs, tools, **kw: (answer, exhausted),
+        )
+        ctx = SimpleNamespace(
+            base_dir=str(tmp_path), tools=[], loop_kwargs=self._loop_kwargs()
+        )
+        return _verify_one_finding((key, finding), state, ctx)
+
+    def test_parse_verdict_line(self):
+        from swival.audit import _parse_verdict_line
+
+        assert _parse_verdict_line("proof\nREPRODUCED") is True
+        assert _parse_verdict_line("could not confirm\nNOTREPRODUCED") is False
+        assert _parse_verdict_line("  REPRODUCED  \n\n") is True
+        # Scanning runs from the end past non-token lines, so a token line
+        # followed by trailing prose still counts.
+        assert _parse_verdict_line("REPRODUCED\nbut see caveats above") is True
+        assert _parse_verdict_line("the bug REPRODUCED in my test") is None
+        assert _parse_verdict_line("") is None
+        assert _parse_verdict_line("no token here") is None
+        # Token line wins over prose mentions of the other token earlier on.
+        assert (
+            _parse_verdict_line("at first NOTREPRODUCED seemed right\nREPRODUCED")
+            is True
+        )
+
+    def test_empty_answer_is_failed_not_discarded(self, monkeypatch, tmp_path):
+        state = self._make_state(tmp_path)
+        result = self._run_verifier_with_answer(monkeypatch, tmp_path, state, "")
+        assert result.error is not None
+        assert "no verdict token" in result.error
+        assert not result.discarded
+        assert state.metrics["verifier_no_verdict"] == 2  # original + one retry
+
+    def test_tokenless_answer_is_failed_not_discarded(self, monkeypatch, tmp_path):
+        state = self._make_state(tmp_path)
+        result = self._run_verifier_with_answer(
+            monkeypatch, tmp_path, state, "I could not reproduce this issue."
+        )
+        assert result.error is not None
+        assert "no verdict token" in result.error
+        assert not result.discarded
+
+    def test_both_tokens_in_prose_final_reproduced_verifies(
+        self, monkeypatch, tmp_path
+    ):
+        state = self._make_state(tmp_path)
+        answer = (
+            "I initially leaned toward NOTREPRODUCED, but the PoC crashed.\nREPRODUCED"
+        )
+        result = self._run_verifier_with_answer(monkeypatch, tmp_path, state, answer)
+        assert result.verified_finding is not None
+        assert result.error is None
+
+    def test_exhausted_with_verdict_line_accepts_verdict(self, monkeypatch, tmp_path):
+        state = self._make_state(tmp_path)
+        result = self._run_verifier_with_answer(
+            monkeypatch, tmp_path, state, "proof\nREPRODUCED", exhausted=True
+        )
+        assert result.verified_finding is not None
+        assert result.error is None
+
+    def test_exhausted_with_notreproduced_line_discards(self, monkeypatch, tmp_path):
+        state = self._make_state(tmp_path)
+        result = self._run_verifier_with_answer(
+            monkeypatch, tmp_path, state, "no crash\nNOTREPRODUCED", exhausted=True
+        )
+        assert result.discarded
+        assert result.error is None
+
+    def test_exhausted_without_verdict_is_failed(self, monkeypatch, tmp_path):
+        state = self._make_state(tmp_path)
+        result = self._run_verifier_with_answer(
+            monkeypatch,
+            tmp_path,
+            state,
+            "ran out of budget mid-analysis",
+            exhausted=True,
+        )
+        assert result.error is not None
+        assert "no verdict token" in result.error
+        assert "turn budget exhausted" in result.error
+        assert not result.discarded
 
     def test_stale_running_reset_to_pending(self, tmp_path):
         state = self._make_state(tmp_path)
@@ -4651,7 +4887,7 @@ class TestPhase3Split:
         monkeypatch.setattr("swival.audit._git_show", lambda path, base_dir: "x = 1")
         monkeypatch.setattr(
             "swival.audit._call_audit_llm",
-            lambda ctx, messages, temperature=0.0, trace_task=None: "@@ none @@",
+            lambda ctx, messages, *args, **kwargs: "@@ none @@",
         )
 
         result = _deep_review_one("a.py", state, ctx)
@@ -4670,7 +4906,7 @@ class TestPhase3Split:
             "swival.audit._git_show", lambda path, base_dir: "eval(input())"
         )
 
-        def fake_call(ctx, messages, temperature=0.0, trace_task=None):
+        def fake_call(ctx, messages, *args, **kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
                 return (
@@ -4730,7 +4966,7 @@ class TestPhase3Split:
 
         monkeypatch.setattr(
             "swival.audit._call_audit_llm",
-            lambda ctx, messages, temperature=0.0, trace_task=None: (
+            lambda ctx, messages, *args, **kwargs: (
                 inventory_response
                 if "phase 3" in (messages[0].get("content", "") or "").lower()
                 else "totally broken output {{{"
@@ -4752,7 +4988,7 @@ class TestPhase3Split:
 
         monkeypatch.setattr("swival.audit._git_show", lambda path, base_dir: "code")
 
-        def fake_call(ctx, messages, temperature=0.0, trace_task=None):
+        def fake_call(ctx, messages, *args, **kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
                 return (
@@ -4808,7 +5044,7 @@ class TestPhase3Split:
 
         monkeypatch.setattr("swival.audit._git_show", lambda path, base_dir: "code")
 
-        def fake_call(ctx, messages, temperature=0.0, trace_task=None):
+        def fake_call(ctx, messages, *args, **kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
                 return (
@@ -4851,7 +5087,7 @@ class TestPhase3Split:
             "swival.audit._git_show", lambda path, base_dir: "verify_sig(...)"
         )
 
-        def fake_call(ctx, messages, temperature=0.0, trace_task=None):
+        def fake_call(ctx, messages, *args, **kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
                 return (
@@ -4899,7 +5135,7 @@ class TestPhase3Split:
 
         monkeypatch.setattr("swival.audit._git_show", lambda path, base_dir: "code")
 
-        def fake_call(ctx, messages, temperature=0.0, trace_task=None):
+        def fake_call(ctx, messages, *args, **kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
                 return (
@@ -4940,7 +5176,7 @@ class TestPhase3Split:
 
         monkeypatch.setattr("swival.audit._git_show", lambda path, base_dir: "code")
 
-        def fake_call(ctx, messages, temperature=0.0, trace_task=None):
+        def fake_call(ctx, messages, *args, **kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
                 return (
@@ -4982,7 +5218,7 @@ class TestPhase3Split:
 
         monkeypatch.setattr("swival.audit._git_show", lambda path, base_dir: "code")
 
-        def fake_call(ctx, messages, temperature=0.0, trace_task=None):
+        def fake_call(ctx, messages, *args, **kwargs):
             calls["n"] += 1
             if calls["n"] <= 2:
                 return "@@ finding @@\ntitle: bad\n"
@@ -5005,9 +5241,7 @@ class TestPhase3Split:
         monkeypatch.setattr("swival.audit._git_show", lambda path, base_dir: "code")
         monkeypatch.setattr(
             "swival.audit._call_audit_llm",
-            lambda ctx, messages, temperature=0.0, trace_task=None: (
-                "@@ finding @@\ntitle: incomplete\n"
-            ),
+            lambda ctx, messages, *args, **kwargs: "@@ finding @@\ntitle: incomplete\n",
         )
 
         result = _deep_review_one("a.py", state, ctx)
@@ -5652,7 +5886,40 @@ class TestCallAuditLlmOverflowRetry:
         assert any("overflow" in (t or "") for t in traces)
         assert any(t == "triage foo.py" for t in traces)
 
-    def test_empty_response_retries_with_truncation(self, monkeypatch):
+    def test_empty_response_retries_full_length_first(self, monkeypatch):
+        """The first empty-response retry resends the message unchanged."""
+        from types import SimpleNamespace
+
+        from swival.audit import _call_audit_llm
+
+        calls = []
+
+        def fake_call_llm(*args, **kwargs):
+            messages = args[2]
+            user_text = messages[-1]["content"]
+            calls.append(user_text)
+            if len(calls) == 1:
+                msg = SimpleNamespace(content="", role="assistant")
+                return msg, "stop", None, 0, None
+            msg = SimpleNamespace(content="ok-second-try", role="assistant")
+            return msg, "stop", None, 0, None
+
+        monkeypatch.setattr("swival.agent.call_llm", fake_call_llm)
+        ctx = self._make_ctx()
+        metrics = {}
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "x" * 2000},
+        ]
+        result = _call_audit_llm(ctx, msgs, metrics=metrics)
+        assert result == "ok-second-try"
+        assert len(calls) == 2
+        assert calls[1] == calls[0]
+        assert "[truncated" not in calls[1]
+        assert metrics["empty_response_retries"] == 1
+        assert metrics.get("truncated_calls", 0) == 0
+
+    def test_empty_response_shrinks_from_second_retry(self, monkeypatch):
         from types import SimpleNamespace
 
         from swival.audit import _call_audit_llm
@@ -5677,9 +5944,81 @@ class TestCallAuditLlmOverflowRetry:
         ]
         result = _call_audit_llm(ctx, msgs)
         assert result == "ok-after-truncation"
-        assert len(calls) == 2
+        assert len(calls) == 3
         assert calls[0] == 2000
-        assert calls[1] < 2000
+        assert calls[1] == 2000  # full-length retry first
+        assert calls[2] < 2000  # then shrink
+
+    def test_empty_response_at_floor_still_retries(self, monkeypatch):
+        """A prompt at/below the truncation floor retries without shrinking
+        and still counts every empty response."""
+        from types import SimpleNamespace
+
+        from swival.audit import _call_audit_llm
+
+        calls = []
+
+        def fake_call_llm(*args, **kwargs):
+            messages = args[2]
+            calls.append(len(messages[-1]["content"]))
+            msg = SimpleNamespace(content="", role="assistant")
+            return msg, "stop", None, 0, None
+
+        monkeypatch.setattr("swival.agent.call_llm", fake_call_llm)
+        ctx = self._make_ctx()
+        metrics = {}
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "x" * 100},
+        ]
+        result = _call_audit_llm(ctx, msgs, metrics=metrics)
+        assert result == ""
+        assert len(calls) == 4  # original + 3 retries
+        assert all(c == 100 for c in calls)  # never shrunk
+        assert metrics["empty_response_retries"] == 4
+
+    def test_overflow_truncation_reported(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from swival.agent import ContextOverflowError
+        from swival.audit import _call_audit_llm
+
+        warnings = []
+
+        def fake_call_llm(*args, **kwargs):
+            messages = args[2]
+            user_text = messages[-1]["content"]
+            if "[truncated" not in user_text:
+                raise ContextOverflowError("too big")
+            msg = SimpleNamespace(content="ok", role="assistant")
+            return msg, "stop", None, 0, None
+
+        monkeypatch.setattr("swival.agent.call_llm", fake_call_llm)
+        monkeypatch.setattr(
+            "swival.audit._ui_warning", lambda ui, msg: warnings.append(msg)
+        )
+        ctx = self._make_ctx()
+        metrics = {}
+        truncation_out = []
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "x" * 2000},
+        ]
+        result = _call_audit_llm(
+            ctx,
+            msgs,
+            trace_task="audit: phase 3a inventory a.py",
+            metrics=metrics,
+            truncation_out=truncation_out,
+        )
+        assert result == "ok"
+        assert metrics["truncated_calls"] == 1
+        assert truncation_out == [
+            {"shrinks": 1, "final_limit": 1000, "original_len": 2000}
+        ]
+        assert len(warnings) == 1
+        assert "evidence truncated to 50%" in warnings[0]
+        assert "phase 3a inventory a.py" in warnings[0]
 
 
 class TestMatchPathGlob:
@@ -6159,7 +6498,7 @@ class TestSelectAll:
 
         captured: dict = {}
 
-        def fake_call(ctx, messages, temperature=0.0, trace_task=None):
+        def fake_call(ctx, messages, *args, **kwargs):
             captured["user"] = messages[1]["content"]
             return "@@ none @@"
 
@@ -6167,7 +6506,7 @@ class TestSelectAll:
 
         _phase3a_inventory("a.py", state, ctx, content="print('x')")
 
-        assert "Focus bug classes: all" in captured["user"]
+        assert "Focus bug classes (triage hints, not limits): all" in captured["user"]
         assert "Phase 2 triage result:\n{}" in captured["user"]
 
     # -- Resume preservation -------------------------------------------------
@@ -6510,6 +6849,239 @@ class TestPromotion:
         assert state.triage_records["b.py"].priority == "ESCALATE_MEDIUM"
         assert state.triage_records["c.py"].priority == "ESCALATE_MEDIUM"
 
+    def _focused_state(self, tmp_path, focus):
+        scope = AuditScope(
+            branch="m",
+            commit="c",
+            tracked_files=["a/b.py", "a/c.py"],
+            mandatory_files=["a/b.py", "a/c.py"],
+            focus=focus,
+        )
+        return AuditRunState(
+            run_id="r",
+            scope=scope,
+            queued_files=["a/b.py", "a/c.py"],
+            state_dir=tmp_path,
+            triage_records={p: _bare_triage(p) for p in ["a/b.py", "a/c.py"]},
+        )
+
+    def test_exact_focus_promotes_skip(self, tmp_path):
+        from swival.audit import _apply_promotions, _exact_focus_paths
+
+        state = self._focused_state(tmp_path, ["a/b.py"])
+        matches = {p: "focus" for p in _exact_focus_paths(state.scope)}
+        assert matches == {"a/b.py": "focus"}
+        _apply_promotions(state, matches)
+        rec = state.triage_records["a/b.py"]
+        assert rec.priority == "ESCALATE_MEDIUM"
+        assert "named explicitly in /audit focus" in rec.promotion_reasons
+        assert "forced via swival.toml" not in " ".join(rec.promotion_reasons)
+        assert state.triage_records["a/c.py"].priority == "SKIP"
+
+    def test_directory_focus_does_not_promote(self, tmp_path):
+        from swival.audit import _exact_focus_paths
+
+        state = self._focused_state(tmp_path, ["a"])
+        assert _exact_focus_paths(state.scope) == []
+
+    def test_glob_focus_does_not_promote(self, tmp_path):
+        from swival.audit import _exact_focus_paths
+
+        state = self._focused_state(tmp_path, ["a/*.py"])
+        assert _exact_focus_paths(state.scope) == []
+
+
+class TestDirtyWorktreeWarning:
+    """Fresh runs warn when the working tree diverges from the audited HEAD."""
+
+    def _scope(self, tmp_path, focus=None):
+        from swival.audit import _resolve_scope
+
+        return _resolve_scope(str(tmp_path), focus or [])
+
+    def test_clean_repo_emits_nothing(self, tmp_path):
+        from swival.audit import _dirty_worktree_warning
+
+        _init_git(tmp_path)
+        _commit_file(tmp_path, "a.py", "x = 1")
+        scope = self._scope(tmp_path)
+        assert _dirty_worktree_warning(str(tmp_path), scope) is None
+
+    def test_modified_and_untracked_counted(self, tmp_path):
+        from swival.audit import _dirty_worktree_warning
+
+        _init_git(tmp_path)
+        _commit_file(tmp_path, "a.py", "x = 1")
+        scope = self._scope(tmp_path)
+        (tmp_path / "a.py").write_text("x = 2")
+        (tmp_path / "new.py").write_text("y = 1")
+
+        msg = _dirty_worktree_warning(str(tmp_path), scope)
+        assert msg is not None
+        assert "audit reviews committed content at" in msg
+        assert scope.commit[:8] in msg
+        assert "1 tracked file(s) differ from HEAD" in msg
+        assert "1 untracked file(s) are not audited" in msg
+
+    def test_deleted_tracked_file_counts_as_differing(self, tmp_path):
+        from swival.audit import _dirty_worktree_warning
+
+        _init_git(tmp_path)
+        _commit_file(tmp_path, "a.py", "x = 1")
+        scope = self._scope(tmp_path)
+        (tmp_path / "a.py").unlink()
+
+        msg = _dirty_worktree_warning(str(tmp_path), scope)
+        assert msg is not None
+        assert "1 tracked file(s) differ from HEAD" in msg
+
+    def test_staged_rename_counts_as_differing(self, tmp_path):
+        import subprocess
+
+        from swival.audit import _dirty_worktree_warning
+
+        _init_git(tmp_path)
+        _commit_file(tmp_path, "a.py", "x = 1")
+        scope = self._scope(tmp_path)
+        subprocess.run(
+            ["git", "mv", "a.py", "b.py"],
+            cwd=tmp_path,
+            capture_output=True,
+            check=True,
+        )
+
+        msg = _dirty_worktree_warning(str(tmp_path), scope)
+        assert msg is not None
+        assert "1 tracked file(s) differ from HEAD" in msg
+        # The staged new name is tracked, not untracked.
+        assert "untracked" not in msg
+
+    def test_untracked_outside_focus_not_counted(self, tmp_path):
+        from swival.audit import _dirty_worktree_warning
+
+        _init_git(tmp_path)
+        _commit_file(tmp_path, "pkg/a.py", "x = 1")
+        scope = self._scope(tmp_path, focus=["pkg/"])
+        (tmp_path / "elsewhere.py").write_text("y = 1")
+
+        assert _dirty_worktree_warning(str(tmp_path), scope) is None
+
+    def test_untracked_inside_focus_counted(self, tmp_path):
+        from swival.audit import _dirty_worktree_warning
+
+        _init_git(tmp_path)
+        _commit_file(tmp_path, "pkg/a.py", "x = 1")
+        scope = self._scope(tmp_path, focus=["pkg/"])
+        (tmp_path / "pkg" / "new.py").write_text("y = 1")
+
+        msg = _dirty_worktree_warning(str(tmp_path), scope)
+        assert msg is not None
+        assert "1 untracked file(s) are not audited" in msg
+
+    def test_non_auditable_changes_ignored(self, tmp_path):
+        from swival.audit import _dirty_worktree_warning
+
+        _init_git(tmp_path)
+        _commit_file(tmp_path, "a.py", "x = 1")
+        scope = self._scope(tmp_path)
+        (tmp_path / "notes.txt").write_text("scratch")
+
+        assert _dirty_worktree_warning(str(tmp_path), scope) is None
+
+
+class TestExactFocusPromotion:
+    """An exact /audit focus path bypasses a triage SKIP end to end."""
+
+    def test_exact_focus_file_reaches_deep_review(self, monkeypatch, tmp_path):
+        from types import SimpleNamespace
+        from swival.audit import DeepReviewResult, run_audit_command
+
+        _init_git(tmp_path)
+        _commit_file(tmp_path, "a.py", "x = 1")
+        _commit_file(tmp_path, "b.py", "y = 2")
+
+        reviewed = []
+        captured = {}
+
+        def fake_deep_review(path, state, ctx, ui=None):
+            reviewed.append(path)
+            captured["record"] = state.triage_records[path]
+            return DeepReviewResult(path=path, findings=[])
+
+        def fake_triage(path, state, ctx):
+            return TriageRecord(
+                path=path,
+                priority="SKIP",
+                confidence="high",
+                bug_classes=[],
+                summary="looks fine",
+                relevant_symbols=[],
+                suspicious_flows=[],
+                needs_followup=False,
+            )
+
+        monkeypatch.setattr("swival.audit._deep_review_one", fake_deep_review)
+        monkeypatch.setattr("swival.audit._phase2_triage_one", fake_triage)
+        monkeypatch.setattr(
+            "swival.audit._phase1_repo_profile",
+            lambda state, ctx: {"summary": "test"},
+        )
+
+        ctx = SimpleNamespace(
+            base_dir=str(tmp_path),
+            tools=[],
+            verbose=False,
+            no_history=True,
+            loop_kwargs={},
+        )
+        run_audit_command("a.py", ctx)
+        assert reviewed == ["a.py"]
+        rec = captured["record"]
+        assert rec.priority == "ESCALATE_MEDIUM"
+        assert "named explicitly in /audit focus" in rec.promotion_reasons
+
+    def test_directory_focus_does_not_bypass_triage(self, monkeypatch, tmp_path):
+        from types import SimpleNamespace
+        from swival.audit import DeepReviewResult, run_audit_command
+
+        _init_git(tmp_path)
+        _commit_file(tmp_path, "pkg/a.py", "x = 1")
+
+        reviewed = []
+
+        def fake_deep_review(path, state, ctx, ui=None):
+            reviewed.append(path)
+            return DeepReviewResult(path=path, findings=[])
+
+        def fake_triage(path, state, ctx):
+            return TriageRecord(
+                path=path,
+                priority="SKIP",
+                confidence="high",
+                bug_classes=[],
+                summary="looks fine",
+                relevant_symbols=[],
+                suspicious_flows=[],
+                needs_followup=False,
+            )
+
+        monkeypatch.setattr("swival.audit._deep_review_one", fake_deep_review)
+        monkeypatch.setattr("swival.audit._phase2_triage_one", fake_triage)
+        monkeypatch.setattr(
+            "swival.audit._phase1_repo_profile",
+            lambda state, ctx: {"summary": "test"},
+        )
+
+        ctx = SimpleNamespace(
+            base_dir=str(tmp_path),
+            tools=[],
+            verbose=False,
+            no_history=True,
+            loop_kwargs={},
+        )
+        run_audit_command("pkg", ctx)
+        assert reviewed == []
+
 
 class TestForceReviewConfig:
     """[audit] force_review TOML schema and merge logic."""
@@ -6708,7 +7280,7 @@ class TestPhase2PromptScoreCache:
 
         captured = {}
 
-        def fake_call(ctx, msgs, temperature=0.0, trace_task=None):
+        def fake_call(ctx, msgs, *args, **kwargs):
             captured["user"] = msgs[1]["content"]
             return (
                 "@@ triage @@\n"
@@ -6750,7 +7322,7 @@ class TestPhase2PromptScoreCache:
 
         monkeypatch.setattr(
             "swival.audit._call_audit_llm",
-            lambda ctx, msgs, temperature=0.0, trace_task=None: (
+            lambda ctx, msgs, *args, **kwargs: (
                 "@@ triage @@\n"
                 "priority: SKIP\n"
                 "confidence: medium\n"
@@ -6789,7 +7361,7 @@ class TestPhase2PromptScoreCache:
 
         captured = {}
 
-        def fake_call(ctx, msgs, temperature=0.0, trace_task=None):
+        def fake_call(ctx, msgs, *args, **kwargs):
             captured["user"] = msgs[1]["content"]
             return (
                 "@@ triage @@\n"
@@ -6860,7 +7432,7 @@ class TestPhase2TriageFailureRecord:
 
         monkeypatch.setattr(
             "swival.audit._call_audit_llm",
-            lambda ctx, msgs, temperature=0.0, trace_task=None: "garbage no record",
+            lambda ctx, msgs, *args, **kwargs: "garbage no record",
         )
 
         ctx = SimpleNamespace(base_dir=str(tmp_path), loop_kwargs={})
@@ -6895,7 +7467,7 @@ class TestConfirmationPass:
 
         monkeypatch.setattr(
             "swival.audit._call_audit_llm",
-            lambda ctx, msgs, temperature=0.0, trace_task=None: (
+            lambda ctx, msgs, *args, **kwargs: (
                 "@@ triage @@\n"
                 "priority: ESCALATE_MEDIUM\n"
                 "confidence: medium\n"
@@ -7293,6 +7865,56 @@ class TestPhase45Adjudication:
         assert res.kept is True
         assert res.decision == "keep"
         assert res.final_severity == "high"
+        assert "only 0 usable" in res.reason
+
+    def test_single_refuting_verdict_cannot_drop(self, tmp_path, monkeypatch):
+        # One usable false_positive out of three lenses is not a jury: keep
+        # with the inconclusive reason instead of dropping.
+        fp = _verdict_block("false_positive", "no", "low", "no attacker gain")
+        res = self._adj(
+            tmp_path, monkeypatch, self._vf(), _adj_fake_call("junk", fp, "junk")
+        )
+        assert res.kept is True
+        assert res.decision == "keep"
+        assert res.reason == "adjudication inconclusive: only 1 usable panel verdict(s)"
+        assert res.final_severity == "high"
+
+    def test_two_usable_verdicts_tie_still_drops(self, tmp_path, monkeypatch):
+        # Two usable verdicts, 1 real vs 1 false_positive: a tie drops
+        # (refute by default) once the minimum jury of 2 is met.
+        fp = _verdict_block("false_positive", "no", "low", "no attacker gain")
+        real = _verdict_block("real", "yes", "high")
+        res = self._adj(
+            tmp_path, monkeypatch, self._vf(), _adj_fake_call("junk", fp, real)
+        )
+        assert res.kept is False
+        assert res.decision == "drop"
+
+    def test_flaky_lens_retried_once_and_counted(self, tmp_path, monkeypatch):
+        # A lens that fails parse on the first ask succeeds on the re-ask and
+        # contributes a verdict; the re-ask is counted in phase45_lens_retries.
+        real = _verdict_block("real", "yes", "high")
+        calls = {"reach": 0}
+
+        def fake_call(ctx, messages, *args, **kwargs):
+            system = messages[0]["content"]
+            if "format repair tool" in system:
+                return ""
+            if "Lens: reachability" in system:
+                calls["reach"] += 1
+                return "junk" if calls["reach"] == 1 else real
+            if "Lens:" in system:
+                return real
+            return ""
+
+        state = self._state(tmp_path)
+        monkeypatch.setattr("swival.audit._gather_evidence", lambda f, s, c: ("ev", 1))
+        monkeypatch.setattr("swival.audit._call_audit_llm", fake_call)
+        res = _adjudicate_one((0, self._vf()), state, self._ctx(tmp_path))
+
+        assert res.kept is True
+        assert calls["reach"] == 2
+        assert state.metrics["phase45_lens_retries"] == 1
 
     def test_driver_moves_drops_into_state(self, tmp_path, monkeypatch):
         from swival.audit_ui import AuditUI
@@ -7833,7 +8455,7 @@ class TestPhase3AAssembly:
     def _capture_llm(self, monkeypatch, response="@@ none @@"):
         captured: dict = {}
 
-        def fake_llm(ctx, messages, temperature=None, trace_task=None):
+        def fake_llm(ctx, messages, *args, **kwargs):
             captured["system"] = messages[0]["content"]
             captured["user"] = messages[-1]["content"]
             return response
@@ -7871,6 +8493,82 @@ class TestPhase3AAssembly:
         )
         assert f"{_CALLEE_SECTION_HEADER}\n(none)" in captured["user"]
 
+    def test_3a_message_order_degrades_callee_first(self, monkeypatch, tmp_path):
+        from swival.audit import _CALLEE_SECTION_HEADER, _phase3a_inventory
+
+        state, contents = _default_callee_state(tmp_path)
+        captured = self._capture_llm(monkeypatch)
+        _phase3a_inventory(
+            "pkg/main.py", state, _callee_ctx(tmp_path), contents["pkg/main.py"]
+        )
+        user = captured["user"]
+        assert user.startswith("Primary file: pkg/main.py")
+        assert "Focus bug classes (triage hints, not limits):" in user
+        # Head-truncation cuts from the end: the callee section must come
+        # last and the path declaration first.
+        assert (
+            user.index("Primary file:")
+            < user.index("Focus bug classes")
+            < user.index("Repository profile:")
+            < user.index("Phase 2 triage result:")
+            < user.index("Committed evidence bundle:")
+            < user.index(_CALLEE_SECTION_HEADER)
+        )
+
+    def test_3b_message_order_finding_first_callee_last(self, monkeypatch, tmp_path):
+        from swival.audit import _CALLEE_SECTION_HEADER, _phase3b_expand_one
+
+        state, contents = _default_callee_state(tmp_path)
+        captured = self._capture_llm(
+            monkeypatch,
+            response=(
+                "@@ expansion @@\n"
+                "type: code execution\n"
+                "attacker: remote client\n"
+                "trigger: request body reaches eval\n"
+                "impact: arbitrary code execution as server user\n"
+                "preconditions: none\n"
+                "proof: direct\n"
+                "fix_outline: fix it\n"
+            ),
+        )
+        stub = {
+            "title": "t",
+            "severity": "high",
+            "location": "pkg/main.py:1",
+            "attacker": "remote",
+            "trigger": "request",
+            "impact": "rce",
+            "claim": "c",
+        }
+        _phase3b_expand_one(
+            (stub, "pkg/main.py", contents["pkg/main.py"], state, _callee_ctx(tmp_path))
+        )
+        user = captured["user"]
+        assert user.startswith("Finding to expand:")
+        assert (
+            user.index("Finding to expand:")
+            < user.index("Committed evidence for pkg/main.py:")
+            < user.index(_CALLEE_SECTION_HEADER)
+        )
+
+    def test_3a_truncation_recorded_in_state(self, monkeypatch, tmp_path):
+        from swival.audit import _phase3a_inventory
+
+        state, contents = _default_callee_state(tmp_path)
+
+        def fake_llm(ctx, messages, *args, **kwargs):
+            out = kwargs.get("truncation_out")
+            if out is not None:
+                out.append({"shrinks": 2, "final_limit": 500, "original_len": 2000})
+            return "@@ none @@"
+
+        monkeypatch.setattr("swival.audit._call_audit_llm", fake_llm)
+        _phase3a_inventory(
+            "pkg/main.py", state, _callee_ctx(tmp_path), contents["pkg/main.py"]
+        )
+        assert state.truncated_files == {"pkg/main.py": 1}
+
 
 class TestPhase5StateThreading:
     def test_report_prompt_carries_callee_section(self, monkeypatch, tmp_path):
@@ -7879,7 +8577,7 @@ class TestPhase5StateThreading:
         state, contents = _default_callee_state(tmp_path)
         captured: dict = {}
 
-        def fake_llm(ctx, messages, temperature=None, trace_task=None):
+        def fake_llm(ctx, messages, *args, **kwargs):
             captured["user"] = messages[-1]["content"]
             return "# Report"
 

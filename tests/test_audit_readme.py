@@ -167,6 +167,20 @@ class TestDeterministicRender:
         assert "- files triaged: 2" in text
         assert "- artifacts: 2 written, 0 failed, 0 pending" in text
 
+    def test_truncated_files_line_rendered_when_present(self, tmp_path):
+        state = _make_two_finding_state(tmp_path)
+        state.truncated_files = {"main.c": 2, "lib.c": 1}
+        text = _render_findings_readme(state)
+        assert (
+            "- 2 file(s) deep-reviewed with truncated Phase 3 evidence "
+            "(context window too small): `lib.c`, `main.c`" in text
+        )
+
+    def test_truncated_files_line_absent_when_empty(self, tmp_path):
+        state = _make_two_finding_state(tmp_path)
+        text = _render_findings_readme(state)
+        assert "truncated Phase 3 evidence" not in text
+
 
 # ---------------------------------------------------------------------------
 # 2. Table escaping

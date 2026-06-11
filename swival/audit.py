@@ -54,6 +54,11 @@ _DEFAULT_METRICS: dict[str, int] = {
     "analytical_retries": 0,
     "multiline_continuations": 0,
     "lenient_corrections": 0,
+    "verifier_no_verdict": 0,
+    "phase45_lens_retries": 0,
+    "truncated_calls": 0,
+    "empty_response_retries": 0,
+    "high_none_retries": 0,
 }
 
 # ---------------------------------------------------------------------------
@@ -328,6 +333,10 @@ class AuditRunState:
     # Each entry: {"title", "severity", "source_file", "reason"}. Kept so the
     # README totals can explain why verified and written counts differ.
     adjudication_discarded: list[dict] = field(default_factory=list)
+    # path -> number of Phase 3 calls (3A inventory or 3B expansion) for that
+    # file whose evidence was head-truncated to fit the context window. A file
+    # listed here was deep-reviewed on partial evidence.
+    truncated_files: dict[str, int] = field(default_factory=dict)
     # In-memory HEAD content cache (path -> content), never persisted. HEAD
     # is fixed for the run, so entries never invalidate; concurrent duplicate
     # fills from worker threads are idempotent dict writes.
@@ -379,6 +388,7 @@ class AuditRunState:
             "measure_triage": self.measure_triage,
             "measurement_escalated_paths": sorted(self.measurement_escalated_paths),
             "adjudication_discarded": self.adjudication_discarded,
+            "truncated_files": self.truncated_files,
         }
         state_path = d / "state.json"
         tmp = state_path.with_suffix(".tmp")
@@ -429,13 +439,16 @@ class AuditRunState:
             artifact_state=blob["artifact_state"],
             state_dir=state_dir,
             phase=blob.get("phase", "init"),
-            metrics=blob.get("metrics", dict(_DEFAULT_METRICS)),
+            # Merge so a state file saved before a metric existed still
+            # supports bare `+= 1` on every current counter.
+            metrics={**_DEFAULT_METRICS, **blob.get("metrics", {})},
             select_all=bool(blob.get("select_all", False)),
             measure_triage=bool(blob.get("measure_triage", False)),
             measurement_escalated_paths=set(
                 blob.get("measurement_escalated_paths", [])
             ),
             adjudication_discarded=blob.get("adjudication_discarded", []),
+            truncated_files=blob.get("truncated_files", {}),
         )
         return state
 
@@ -555,6 +568,63 @@ def _match_path_glob(file: str, glob: str) -> bool:
 
 def _is_auditable(path: str) -> bool:
     return Path(path).suffix.lower() in _AUDITABLE_EXTS
+
+
+def _dirty_worktree_warning(base_dir: str, scope: AuditScope) -> str | None:
+    """One-line warning when the working tree differs from the audited HEAD.
+
+    /audit reviews committed content only; a user comparing against a naive
+    working-tree prompt needs to know when the two diverge. NUL-delimited
+    plumbing sidesteps the rename/deletion/quoting pitfalls of parsing
+    ``git status --porcelain``.
+    """
+    try:
+        diff_raw = _git(["diff", "--name-status", "-M", "-z", "HEAD"], base_dir)
+        untracked_raw = _git(
+            ["ls-files", "--others", "--exclude-standard", "-z"], base_dir
+        )
+    except (RuntimeError, OSError, subprocess.SubprocessError):
+        return None
+
+    # mandatory_files is already _is_auditable-filtered, so membership alone
+    # decides scope here. --name-status records are NUL-delimited as: status,
+    # path — except rename/copy (Rnnn/Cnnn), which carry two paths: old, then
+    # new. A staged rename reports only under the *new* name with --name-only,
+    # which is absent from the HEAD-derived mandatory set, so both sides must
+    # be checked here.
+    mandatory = set(scope.mandatory_files)
+    changed: list[str] = []
+    tokens = iter(diff_raw.split("\0"))
+    for status in tokens:
+        if not status:
+            continue
+        path = next(tokens, "")
+        if status.startswith(("R", "C")):
+            new = next(tokens, "")
+            if path in mandatory or new in mandatory:
+                changed.append(path)
+        elif path in mandatory:
+            changed.append(path)
+    # Untracked files are by definition absent from mandatory_files, so they
+    # are scoped by the focus globs directly; no focus means the whole repo.
+    untracked = [
+        p
+        for p in untracked_raw.split("\0")
+        if p
+        and _is_auditable(p)
+        and (not scope.focus or any(_match_path_glob(p, g) for g in scope.focus))
+    ]
+
+    if not changed and not untracked:
+        return None
+    parts = []
+    if changed:
+        parts.append(f"{len(changed)} tracked file(s) differ from HEAD")
+    if untracked:
+        parts.append(f"{len(untracked)} untracked file(s) are not audited")
+    return f"audit reviews committed content at {scope.commit[:8]}; " + " and ".join(
+        parts
+    )
 
 
 def _git_show(path: str, base_dir: str) -> str:
@@ -1805,6 +1875,11 @@ _METRIC_LABELS: tuple[tuple[str, str], ...] = (
     ("analytical_retries", "analytical retries"),
     ("multiline_continuations", "multiline continuations"),
     ("lenient_corrections", "lenient corrections"),
+    ("verifier_no_verdict", "verifier answers without a verdict token"),
+    ("phase45_lens_retries", "adjudication lens retries"),
+    ("truncated_calls", "calls with truncated evidence"),
+    ("empty_response_retries", "empty-response retries"),
+    ("high_none_retries", "ESCALATE_HIGH second opinions"),
 )
 
 
@@ -1949,7 +2024,17 @@ def _call_audit_llm(
     messages: list[dict],
     temperature: float | None = None,
     trace_task: str | None = None,
+    metrics: dict[str, int] | None = None,
+    truncation_out: list | None = None,
 ) -> str:
+    """Call the LLM with overflow/empty-response retry and head-truncation.
+
+    When ``metrics`` is supplied, bumps ``truncated_calls`` once per call that
+    shrank at least once and ``empty_response_retries`` once per empty
+    response received. When ``truncation_out`` is supplied and the call
+    shrank, appends exactly one record:
+    ``{"shrinks": n, "final_limit": limit, "original_len": len(original_text)}``.
+    """
     from .agent import call_llm, ContextOverflowError
     from ._msg import _msg_content
 
@@ -1985,6 +2070,7 @@ def _call_audit_llm(
     limit = len(original_text)
     messages = list(messages)
     overflowed_once = False
+    shrinks = 0
 
     _debug_log(
         "llm_request",
@@ -1993,20 +2079,41 @@ def _call_audit_llm(
         user_len=len(original_text),
     )
 
+    def _shrink() -> None:
+        nonlocal limit, shrinks
+        limit = limit // 2
+        shrinks += 1
+        if shrinks == 1:
+            pct = (100 * limit) // max(1, len(original_text))
+            _ui_warning(
+                None,
+                f"evidence truncated to {pct}% for {trace_task or 'audit call'}",
+            )
+        messages[-1] = {
+            **user_msg,
+            "content": original_text[:limit] + _AUDIT_TRUNCATION_MARKER,
+        }
+
     empty_retries = 0
     while True:
         try:
             content = _do_call(messages)
-            if not content and limit > _AUDIT_TRUNCATION_FLOOR:
+            if not content:
                 empty_retries += 1
+                if metrics is not None:
+                    metrics["empty_response_retries"] = (
+                        metrics.get("empty_response_retries", 0) + 1
+                    )
                 if empty_retries > 3:
                     break
                 _debug_log("llm_empty", task=trace_task, limit=limit)
-                limit = limit // 2
-                messages[-1] = {
-                    **user_msg,
-                    "content": original_text[:limit] + _AUDIT_TRUNCATION_MARKER,
-                }
+                # Empty output is usually transient, not a context problem:
+                # the first retry resends the message unchanged. Subsequent
+                # empties shrink, but only while the result stays above the
+                # truncation floor — the floor stops shrinking, never the
+                # retry itself.
+                if empty_retries > 1 and limit // 2 >= _AUDIT_TRUNCATION_FLOOR:
+                    _shrink()
                 continue
             break
         except ContextOverflowError:
@@ -2024,13 +2131,21 @@ def _call_audit_llm(
                     ],
                     task=(trace_task + " (overflow)" if trace_task else "overflow"),
                 )
-            limit = limit // 2
-            if limit < _AUDIT_TRUNCATION_FLOOR:
+            if limit // 2 < _AUDIT_TRUNCATION_FLOOR:
                 raise
-            messages[-1] = {
-                **user_msg,
-                "content": original_text[:limit] + _AUDIT_TRUNCATION_MARKER,
-            }
+            _shrink()
+
+    if shrinks:
+        if metrics is not None:
+            metrics["truncated_calls"] = metrics.get("truncated_calls", 0) + 1
+        if truncation_out is not None:
+            truncation_out.append(
+                {
+                    "shrinks": shrinks,
+                    "final_limit": limit,
+                    "original_len": len(original_text),
+                }
+            )
 
     _debug_log(
         "llm_response",
@@ -2792,7 +2907,12 @@ def _phase1_repo_profile(state: AuditRunState, ctx: InputContext) -> dict:
         {"role": "system", "content": _PHASE1_SYSTEM},
         {"role": "user", "content": suffix},
     ]
-    raw = _call_audit_llm(ctx, messages, trace_task="audit: phase 1 repo profile")
+    raw = _call_audit_llm(
+        ctx,
+        messages,
+        trace_task="audit: phase 1 repo profile",
+        metrics=state.metrics,
+    )
     records = _parse_records_with_repair(
         ctx,
         raw,
@@ -2863,7 +2983,12 @@ def _phase2_triage_one(
         {"role": "user", "content": suffix},
     ]
     try:
-        raw = _call_audit_llm(ctx, messages, trace_task=f"audit: phase 2 triage {path}")
+        raw = _call_audit_llm(
+            ctx,
+            messages,
+            trace_task=f"audit: phase 2 triage {path}",
+            metrics=state.metrics,
+        )
     except Exception as e:
         kind = type(e).__name__
         _debug_log(
@@ -2986,7 +3111,10 @@ def _phase2_confirm_one(
     ]
     try:
         raw = _call_audit_llm(
-            ctx, messages, trace_task=f"audit: phase 2 confirm {path}"
+            ctx,
+            messages,
+            trace_task=f"audit: phase 2 confirm {path}",
+            metrics=state.metrics,
         )
     except Exception as e:
         _debug_log("triage_confirm_failed", path=path, error=str(e))
@@ -3081,9 +3209,13 @@ def _compute_promotion_reasons(
         if rec.triage_failure_mode is not None:
             _add(p, f"triage infrastructure failure: {rec.triage_failure_mode}")
 
-    # Force-review (user override from swival.toml).
+    # Force-review (user override from swival.toml) and exact-path focus
+    # (the user named the file on the /audit command line).
     for p, source in force_review_matches.items():
-        _add(p, f"forced via swival.toml ({source})")
+        if source == "focus":
+            _add(p, "named explicitly in /audit focus")
+        else:
+            _add(p, f"forced via swival.toml ({source})")
 
     return reasons
 
@@ -3191,6 +3323,7 @@ _PROMOTION_REASON_LABELS: tuple[tuple[str, str, str], ...] = (
         "warning",
     ),
     ("forced via swival.toml", "force-listed in swival.toml", "info"),
+    ("named explicitly in /audit focus", "named explicitly in /audit focus", "info"),
 )
 
 
@@ -3264,19 +3397,31 @@ def _phase3a_inventory(
     if callee_context is None:
         callee_context = _gather_callee_context(path, content, state, ctx)
 
+    # Ordered so blind head-truncation deletes the least valuable content
+    # first: the callee section goes, then the tail of the file, never the
+    # path declaration.
     suffix = (
-        f"Focus bug classes: {bug_classes}\n\n"
+        f"Primary file: {path}\n\n"
+        f"Focus bug classes (triage hints, not limits): {bug_classes}\n\n"
         f"Repository profile:\n{profile_json}\n\n"
         f"Phase 2 triage result:\n{triage_json}\n\n"
         f"Committed evidence bundle:\n{content}\n\n"
-        f"{_CALLEE_SECTION_HEADER}\n{callee_context}\n\n"
-        f"Primary file: {path}"
+        f"{_CALLEE_SECTION_HEADER}\n{callee_context}"
     )
     messages = [
         {"role": "system", "content": _PHASE3A_SYSTEM},
         {"role": "user", "content": suffix},
     ]
-    raw = _call_audit_llm(ctx, messages, trace_task=f"audit: phase 3a inventory {path}")
+    truncation_out: list[dict] = []
+    raw = _call_audit_llm(
+        ctx,
+        messages,
+        trace_task=f"audit: phase 3a inventory {path}",
+        metrics=state.metrics,
+        truncation_out=truncation_out,
+    )
+    if truncation_out:
+        state.truncated_files[path] = state.truncated_files.get(path, 0) + 1
     return _parse_records_with_repair(
         ctx,
         raw,
@@ -3299,9 +3444,9 @@ def _phase3b_expand_one(
 
     if callee_context is None:
         callee_context = _gather_callee_context(path, content, state, ctx)
+    # The finding under expansion leads so head-truncation can never delete
+    # it; the callee section trails as the first content to go.
     suffix = (
-        f"Committed evidence for {path}:\n{content}\n\n"
-        f"{_CALLEE_SECTION_HEADER}\n{callee_context}\n\n"
         f"Finding to expand:\n"
         f"  Title: {finding_stub.get('title', '')}\n"
         f"  Severity: {finding_stub.get('severity', '')}\n"
@@ -3309,13 +3454,24 @@ def _phase3b_expand_one(
         f"  Attacker: {finding_stub.get('attacker', '')}\n"
         f"  Trigger: {finding_stub.get('trigger', '')}\n"
         f"  Impact: {finding_stub.get('impact', '')}\n"
-        f"  Claim: {finding_stub.get('claim', '')}"
+        f"  Claim: {finding_stub.get('claim', '')}\n\n"
+        f"Committed evidence for {path}:\n{content}\n\n"
+        f"{_CALLEE_SECTION_HEADER}\n{callee_context}"
     )
     messages = [
         {"role": "system", "content": _PHASE3B_SYSTEM},
         {"role": "user", "content": suffix},
     ]
-    raw = _call_audit_llm(ctx, messages, trace_task=f"audit: phase 3b expand {path}")
+    truncation_out: list[dict] = []
+    raw = _call_audit_llm(
+        ctx,
+        messages,
+        trace_task=f"audit: phase 3b expand {path}",
+        metrics=state.metrics,
+        truncation_out=truncation_out,
+    )
+    if truncation_out:
+        state.truncated_files[path] = state.truncated_files.get(path, 0) + 1
     try:
         records = _parse_records_with_repair(
             ctx,
@@ -3389,6 +3545,17 @@ def _phase3_deep_review(
     inventory = _phase3a_inventory(
         path, state, ctx, content, callee_context=callee_context
     )
+    if not inventory:
+        triage = state.triage_records.get(path)
+        if triage is not None and triage.priority == "ESCALATE_HIGH":
+            # `@@ none @@` is the easiest way for a small model to comply
+            # with the format, so an empty inventory on the files triage
+            # rated highest gets one identical re-ask. Sampling variance is
+            # the mechanism; the prompt stays byte-identical (cache-friendly).
+            state.metrics["high_none_retries"] += 1
+            inventory = _phase3a_inventory(
+                path, state, ctx, content, callee_context=callee_context
+            )
     if not inventory:
         return []
 
@@ -3495,6 +3662,25 @@ class _TransientVerifierError(Exception):
     """Raised when a verifier worker hits a transient provider or transport error."""
 
 
+def _parse_verdict_line(answer: str) -> bool | None:
+    """Final verdict-line parsing for the Phase 4 verifier answer.
+
+    Scans non-empty lines from the end; the first line that (stripped) equals
+    exactly REPRODUCED or NOTREPRODUCED is the verdict. Returns True/False
+    accordingly, or None when the answer never commits to a verdict on its
+    own line — including the empty answer.
+    """
+    for line in reversed(answer.splitlines()):
+        token = line.strip()
+        if not token:
+            continue
+        if token == _REPRODUCE_KEYWORD:
+            return True
+        if token == _NO_REPRODUCE_KEYWORD:
+            return False
+    return None
+
+
 def _phase4c_reproduce(
     finding: FindingRecord,
     state: AuditRunState,
@@ -3557,7 +3743,7 @@ def _phase4c_reproduce(
             kw["event_callback"] = _on_event
 
         try:
-            answer, _exhausted = run_agent_loop(messages, ctx.tools, **kw)
+            answer, exhausted = run_agent_loop(messages, ctx.tools, **kw)
         except (ConnectionError, TimeoutError, OSError) as e:
             raise _TransientVerifierError(str(e)) from e
         finally:
@@ -3565,8 +3751,20 @@ def _phase4c_reproduce(
                 ctx, messages, task=f"audit: phase 4 verify {finding.title}"
             )
 
+        # A valid final verdict line wins even when the loop exhausted its
+        # turn budget: the model answered, just slowly. No verdict line —
+        # empty answer, exhausted loop, or token never emitted — is an
+        # infrastructure failure, not a negative verdict.
         answer = answer or ""
-        if _REPRODUCE_KEYWORD in answer and _NO_REPRODUCE_KEYWORD not in answer:
+        verdict = _parse_verdict_line(answer)
+        if verdict is None:
+            state.metrics["verifier_no_verdict"] += 1
+            _ui_info(ui, f"    verifier [{locs}]: no verdict token — {finding.title}")
+            raise _TransientVerifierError(
+                "verifier produced no verdict token"
+                + (" (turn budget exhausted)" if exhausted else "")
+            )
+        if verdict:
             _ui_info(ui, f"    verifier [{locs}]: REPRODUCED — {finding.title}")
             return {"reproduced": True, "summary": answer[-1000:]}
 
@@ -3693,7 +3891,10 @@ def _phase5_report(
         {"role": "user", "content": suffix},
     ]
     return _call_audit_llm(
-        ctx, messages, trace_task=f"audit: phase 5 report {vf.finding.title}"
+        ctx,
+        messages,
+        trace_task=f"audit: phase 5 report {vf.finding.title}",
+        metrics=state.metrics,
     )
 
 
@@ -3971,7 +4172,10 @@ def _phase45_review_one(
         {"role": "user", "content": user},
     ]
     raw = _call_audit_llm(
-        ctx, messages, trace_task=f"audit: phase 4.5 review {finding.title}"
+        ctx,
+        messages,
+        trace_task=f"audit: phase 4.5 review {finding.title}",
+        metrics=state.metrics,
     )
     try:
         records = _parse_records_with_repair(
@@ -4011,7 +4215,10 @@ def _phase45_consolidate(
         {"role": "user", "content": user},
     ]
     raw = _call_audit_llm(
-        ctx, messages, trace_task=f"audit: phase 4.5 consolidate {finding.title}"
+        ctx,
+        messages,
+        trace_task=f"audit: phase 4.5 consolidate {finding.title}",
+        metrics=state.metrics,
     )
     try:
         records = _parse_records_with_repair(
@@ -4055,19 +4262,25 @@ def _adjudicate_one(
 
     verdicts: list[dict] = []
     for lens in _PHASE45_LENSES:
-        try:
-            v = _phase45_review_one(
-                finding, lens, surface, evidence, reproducer_summary, state, ctx
-            )
-        except Exception as e:
-            _ui_info(ui, f"    adjudicate [{finding.title}]: reviewer error: {e}")
-            v = None
+        v = None
+        for attempt in range(2):
+            if attempt:
+                state.metrics["phase45_lens_retries"] += 1
+            try:
+                v = _phase45_review_one(
+                    finding, lens, surface, evidence, reproducer_summary, state, ctx
+                )
+            except Exception as e:
+                _ui_info(ui, f"    adjudicate [{finding.title}]: reviewer error: {e}")
+                v = None
+            if v is not None:
+                break
         if v is not None:
             verdicts.append(v)
 
-    if not verdicts:
-        # No usable verdict: keep the reproduced finding rather than silently
-        # dropping it on a transient failure.
+    if len(verdicts) < 2:
+        # 0 or 1 usable verdicts: a panel that mostly failed to respond has
+        # not earned the right to overrule a reproduced finding.
         return AdjudicationResult(
             index=index,
             kept=True,
@@ -4075,7 +4288,10 @@ def _adjudicate_one(
             finding=finding,
             original_severity=original_severity,
             final_severity=original_severity,
-            reason="adjudication inconclusive: no usable panel verdict",
+            reason=(
+                f"adjudication inconclusive: only {len(verdicts)} usable "
+                f"panel verdict(s)"
+            ),
         )
 
     confirming = [
@@ -4651,6 +4867,12 @@ def _render_findings_readme(state: AuditRunState, *, repo_name: str = "audit") -
     lines.append(f"- files triaged: {totals['files_triaged']}")
     lines.append(f"- files escalated: {totals['files_escalated']}")
     lines.append(f"- files deep-reviewed: {totals['files_deep_reviewed']}")
+    if state.truncated_files:
+        truncated = ", ".join(f"`{p}`" for p in sorted(state.truncated_files))
+        lines.append(
+            f"- {len(state.truncated_files)} file(s) deep-reviewed with "
+            f"truncated Phase 3 evidence (context window too small): {truncated}"
+        )
     lines.append(f"- findings proposed: {totals['findings_proposed']}")
     lines.append(f"- findings verified: {totals['findings_verified']}")
     lines.append(f"- findings discarded: {totals['findings_discarded']}")
@@ -4787,6 +5009,18 @@ def _resolve_force_review(
                 f"audit: swival.toml force_review glob {g!r} matched zero files"
             )
     return matches, warnings
+
+
+def _exact_focus_paths(scope: AuditScope) -> list[str]:
+    """Focus tokens that name an exact mandatory file.
+
+    No wildcard, exact string match against the mandatory set, never a
+    directory prefix (directory tokens express "look here", not "this file
+    matters"). A user who names a specific file on the /audit command line
+    has escalated it more strongly than any triage heuristic.
+    """
+    mandatory = set(scope.mandatory_files)
+    return [f for f in scope.focus if not any(c in f for c in "*?[") and f in mandatory]
 
 
 def run_audit_command(cmd_arg: str, ctx: InputContext) -> str:
@@ -5108,6 +5342,8 @@ def _run_pipeline_body(
         )
         for w in force_warnings:
             ui.warning(w)
+        for p in _exact_focus_paths(state.scope):
+            force_matches.setdefault(p, "focus")
         promotions = _apply_promotions(state, force_matches)
 
         # Confirmation pass for low-confidence SKIPs.
@@ -5709,6 +5945,10 @@ def _run_audit_phases(
 
         if not scope.mandatory_files:
             return "No auditable files found in scope."
+
+        dirty_msg = _dirty_worktree_warning(base_dir, scope)
+        if dirty_msg:
+            fmt.warning(dirty_msg)
 
         state = AuditRunState(
             run_id=str(uuid.uuid4())[:8],
