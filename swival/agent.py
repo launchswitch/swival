@@ -94,6 +94,7 @@ from .loops import (
     WARN_FAILURES,
 )
 from .mcp_client import McpShutdownError
+from .lsp_client import LspShutdownError
 from .tools import (
     clamp_timeout,
     TOOLS,
@@ -3304,6 +3305,7 @@ def handle_tool_call(
     goal_state=None,
     mcp_manager=None,
     a2a_manager=None,
+    lsp_manager=None,
     messages=None,
     image_stash=None,
     scratch_dir=None,
@@ -3411,6 +3413,7 @@ def handle_tool_call(
                 tool_call_id=tool_call.id,
                 mcp_manager=mcp_manager,
                 a2a_manager=a2a_manager,
+                lsp_manager=lsp_manager,
                 messages=messages,
                 verbose=verbose,
                 image_stash=image_stash,
@@ -3428,6 +3431,8 @@ def handle_tool_call(
         result = "error: MCP server is shutting down"
     except A2aShutdownError:
         result = "error: A2A agent is shutting down"
+    except LspShutdownError:
+        result = "error: LSP server is shutting down"
     except Exception as e:
         result = f"error: tool {name!r} raised {type(e).__name__}: {e}"
     elapsed = time.monotonic() - t0
@@ -5385,6 +5390,28 @@ def build_parser():
         help="Disable A2A agent connections entirely.",
     )
     integrations_group.add_argument(
+        "--lsp",
+        action="store_true",
+        default=_UNSET,
+        help=(
+            "LSP is on by default; this flag is a no-op kept for backward "
+            "compat. Use --no-lsp to disable."
+        ),
+    )
+    integrations_group.add_argument(
+        "--lsp-config",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help="Path to a TOML config file with [lsp_servers.*] tables.",
+    )
+    integrations_group.add_argument(
+        "--no-lsp",
+        action="store_true",
+        default=_UNSET,
+        help="Disable LSP server connections entirely.",
+    )
+    integrations_group.add_argument(
         "--subagents",
         action="store_true",
         default=_UNSET,
@@ -6063,6 +6090,9 @@ def main():
     # Stash A2A servers from TOML config before apply_config_to_args strips them
     args._a2a_servers_toml = file_config.pop("a2a_servers", None)
 
+    # Stash LSP servers from TOML config before apply_config_to_args strips them
+    args._lsp_servers_toml = file_config.pop("lsp_servers", None)
+
     # Stash serve_skills from TOML config before apply_config_to_args strips them
     args._serve_skills_config = file_config.pop("serve_skills", None)
 
@@ -6539,6 +6569,9 @@ def main():
         _a2a = getattr(args, "_a2a_manager", None)
         if _a2a is not None:
             _a2a.close()
+        _lsp = getattr(args, "_lsp_manager", None)
+        if _lsp is not None:
+            _lsp.close()
 
         if _lc_error is not None:
             sys.exit(1)
@@ -7115,6 +7148,7 @@ def build_system_prompt(
     config_dir: "Path | None" = None,
     mcp_tool_info: dict | None = None,
     a2a_tool_info: dict | None = None,
+    lsp_tool_info: dict | None = None,
     no_continue: bool = False,
     memory_full: bool = False,
     user_query: str | None = None,
@@ -7216,6 +7250,9 @@ def build_system_prompt(
         if a2a_tool_info and not system_prompt:
             system_content += "\n\n" + _format_a2a_tool_info(a2a_tool_info)
 
+        if lsp_tool_info and not system_prompt:
+            system_content += "\n\n" + _format_lsp_tool_info(lsp_tool_info)
+
     # Load continue-here file from a previous interrupted session
     if not no_continue:
         from .continue_here import load_continue_file, format_continue_prompt
@@ -7255,6 +7292,14 @@ def _format_a2a_tool_info(tool_info: dict[str, list[tuple[str, str]]]) -> str:
         "Tools provided by remote A2A agents. Each tool accepts a natural-language\n"
         "message. For multi-turn conversations, pass back the contextId from a\n"
         "previous result. For input-required resumption, pass both contextId and taskId.",
+        tool_info,
+    )
+
+
+def _format_lsp_tool_info(tool_info: dict[str, list[tuple[str, str]]]) -> str:
+    return _format_external_tool_info(
+        "LSP Tools",
+        "Code intelligence tools provided by Language Server Protocol servers:",
         tool_info,
     )
 
@@ -7322,6 +7367,44 @@ def _resolve_a2a_servers(args) -> dict | None:
         a2a_servers = file_servers
 
     return a2a_servers or None
+
+
+def _resolve_lsp_servers(args, base_dir) -> dict | None:
+    """Resolve LSP server configs from TOML + config file + auto-detect.
+
+    Auto-detection runs whenever no explicit config is provided, matching
+    the library path (Session.lsp_servers) for behavioral consistency.
+    Use ``--no-lsp`` to opt out entirely.
+    """
+    from .config import load_lsp_config
+    from .lsp_client import auto_detect_lsp
+
+    toml_servers = getattr(args, "_lsp_servers_toml", None) or {}
+
+    lsp_config_path = getattr(args, "lsp_config", None)
+    if lsp_config_path:
+        p = Path(lsp_config_path)
+        if not p.is_file():
+            raise ConfigError(f"--lsp-config file not found: {lsp_config_path}")
+        file_servers = load_lsp_config(p)
+        file_servers.update(toml_servers)
+        toml_servers = file_servers
+
+    # Auto-detect if no explicit config. The --lsp flag is kept as a
+    # no-op for backward compat with the docs/help text; --no-lsp is
+    # the real opt-out (handled by the caller).
+    auto_detected = None
+    if not toml_servers:
+        auto_detected = auto_detect_lsp(base_dir)
+
+    # Merge: explicit config wins over auto-detect
+    merged: dict[str, dict] = {}
+    if auto_detected:
+        merged.update(auto_detected)
+    if toml_servers:
+        merged.update(toml_servers)
+
+    return merged or None
 
 
 def _validate_external_command(cmd_string: str, label: str) -> None:
@@ -7568,6 +7651,26 @@ def _run_main(args, report, _write_report, parser):
             a2a_tool_info = a2a_manager.get_tool_info()
     args._a2a_manager = a2a_manager
 
+    # Initialize LSP servers
+    lsp_manager = None
+    lsp_tool_info = {}
+    if not getattr(args, "no_lsp", False):
+        from .lsp_client import LspManager
+
+        lsp_servers = _resolve_lsp_servers(args, base_dir)
+        if lsp_servers:
+            lsp_manager = LspManager(
+                lsp_servers,
+                workspace_root=base_dir,
+                verbose=args.verbose,
+            )
+            lsp_manager.start()
+            lsp_tools = lsp_manager.list_tools()
+            if lsp_tools:
+                tools.extend(lsp_tools)
+            lsp_tool_info = lsp_manager.get_tool_info()
+    args._lsp_manager = lsp_manager
+
     # --- Secret encryption lifecycle ---
     secret_shield = None
     if getattr(args, "encrypt_secrets", False):
@@ -7650,6 +7753,7 @@ def _run_main(args, report, _write_report, parser):
         config_dir=getattr(args, "config_dir", None),
         mcp_tool_info=mcp_tool_info,
         a2a_tool_info=a2a_tool_info,
+        lsp_tool_info=lsp_tool_info,
         no_continue=getattr(args, "no_continue", False),
         user_query=getattr(args, "question", None),
         report=report,
@@ -7712,6 +7816,7 @@ def _run_main(args, report, _write_report, parser):
         file_tracker=file_tracker,
         mcp_manager=mcp_manager,
         a2a_manager=a2a_manager,
+        lsp_manager=lsp_manager,
         cache=llm_cache,
         secret_shield=secret_shield,
         command_policy=command_policy,
@@ -7832,6 +7937,7 @@ def _run_main(args, report, _write_report, parser):
                     pre_profile_baseline=getattr(args, "_pre_profile_baseline", {}),
                     mcp_manager=loop_kwargs.get("mcp_manager"),
                     a2a_manager=loop_kwargs.get("a2a_manager"),
+                    lsp_manager=loop_kwargs.get("lsp_manager"),
                     subagent_manager=subagent_manager,
                     extra_write_roots=loop_kwargs.get("extra_write_roots", []),
                     skill_read_roots=loop_kwargs.get("skill_read_roots", []),
@@ -8127,6 +8233,7 @@ def run_agent_loop(
     compaction_state: "CompactionState | None" = None,
     mcp_manager=None,
     a2a_manager=None,
+    lsp_manager=None,
     subagent_manager=None,
     continue_here: bool = True,
     cache=None,
@@ -8321,6 +8428,7 @@ def run_agent_loop(
             goal_state=goal_state,
             mcp_manager=mcp_manager,
             a2a_manager=a2a_manager,
+            lsp_manager=lsp_manager,
             subagent_manager=subagent_manager,
             messages=None,  # inner loop manages its own transcript
             image_stash=None,
@@ -9404,6 +9512,7 @@ def run_agent_loop(
                 goal_state=goal_state,
                 mcp_manager=mcp_manager,
                 a2a_manager=a2a_manager,
+                lsp_manager=lsp_manager,
                 messages=messages,
                 image_stash=image_stash,
                 scratch_dir=scratch_dir,
@@ -10165,13 +10274,16 @@ def _repl_profile(
     return new_name, "\n".join(lines), False
 
 
-def _repl_tools(tools: list, mcp_manager=None, a2a_manager=None) -> str:
+def _repl_tools(
+    tools: list, mcp_manager=None, a2a_manager=None, lsp_manager=None
+) -> str:
     """Build a listing of all available tools grouped by source."""
     # Collect MCP/A2A tool info from managers for classification.
     mcp_info = mcp_manager.get_tool_info() if mcp_manager is not None else {}
     a2a_info = a2a_manager.get_tool_info() if a2a_manager is not None else {}
+    lsp_info = lsp_manager.get_tool_info() if lsp_manager is not None else {}
     external_names: set[str] = set()
-    for entries in (*mcp_info.values(), *a2a_info.values()):
+    for entries in (*mcp_info.values(), *a2a_info.values(), *lsp_info.values()):
         external_names.update(name for name, _ in entries)
 
     # Built-in: everything not claimed by MCP/A2A.
@@ -10208,6 +10320,7 @@ def _repl_tools(tools: list, mcp_manager=None, a2a_manager=None) -> str:
     for source_info, kind, noun in [
         (mcp_info, "MCP tools", "server"),
         (a2a_info, "A2A tools", "agent"),
+        (lsp_info, "LSP tools", "server"),
     ]:
         if not source_info:
             continue
@@ -11007,7 +11120,9 @@ def execute_input(
         if cmd == "/tools":
             return StepResult(
                 kind="info",
-                text=_repl_tools(ctx.tools, ctx.mcp_manager, ctx.a2a_manager),
+                text=_repl_tools(
+                    ctx.tools, ctx.mcp_manager, ctx.a2a_manager, ctx.lsp_manager
+                ),
             )
 
         if cmd == "/copy":
@@ -11649,6 +11764,7 @@ def _build_iteration_ctx(
         pre_profile_baseline=ctx.pre_profile_baseline,
         mcp_manager=ctx.mcp_manager,
         a2a_manager=ctx.a2a_manager,
+        lsp_manager=ctx.lsp_manager,
         subagent_manager=iter_subagent,
         subagent_holder=None,
         extra_write_roots=ctx.extra_write_roots,
@@ -11972,6 +12088,7 @@ def repl_loop(
     compaction_state: "CompactionState | None" = None,
     mcp_manager=None,
     a2a_manager=None,
+    lsp_manager=None,
     subagent_manager=None,
     continue_here: bool = True,
     cache=None,
@@ -12206,6 +12323,7 @@ def repl_loop(
         compaction_state=compaction_state,
         mcp_manager=mcp_manager,
         a2a_manager=a2a_manager,
+        lsp_manager=lsp_manager,
         subagent_manager=subagent_manager,
         cache=cache,
         secret_shield=secret_shield,
@@ -12243,6 +12361,7 @@ def repl_loop(
         pre_profile_baseline=pre_profile_baseline or {},
         mcp_manager=mcp_manager,
         a2a_manager=a2a_manager,
+        lsp_manager=lsp_manager,
         subagent_manager=subagent_manager,
         subagent_holder=_subagent_holder,
         extra_write_roots=extra_write_roots,

@@ -97,6 +97,9 @@ class Session:
         proactive_summaries: bool = False,
         mcp_servers: dict | None = None,
         a2a_servers: dict | None = None,
+        lsp_servers: dict | None = None,
+        lsp_config: str | Path | None = None,
+        no_lsp: bool = False,
         extra_body: dict | None = None,
         reasoning_effort: str | None = None,
         continue_here: bool = True,
@@ -184,6 +187,9 @@ class Session:
         self.memory_full = memory_full
         self.mcp_servers = mcp_servers
         self.a2a_servers = a2a_servers
+        self.lsp_servers = lsp_servers
+        self.lsp_config = lsp_config
+        self.no_lsp = no_lsp
         self.extra_body = extra_body
         self.reasoning_effort = reasoning_effort
         self.sanitize_thinking = sanitize_thinking
@@ -246,6 +252,9 @@ class Session:
 
         # A2A manager (created in _setup if a2a_servers is non-empty)
         self._a2a_manager = None
+
+        # LSP manager (created in _setup; auto-detected by default)
+        self._lsp_manager = None
 
         # Secret shield (created in _setup if encrypt_secrets is enabled)
         self._secret_shield = None
@@ -422,6 +431,10 @@ class Session:
             if a2a_tools:
                 self._tools.extend(a2a_tools)
 
+        # Initialize LSP servers
+        if not self.no_lsp:
+            self._init_lsp()
+
         # Initialize secret encryption shield
         if self.encrypt_secrets:
             from .secrets import SecretShield
@@ -467,6 +480,7 @@ class Session:
         # in run()/ask() so it can be keyed from the user's question).
         mcp_tool_info = self._mcp_manager.get_tool_info() if self._mcp_manager else None
         a2a_tool_info = self._a2a_manager.get_tool_info() if self._a2a_manager else None
+        lsp_tool_info = self._lsp_manager.get_tool_info() if self._lsp_manager else None
         # Build list of tool schemas exposable to command provider (MCP/A2A/skills).
         _command_tool_schemas = (
             _filter_command_tool_schemas(self._tools) or None
@@ -485,6 +499,7 @@ class Session:
             config_dir=self.config_dir,
             mcp_tool_info=mcp_tool_info,
             a2a_tool_info=a2a_tool_info,
+            lsp_tool_info=lsp_tool_info,
             no_continue=not self.continue_here,
             provider=self.provider,
             command_tool_schemas=_command_tool_schemas,
@@ -497,6 +512,38 @@ class Session:
         cleanup_old_cmd_outputs(self.base_dir)
 
         self._setup_done = True
+
+    def _init_lsp(self) -> None:
+        """Initialize LSP manager from explicit config or auto-detection."""
+        from .lsp_client import LspManager, auto_detect_lsp
+
+        servers = self.lsp_servers
+
+        # Load from TOML config file if provided
+        if not servers and self.lsp_config:
+            from .config import load_lsp_config
+
+            p = Path(self.lsp_config)
+            if not p.is_file():
+                raise ConfigError(f"lsp_config file not found: {self.lsp_config}")
+            servers = load_lsp_config(p)
+
+        # Auto-detect if no explicit config
+        if not servers:
+            servers = auto_detect_lsp(self.base_dir)
+
+        if not servers:
+            return
+
+        self._lsp_manager = LspManager(
+            servers,
+            workspace_root=self.base_dir,
+            verbose=self.verbose,
+        )
+        self._lsp_manager.start()
+        lsp_tools = self._lsp_manager.list_tools()
+        if lsp_tools:
+            self._tools.extend(lsp_tools)
 
     def _system_with_memory(
         self,
@@ -600,6 +647,8 @@ class Session:
             kwargs["mcp_manager"] = self._mcp_manager
         if self._a2a_manager is not None:
             kwargs["a2a_manager"] = self._a2a_manager
+        if self._lsp_manager is not None:
+            kwargs["lsp_manager"] = self._lsp_manager
         if self.llm_filter is not None:
             kwargs["llm_filter"] = self.llm_filter
         if self.command_middleware is not None:
@@ -755,6 +804,7 @@ class Session:
             loop_kwargs=loop_kwargs,
             mcp_manager=self._mcp_manager,
             a2a_manager=self._a2a_manager,
+            lsp_manager=self._lsp_manager,
             subagent_manager=loop_kwargs.get("subagent_manager"),
             extra_write_roots=self._allowed_dir_paths,
             skill_read_roots=state["skill_read_roots"],
@@ -967,7 +1017,7 @@ class Session:
             self._cleanup()
 
     def _cleanup(self):
-        """Release resources (cache, MCP, A2A, secrets)."""
+        """Release resources (cache, MCP, A2A, LSP, secrets)."""
         if self._llm_cache is not None:
             self._llm_cache.close()
             self._llm_cache = None
@@ -975,6 +1025,8 @@ class Session:
             self._mcp_manager.close()
         if self._a2a_manager is not None:
             self._a2a_manager.close()
+        if self._lsp_manager is not None:
+            self._lsp_manager.close()
         if self._secret_shield is not None:
             self._secret_shield.destroy()
             self._secret_shield = None

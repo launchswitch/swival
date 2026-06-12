@@ -1221,3 +1221,11 @@ def a2a_server_start(name: str, tool_count: int) -> None:
 
 def a2a_server_error(name: str, error: str) -> None:
     _server_error("A2A", name, error)
+
+
+def lsp_server_start(name: str, tool_count: int) -> None:
+    _server_start("LSP", name, tool_count)
+
+
+def lsp_server_error(name: str, error: str) -> None:
+    _server_error("LSP", name, error)

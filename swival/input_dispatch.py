@@ -49,6 +49,7 @@ class InputContext:
     # External managers.
     mcp_manager: object = None
     a2a_manager: object = None
+    lsp_manager: object = None
     subagent_manager: object = None
     subagent_holder: list | None = None
     # Misc.

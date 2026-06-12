@@ -103,6 +103,8 @@ CONFIG_KEYS: dict[str, type | tuple[type, ...]] = {
     "proactive_summaries": bool,
     "no_mcp": bool,
     "no_a2a": bool,
+    "no_lsp": bool,
+    "lsp_config": str,
     "extra_body": dict,
     "reasoning_effort": str,
     "cache": bool,
@@ -213,6 +215,9 @@ _ARGPARSE_DEFAULTS: dict[str, Any] = {
     "mcp_config": None,
     "no_a2a": False,
     "a2a_config": None,
+    "lsp": False,
+    "no_lsp": False,
+    "lsp_config": None,
     "extra_body": None,
     "reasoning_effort": None,
     "sanitize_thinking": False,
@@ -794,6 +799,73 @@ def load_a2a_config(path: Path) -> dict[str, dict]:
     return servers
 
 
+# --- LSP config helpers ---
+
+
+_LSP_SERVER_FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
+    "command": str,
+    "args": list,
+    "languages": list,
+    "file_extensions": list,
+    "init_options": dict,
+}
+
+
+def _validate_lsp_server_configs(servers: dict, source: str) -> None:
+    """Validate structure and field types of LSP server configurations."""
+    for name, cfg in servers.items():
+        if not re.match(r"^[a-zA-Z0-9_-]+$", name):
+            raise ConfigError(
+                f"{source}: lsp_servers.{name}: invalid server name (alphanumeric, dash, underscore only)"
+            )
+        if not isinstance(cfg, dict):
+            raise ConfigError(f"{source}: lsp_servers.{name} must be a table")
+        if "command" not in cfg:
+            raise ConfigError(f"{source}: lsp_servers.{name} must have 'command'")
+
+        prefix = f"{source}: lsp_servers.{name}"
+        for field, expected in _LSP_SERVER_FIELD_TYPES.items():
+            if field in cfg:
+                if isinstance(cfg[field], bool) and expected is not bool:
+                    raise ConfigError(
+                        f"{prefix}.{field}: expected {_type_name(expected)}, got bool"
+                    )
+                if not isinstance(cfg[field], expected):
+                    raise ConfigError(
+                        f"{prefix}.{field}: expected {_type_name(expected)}, "
+                        f"got {type(cfg[field]).__name__}"
+                    )
+                # Validate list element types
+                if isinstance(cfg[field], list):
+                    for i, elem in enumerate(cfg[field]):
+                        if not isinstance(elem, str):
+                            raise ConfigError(
+                                f"{prefix}.{field}[{i}]: expected str, "
+                                f"got {type(elem).__name__}"
+                            )
+
+
+def load_lsp_config(path: Path) -> dict[str, dict]:
+    """Load LSP server configs from a TOML file.
+
+    Expects [lsp_servers.*] tables. Returns a dict of name -> config.
+    """
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        raise ConfigError(f"{path}: invalid TOML: {e}") from e
+    except OSError as e:
+        raise ConfigError(f"{path}: cannot read file: {e}")
+
+    servers = data.get("lsp_servers", {})
+    if not isinstance(servers, dict):
+        raise ConfigError(f"{path}: 'lsp_servers' must be a table")
+
+    _validate_lsp_server_configs(servers, str(path))
+    return servers
+
+
 # --- Serve skills validation ---
 
 
@@ -1240,6 +1312,8 @@ def config_to_session_kwargs(config: dict) -> dict:
         "mcp_config",
         "no_a2a",
         "a2a_config",
+        "no_lsp",
+        "lsp_config",
         "serve_name",
         "serve_description",
         "serve_skills",
@@ -1263,6 +1337,7 @@ _NESTED_KEYS = frozenset(
         "profiles",
         "mcp_servers",
         "a2a_servers",
+        "lsp_servers",
         "serve_skills",
         "encrypt_secrets_patterns",
     }

@@ -3372,6 +3372,26 @@ def _dispatch_goal_tool(name: str, args: dict, kwargs: dict) -> str:
     return f"error: unknown goal tool {name!r}"
 
 
+def _notify_lsp(
+    lsp_manager, action: str, abs_path: Path, content: str | None = None
+) -> None:
+    """Notify LSP manager of file changes for document synchronization."""
+    if lsp_manager is None:
+        return
+    try:
+        if action == "read":
+            if content is not None:
+                lsp_manager.on_file_read(abs_path, content)
+        elif action == "write":
+            if content is not None:
+                lsp_manager.on_file_write(abs_path, content)
+        elif action == "delete":
+            lsp_manager.on_file_delete(abs_path)
+    except Exception:
+        # LSP notifications are best-effort; never fail a tool call because of them
+        pass
+
+
 def dispatch(name: str, args: dict, base_dir: str, **kwargs) -> str:
     """Route a tool call to the appropriate implementation.
 
@@ -3428,6 +3448,21 @@ def dispatch(name: str, args: dict, base_dir: str, **kwargs) -> str:
                 _report.record_untrusted_input(name)
             return _wrap_untrusted(guarded, name)
 
+    # LSP tool dispatch
+    if name.startswith("lsp_"):
+        lsp_manager = kwargs.get("lsp_manager")
+        if lsp_manager is None:
+            return f"error: LSP tool {name!r} called but no LSP manager is active"
+        result, is_error = lsp_manager.call_tool(name, args)
+        if is_error:
+            return result
+        guarded = _guard_mcp_output(result, base_dir, name, scratch_dir=scratch_dir)
+        if _report is not None:
+            _report.record_untrusted_input(name)
+        return _wrap_untrusted(guarded, name)
+
+    _lsp_manager = kwargs.get("lsp_manager")
+
     if name == "think":
         thinking_state = kwargs.get("thinking_state")
         if thinking_state is None:
@@ -3454,7 +3489,7 @@ def dispatch(name: str, args: dict, base_dir: str, **kwargs) -> str:
             tail = None
         elif tail is not None:
             offset = 1
-        return _read_file(
+        result = _read_file(
             file_path=args["file_path"],
             base_dir=base_dir,
             offset=offset,
@@ -3465,13 +3500,33 @@ def dispatch(name: str, args: dict, base_dir: str, **kwargs) -> str:
             files_mode=files_mode,
             tracker=file_tracker,
         )
+        # Notify LSP of file read (best-effort)
+        if not result.startswith("error:") and _lsp_manager is not None:
+            try:
+                _abs = safe_resolve(
+                    args["file_path"],
+                    base_dir,
+                    extra_read_roots=skill_read_roots,
+                    extra_write_roots=extra_write_roots,
+                    files_mode=files_mode,
+                )
+                if _abs.is_file():
+                    _notify_lsp(
+                        _lsp_manager,
+                        "read",
+                        _abs,
+                        _abs.read_text(encoding="utf-8", errors="replace"),
+                    )
+            except Exception:
+                pass
+        return result
     elif name == "read_multiple_files":
         files = args.get("files")
         if isinstance(files, str):
             files = [files]
         if not isinstance(files, list):
             return "error: 'files' must be an array"
-        return _read_files(
+        result = _read_files(
             files=files,
             base_dir=base_dir,
             extra_read_roots=skill_read_roots,
@@ -3479,8 +3534,29 @@ def dispatch(name: str, args: dict, base_dir: str, **kwargs) -> str:
             files_mode=files_mode,
             tracker=file_tracker,
         )
+        # Notify LSP of file reads (best-effort)
+        if not result.startswith("error:") and _lsp_manager is not None:
+            for _fp in files:
+                try:
+                    _abs = safe_resolve(
+                        _fp,
+                        base_dir,
+                        extra_read_roots=skill_read_roots,
+                        extra_write_roots=extra_write_roots,
+                        files_mode=files_mode,
+                    )
+                    if _abs.is_file():
+                        _notify_lsp(
+                            _lsp_manager,
+                            "read",
+                            _abs,
+                            _abs.read_text(encoding="utf-8", errors="replace"),
+                        )
+                except Exception:
+                    pass
+        return result
     elif name == "write_file":
-        return _write_file(
+        result = _write_file(
             file_path=args["file_path"],
             content=args.get("content"),
             base_dir=base_dir,
@@ -3489,8 +3565,21 @@ def dispatch(name: str, args: dict, base_dir: str, **kwargs) -> str:
             files_mode=files_mode,
             tracker=file_tracker,
         )
+        # Notify LSP of file write (best-effort)
+        if not result.startswith("error:") and _lsp_manager is not None:
+            try:
+                _abs = safe_resolve(
+                    args["file_path"],
+                    base_dir,
+                    extra_write_roots=extra_write_roots,
+                    files_mode=files_mode,
+                )
+                _notify_lsp(_lsp_manager, "write", _abs, args.get("content"))
+            except Exception:
+                pass
+        return result
     elif name == "edit_file":
-        return _edit_file(
+        result = _edit_file(
             file_path=args["file_path"],
             old_string=args["old_string"],
             new_string=args["new_string"],
@@ -3503,8 +3592,27 @@ def dispatch(name: str, args: dict, base_dir: str, **kwargs) -> str:
             tracker=file_tracker,
             verbose=kwargs.get("verbose", False),
         )
+        # Notify LSP of file edit (best-effort)
+        if not result.startswith("error:") and _lsp_manager is not None:
+            try:
+                _abs = safe_resolve(
+                    args["file_path"],
+                    base_dir,
+                    extra_write_roots=extra_write_roots,
+                    files_mode=files_mode,
+                )
+                if _abs.is_file():
+                    _notify_lsp(
+                        _lsp_manager,
+                        "write",
+                        _abs,
+                        _abs.read_text(encoding="utf-8", errors="replace"),
+                    )
+            except Exception:
+                pass
+        return result
     elif name == "delete_file":
-        return _delete_file(
+        result = _delete_file(
             args["file_path"],
             base_dir,
             extra_write_roots=extra_write_roots,
@@ -3512,6 +3620,19 @@ def dispatch(name: str, args: dict, base_dir: str, **kwargs) -> str:
             tracker=file_tracker,
             tool_call_id=kwargs.get("tool_call_id", ""),
         )
+        # Notify LSP of file delete (best-effort)
+        if not result.startswith("error:") and _lsp_manager is not None:
+            try:
+                _abs = safe_resolve(
+                    args["file_path"],
+                    base_dir,
+                    extra_write_roots=extra_write_roots,
+                    files_mode=files_mode,
+                )
+                _notify_lsp(_lsp_manager, "delete", _abs)
+            except Exception:
+                pass
+        return result
     elif name == "list_files":
         return _list_files(
             pattern=args["pattern"],
