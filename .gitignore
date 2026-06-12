@@ -7,3 +7,10 @@ build/
 dist/
 tmp/
 secret
+
+# Cartography data (regenerated daily by cron)
+.slim/
+
+# Local platform-specific wheels
+local-wheels/
+*.whl

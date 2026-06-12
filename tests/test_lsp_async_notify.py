@@ -138,22 +138,30 @@ class TestAsyncNotificationQueue:
         mgr.close()
         assert not mgr._notification_worker.is_alive()
 
-    def test_enqueue_drops_oldest_when_full(self, manager):
+    def test_enqueue_drops_oldest_when_full(self, tmp_path):
         """A full queue drops the oldest item to make room."""
+        # Use a manager with a small queue and NO active worker so the
+        # test can fill it without racing the drain thread.
+        mgr = LspManager(
+            {"mock-server": {"command": "echo", "languages": ["python"]}},
+            workspace_root=str(tmp_path),
+            verbose=False,
+        )
         import queue
 
-        q = manager._notification_queue
-        # Fill the queue to capacity (1000).
+        q = queue.Queue(maxsize=10)
+        mgr._notification_queue = q
+        mgr._started = True
+
         dummy = Path("/tmp/dummy.py")
-        for i in range(1000):
+        for i in range(10):
             q.put_nowait(("read", dummy, f"content-{i}"))
 
         assert q.full()
         # Enqueue one more — should drop the oldest.
-        manager._enqueue_notification("read", dummy, "overflow")
-        # The queue should still have 1000 items (dropped oldest, added new).
-        assert q.qsize() == 1000
-        # The newest item should be "overflow".
+        mgr._enqueue_notification("read", dummy, "overflow")
+        # The queue should still have 10 items (dropped oldest, added new).
+        assert q.qsize() == 10
         # Drain to check — the last item should be "overflow".
         last = None
         while not q.empty():
