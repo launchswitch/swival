@@ -5,37 +5,35 @@ description = "A small, powerful CLI coding agent for open AI models"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.13"
-authors = [
-    { name = "Frank Denis", email = "github@pureftpd.org" },
-]
+authors = [{ name = "Frank Denis", email = "github@pureftpd.org" }]
 keywords = ["ai", "agent", "cli", "llm", "coding", "tool-calling"]
 classifiers = [
-    "Development Status :: 4 - Beta",
-    "Environment :: Console",
-    "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.13",
-    "Topic :: Software Development",
-    "Topic :: Software Development :: Libraries",
-    "Typing :: Typed",
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development",
+  "Topic :: Software Development :: Libraries",
+  "Typing :: Typed",
 ]
 dependencies = [
-    "litellm>=1.88.0",
-    "tiktoken>=0.13.0",
-    "html-to-markdown>=3.5.7,<4",
-    "rich>=15.0.0",
-    "prompt-toolkit>=3.0.52",
-    "mcp>=1.27.2,<2",
-    "rank-bm25>=0.2.2",
-    "httpx>=0.28.1",
-    "starlette>=1.2.1",
-    "uvicorn>=0.49.0",
-    "fast-cipher>=0.2.2",
-    "boto3>=1.43.25",
-    "starlark-go>=1.0.1",
-    "google-cloud-aiplatform>=1.156.0",
+  "litellm>=1.88.0",
+  "tiktoken>=0.13.0",
+  "html-to-markdown>=3.5.7,<4",
+  "rich>=15.0.0",
+  "prompt-toolkit>=3.0.52",
+  "mcp>=1.27.2,<2",
+  "rank-bm25>=0.2.2",
+  "httpx>=0.28.1",
+  "starlette>=1.2.1",
+  "uvicorn>=0.49.0",
+  "fast-cipher>=0.2.2",
+  "boto3>=1.43.25",
+  "starlark-go>=1.0.1",
+  "google-cloud-aiplatform>=1.156.0",
 ]
 
 [project.urls]
@@ -52,16 +50,14 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "swival/",
-    "tests/",
-    "pyproject.toml",
-    "README.md",
-    "LICENSE",
-    "ChangeLog.md",
+  "swival/",
+  "tests/",
+  "pyproject.toml",
+  "README.md",
+  "LICENSE",
+  "ChangeLog.md",
 ]
-exclude = [
-    "homebrew-tap/",
-]
+exclude = ["homebrew-tap/"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["swival"]
@@ -72,12 +68,5 @@ constraint-dependencies = ["requests>=2.34.2", "cryptography>=48.0.0"]
 override-dependencies = ["aiohttp>=3.14.1", "python-dotenv>=1.2.2"]
 
 [dependency-groups]
-dev = [
-    "pytest>=9.0.3",
-    "ruff>=0.15.16",
-    "httpx2>=2.3.0",
-]
-website = [
-    "markdown",
-    "pillow",
-]
+dev = ["pytest>=9.0.3", "ruff>=0.15.16", "httpx2>=2.3.0"]
+website = ["markdown", "pillow"]

@@ -905,7 +905,9 @@ class LspManager:
             return
         self._enqueue_notification("delete", abs_path, None)
 
-    def _enqueue_notification(self, action: str, abs_path: Path, content: str | None) -> None:
+    def _enqueue_notification(
+        self, action: str, abs_path: Path, content: str | None
+    ) -> None:
         """Add a notification to the async queue, dropping the oldest if full."""
         q = self._notification_queue
         if q is None:
@@ -953,7 +955,9 @@ class LspManager:
             finally:
                 q.task_done()
 
-    def _send_notification_sync(self, action: str, abs_path: Path, content: str | None) -> None:
+    def _send_notification_sync(
+        self, action: str, abs_path: Path, content: str | None
+    ) -> None:
         """Send a single notification synchronously. Called from the worker."""
         if not self._connections or self._closing:
             return
@@ -987,7 +991,10 @@ class LspManager:
                 self._notification_queue.put_nowait(None)
             except queue.Full:
                 pass
-        if self._notification_worker is not None and self._notification_worker.is_alive():
+        if (
+            self._notification_worker is not None
+            and self._notification_worker.is_alive()
+        ):
             self._notification_worker.join(timeout=5)
 
         if self._loop is not None and self._loop.is_running():

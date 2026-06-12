@@ -354,17 +354,13 @@ class TestLanguageValidation:
         assert c.supports_language("python") is True
 
     def test_unrecognized_name_returns_empty_languages(self):
-        c = _LspConnection(
-            "xyz-abc", {"command": "x"}, Path("/tmp")
-        )
+        c = _LspConnection("xyz-abc", {"command": "x"}, Path("/tmp"))
         assert c.languages == []
 
     def test_supports_language_defaults_false_when_empty(self):
         # The bug from issue #12: a server with no languages used to
         # claim to handle every language. Now it must claim none.
-        c = _LspConnection(
-            "xyz-abc", {"command": "x"}, Path("/tmp")
-        )
+        c = _LspConnection("xyz-abc", {"command": "x"}, Path("/tmp"))
         assert c.languages == []
         assert c.supports_language("python") is False
         assert c.supports_language("rust") is False
@@ -377,9 +373,7 @@ class TestLanguageValidation:
         # Build a real _LspConnection whose name doesn't match any
         # SERVER_LANGUAGE_HINTS entry and has no explicit languages.
         # "xyz-abc" is verified safe against the current hints list.
-        conn = _LspConnection(
-            "xyz-abc", {"command": "echo"}, Path("/tmp")
-        )
+        conn = _LspConnection("xyz-abc", {"command": "echo"}, Path("/tmp"))
         assert conn.languages == []  # precondition
 
         mgr = LspManager(

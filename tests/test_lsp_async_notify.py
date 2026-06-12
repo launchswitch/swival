@@ -46,9 +46,7 @@ class TestAsyncNotificationQueue:
 
         # Start the manager's event loop and worker, then inject our stub.
         mgr._loop = __import__("asyncio").new_event_loop()
-        mgr._thread = threading.Thread(
-            target=mgr._loop.run_forever, daemon=True
-        )
+        mgr._thread = threading.Thread(target=mgr._loop.run_forever, daemon=True)
         mgr._thread.start()
         mgr._connections["mock-server"] = conn
         mgr._build_routing()
@@ -114,9 +112,7 @@ class TestAsyncNotificationQueue:
         import queue as q_mod
 
         mgr._loop = asyncio.new_event_loop()
-        mgr._thread = threading.Thread(
-            target=mgr._loop.run_forever, daemon=True
-        )
+        mgr._thread = threading.Thread(target=mgr._loop.run_forever, daemon=True)
         mgr._thread.start()
         conn = _LspConnection(
             "mock-server",

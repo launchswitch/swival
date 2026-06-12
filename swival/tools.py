@@ -1791,7 +1791,10 @@ def _read_files(
             "To read a single file, use read_file instead."
         ), {}
     if len(files) > _MAX_READ_FILES:
-        return f"error: too many files requested ({len(files)}), maximum is {_MAX_READ_FILES}", {}
+        return (
+            f"error: too many files requested ({len(files)}), maximum is {_MAX_READ_FILES}",
+            {},
+        )
 
     sections = []
     total_bytes = 0
@@ -3621,9 +3624,7 @@ def dispatch(name: str, args: dict, base_dir: str, **kwargs) -> str:
                         continue
                     content = full_contents.get(str(_abs))
                     if content is None:
-                        content = _abs.read_text(
-                            encoding="utf-8", errors="replace"
-                        )
+                        content = _abs.read_text(encoding="utf-8", errors="replace")
                     _notify_lsp(_lsp_manager, "read", _abs, content)
                 except Exception:
                     pass

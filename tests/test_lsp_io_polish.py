@@ -8,7 +8,6 @@ re-reading from disk.
 from __future__ import annotations
 
 
-
 from swival import tools as t
 
 
