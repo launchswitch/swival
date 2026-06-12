@@ -17,6 +17,7 @@ import atexit
 import json
 import logging
 import os
+import queue
 import threading
 from pathlib import Path
 from typing import Any
@@ -741,6 +742,17 @@ class LspManager:
         # Extension -> server name routing
         self._ext_to_server: dict[str, str] = {}
 
+        # Asynchronous notification queue. File-tool hooks (read/write/
+        # edit/delete) enqueue didOpen/didChange/didClose events here
+        # and return immediately; a dedicated worker thread drains
+        # the queue and posts to the LSP loop. The agent thread is
+        # never blocked on a slow LSP server. The queue is bounded
+        # so a wedged LSP cannot OOM the agent; full-queue drops the
+        # oldest item (newer state is strictly more useful).
+        self._notification_queue: queue.Queue | None = None
+        self._notification_worker: threading.Thread | None = None
+        self._worker_stop = threading.Event()
+
         # Lifecycle flags
         self._closing = False
         self._closed = False
@@ -800,6 +812,16 @@ class LspManager:
         # Build routing tables
         self._build_routing()
 
+        # Start notification worker (drains queue → LSP loop)
+        self._notification_queue = queue.Queue(maxsize=1000)
+        self._worker_stop.clear()
+        self._notification_worker = threading.Thread(
+            target=self._notification_loop,
+            name="swival-lsp-notify",
+            daemon=True,
+        )
+        self._notification_worker.start()
+
         self._started = True
         atexit.register(self.close)
 
@@ -855,8 +877,85 @@ class LspManager:
             return (f"error: LSP tool {name!r} failed: {e}", True)
 
     def on_file_read(self, abs_path: Path, content: str) -> None:
-        """Notify LSP servers that a file was read (didOpen)."""
+        """Notify LSP servers that a file was read (didOpen).
+
+        Non-blocking: enqueues the notification and returns immediately.
+        The background worker thread drains the queue and posts to the
+        LSP event loop.
+        """
         if not self._started or not self._connections:
+            return
+        self._enqueue_notification("read", abs_path, content)
+
+    def on_file_write(self, abs_path: Path, content: str) -> None:
+        """Notify LSP servers that a file was written (didChange).
+
+        Non-blocking: enqueues the notification and returns immediately.
+        """
+        if not self._started or not self._connections:
+            return
+        self._enqueue_notification("write", abs_path, content)
+
+    def on_file_delete(self, abs_path: Path) -> None:
+        """Notify LSP servers that a file was deleted (didClose).
+
+        Non-blocking: enqueues the notification and returns immediately.
+        """
+        if not self._started or not self._connections:
+            return
+        self._enqueue_notification("delete", abs_path, None)
+
+    def _enqueue_notification(self, action: str, abs_path: Path, content: str | None) -> None:
+        """Add a notification to the async queue, dropping the oldest if full."""
+        q = self._notification_queue
+        if q is None:
+            return
+        try:
+            q.put_nowait((action, abs_path, content))
+        except queue.Full:
+            # Drop the oldest item — newer state is strictly more useful.
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                q.put_nowait((action, abs_path, content))
+            except queue.Full:
+                pass  # Give up silently; best-effort delivery.
+
+    def _notification_loop(self) -> None:
+        """Worker thread: drain the notification queue and post to LSP.
+
+        Runs in a daemon thread started by ``start()``. Each item is a
+        ``(action, abs_path, content)`` tuple. The worker resolves the
+        target server, calls the appropriate ``did_*`` method on the
+        connection via ``_run_sync``, and continues. Errors are logged
+        but never propagate to the caller — notifications are fire-and-forget.
+        """
+        q = self._notification_queue
+        assert q is not None  # set before thread start
+        while not self._worker_stop.is_set():
+            try:
+                item = q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if item is None:  # shutdown sentinel
+                break
+            action, abs_path, content = item
+            try:
+                self._send_notification_sync(action, abs_path, content)
+            except Exception as exc:
+                if self._verbose:
+                    print(
+                        f"  LSP: notification {action} {abs_path} failed: {exc}",
+                        flush=True,
+                    )
+            finally:
+                q.task_done()
+
+    def _send_notification_sync(self, action: str, abs_path: Path, content: str | None) -> None:
+        """Send a single notification synchronously. Called from the worker."""
+        if not self._connections or self._closing:
             return
         uri = path_to_uri(abs_path)
         server_name = self._resolve_server(abs_path)
@@ -865,46 +964,31 @@ class LspManager:
         conn = self._connections[server_name]
         ext = abs_path.suffix.lower()
         language_id = EXT_TO_LANGUAGE.get(ext, "plaintext")
-        try:
-            self._run_sync(conn.did_open(uri, language_id, content), timeout=5)
-        except Exception:
-            pass
-
-    def on_file_write(self, abs_path: Path, content: str) -> None:
-        """Notify LSP servers that a file was written (didChange)."""
-        if not self._started or not self._connections:
-            return
-        uri = path_to_uri(abs_path)
-        server_name = self._resolve_server(abs_path)
-        if server_name is None:
-            return
-        conn = self._connections[server_name]
-        try:
-            ext = abs_path.suffix.lower()
-            language_id = EXT_TO_LANGUAGE.get(ext, "plaintext")
-            self._run_sync(conn.did_change(uri, content, language_id), timeout=5)
-        except Exception:
-            pass
-
-    def on_file_delete(self, abs_path: Path) -> None:
-        """Notify LSP servers that a file was deleted (didClose)."""
-        if not self._started or not self._connections:
-            return
-        uri = path_to_uri(abs_path)
-        server_name = self._resolve_server(abs_path)
-        if server_name is None:
-            return
-        conn = self._connections[server_name]
-        try:
+        if action == "read":
+            if content is not None:
+                self._run_sync(conn.did_open(uri, language_id, content), timeout=5)
+        elif action == "write":
+            if content is not None:
+                self._run_sync(conn.did_change(uri, content, language_id), timeout=5)
+        elif action == "delete":
             self._run_sync(conn.did_close(uri), timeout=5)
-        except Exception:
-            pass
 
     def close(self) -> None:
         """Idempotent shutdown."""
         if self._closed:
             return
         self._closing = True
+
+        # Stop notification worker first (no new events to servers).
+        self._worker_stop.set()
+        if self._notification_queue is not None:
+            # Unblock the worker if it's waiting on get().
+            try:
+                self._notification_queue.put_nowait(None)
+            except queue.Full:
+                pass
+        if self._notification_worker is not None and self._notification_worker.is_alive():
+            self._notification_worker.join(timeout=5)
 
         if self._loop is not None and self._loop.is_running():
             try:
