@@ -291,10 +291,16 @@ class _LspConnection:
         return []
 
     def supports_language(self, language_id: str) -> bool:
-        """Check if this server handles the given languageId."""
+        """Check if this server handles the given languageId.
+
+        Defaults to False when no languages are configured. The caller
+        is expected to validate non-empty ``languages`` at startup (see
+        ``LspManager._build_routing``); returning True here would let
+        a misconfigured server silently claim every file.
+        """
         langs = self.languages
         if not langs:
-            return True  # if no languages specified, assume it handles everything
+            return False
         return language_id in langs
 
     def supports_file(self, file_path: Path) -> bool:
@@ -798,24 +804,38 @@ class LspManager:
         atexit.register(self.close)
 
     def list_tools(self) -> list[dict]:
-        """Return LSP tools in OpenAI function-calling format."""
+        """Return LSP tools in OpenAI function-calling format.
+
+        Filters ``LSP_TOOLS`` to only those whose required capability is
+        advertised by at least one active server. ``lsp_diagnostics``
+        and ``lsp_workspace_symbols`` are always included: the former
+        uses stored ``publishDiagnostics`` (no provider capability is
+        required to read them), and the latter picks the first server.
+        """
         if not self._started or not self._connections:
             return []
-        return list(LSP_TOOLS)
+        available = _tools_for_capabilities(
+            [c._capabilities for c in self._connections.values()]
+        )
+        return [t for t in LSP_TOOLS if t["function"]["name"] in available]
 
     def get_tool_info(self) -> dict[str, list[tuple[str, str]]]:
         """Return {server_name: [(tool_name, description), ...]}."""
         info: dict[str, list[tuple[str, str]]] = {}
         if not self._connections:
             return info
-        # All servers share the same tool set
-        tool_names = [t["function"]["name"] for t in LSP_TOOLS]
+        # Mirror list_tools() filtering so the system-prompt listing and
+        # the OpenAI tool schema stay in sync.
+        available = _tools_for_capabilities(
+            [c._capabilities for c in self._connections.values()]
+        )
         tool_descs = {
             t["function"]["name"]: t["function"].get("description", "")
             for t in LSP_TOOLS
+            if t["function"]["name"] in available
         }
         # Group under a virtual "lsp" key
-        info["lsp"] = [(name, tool_descs.get(name, "")) for name in tool_names]
+        info["lsp"] = list(tool_descs.items())
         return info
 
     def call_tool(self, name: str, arguments: dict) -> tuple[str, bool]:
@@ -921,9 +941,26 @@ class LspManager:
         self._connections[name] = conn
 
     def _build_routing(self) -> None:
-        """Build language/extension -> server name routing tables."""
+        """Build language/extension -> server name routing tables.
+
+        Validates that every server declares a non-empty language set,
+        either explicitly (``languages`` or ``file_extensions`` in the
+        config) or implicitly via a recognized name in
+        ``SERVER_LANGUAGE_HINTS``. A server with no resolvable languages
+        would otherwise be a silent catch-all (issue #12).
+        """
+        from .report import ConfigError
+
         for name, conn in self._connections.items():
-            for lang in conn.languages:
+            langs = conn.languages
+            if not langs:
+                raise ConfigError(
+                    f"LSP server {name!r} has no languages configured. "
+                    f"Specify 'languages' or 'file_extensions' in the "
+                    f"config, or use a recognized server name (one of: "
+                    f"{', '.join(sorted(SERVER_LANGUAGE_HINTS.keys()))})."
+                )
+            for lang in langs:
                 if lang not in self._language_to_server:
                     self._language_to_server[lang] = name
             # Also build extension routing
@@ -1051,6 +1088,54 @@ class LspManager:
 # ---------------------------------------------------------------------------
 # LSP tool schemas (OpenAI function-calling format)
 # ---------------------------------------------------------------------------
+
+
+# Mapping from LSP tool name -> capability key(s) required to expose it.
+# ``lsp_diagnostics`` is unconditionally available because it reads the
+# stored ``textDocument/publishDiagnostics`` buffer (no provider
+# capability is required to read what the server already sent).
+# ``lsp_workspace_symbols`` always uses the first active server.
+_LSP_TOOL_REQUIRED_CAPS: dict[str, tuple[str, ...]] = {
+    "lsp_definition": ("definitionProvider",),
+    "lsp_references": ("referencesProvider",),
+    "lsp_hover": ("hoverProvider",),
+    "lsp_code_actions": ("codeActionProvider",),
+    "lsp_rename": ("renameProvider",),
+    "lsp_document_symbols": ("documentSymbolProvider",),
+    "lsp_workspace_symbols": ("workspace.symbolProvider",),
+}
+
+
+def _tools_for_capabilities(
+    capabilities_list: list[dict],
+) -> set[str]:
+    """Return the set of LSP tool names supported by the union of these
+    server capabilities.
+
+    ``lsp_diagnostics`` is always included (no provider capability
+    required). ``lsp_workspace_symbols`` is included if *any* server
+    advertises ``workspace.symbolProvider`` since the manager delegates
+    to the first active server.
+    """
+    available: set[str] = {"lsp_diagnostics"}
+    for caps in capabilities_list:
+        for tool, required in _LSP_TOOL_REQUIRED_CAPS.items():
+            if any(_capability_present(caps, key) for key in required):
+                available.add(tool)
+    return available
+
+
+def _capability_present(caps: dict, dotted_key: str) -> bool:
+    """Check a (possibly nested) capability key, e.g.
+    ``"workspace.symbolProvider"``.
+    """
+    node: Any = caps
+    for part in dotted_key.split("."):
+        if not isinstance(node, dict):
+            return False
+        node = node.get(part)
+    return bool(node)
+
 
 LSP_TOOLS: list[dict] = [
     {

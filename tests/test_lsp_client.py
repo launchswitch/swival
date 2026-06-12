@@ -17,12 +17,15 @@ import pytest
 from swival.lsp_client import (
     LSP_TOOLS,
     _LspConnection,
+    _capability_present,
     _encode_message,
     _read_message,
+    _tools_for_capabilities,
     auto_detect_lsp,
     path_to_uri,
     uri_to_path,
 )
+from swival.report import ConfigError
 
 
 # ---------------------------------------------------------------------------
@@ -274,8 +277,119 @@ class TestToolSchemas:
 
 
 # ---------------------------------------------------------------------------
-# Auto-detection
+# Capability -> tool filtering (issue #10)
 # ---------------------------------------------------------------------------
+
+
+class TestToolsForCapabilities:
+    def test_empty_caps_only_exposes_diagnostics(self):
+        # No providers at all -> only lsp_diagnostics is unconditionally
+        # available (it reads the stored publishDiagnostics buffer).
+        result = _tools_for_capabilities([{}])
+        assert result == {"lsp_diagnostics"}
+
+    def test_single_server_definition_only(self):
+        caps = {"definitionProvider": True}
+        result = _tools_for_capabilities([caps])
+        assert "lsp_definition" in result
+        assert "lsp_references" not in result
+        assert "lsp_hover" not in result
+        assert "lsp_diagnostics" in result
+
+    def test_workspace_symbol_uses_dotted_key(self):
+        # workspace.symbolProvider is a nested capability
+        caps = {"workspace": {"symbolProvider": True}}
+        result = _tools_for_capabilities([caps])
+        assert "lsp_workspace_symbols" in result
+
+    def test_workspace_symbol_absent_when_no_nested_cap(self):
+        # A top-level symbolProvider should NOT enable workspace search
+        result = _tools_for_capabilities([{"symbolProvider": True}])
+        assert "lsp_workspace_symbols" not in result
+
+    def test_union_of_capabilities_across_servers(self):
+        # Two servers, complementary capabilities -> union is exposed
+        a = {"definitionProvider": True, "hoverProvider": True}
+        b = {"referencesProvider": True, "renameProvider": True}
+        result = _tools_for_capabilities([a, b])
+        assert {"lsp_definition", "lsp_hover", "lsp_references", "lsp_rename"} <= result
+
+    def test_capability_present_helper(self):
+        assert _capability_present({"a": True}, "a") is True
+        assert _capability_present({"a": False}, "a") is False
+        assert _capability_present({"a": {"b": True}}, "a.b") is True
+        assert _capability_present({"a": {"b": True}}, "a.c") is False
+        assert _capability_present({"a": True}, "a.b") is False
+        assert _capability_present({}, "a") is False
+
+
+# ---------------------------------------------------------------------------
+# Language-config validation (issue #12)
+# ---------------------------------------------------------------------------
+
+
+class TestLanguageValidation:
+    def test_explicit_languages_works(self):
+        c = _LspConnection(
+            "test",
+            {"command": "x", "languages": ["python"]},
+            Path("/tmp"),
+        )
+        assert c.languages == ["python"]
+        assert c.supports_language("python") is True
+        assert c.supports_language("rust") is False
+
+    def test_file_extensions_works(self):
+        c = _LspConnection(
+            "test",
+            {"command": "x", "file_extensions": [".py", ".pyi"]},
+            Path("/tmp"),
+        )
+        langs = c.languages
+        assert "python" in langs
+
+    def test_recognized_name_auto_detects(self):
+        c = _LspConnection("pyright", {"command": "x"}, Path("/tmp"))
+        assert "python" in c.languages
+        assert c.supports_language("python") is True
+
+    def test_unrecognized_name_returns_empty_languages(self):
+        c = _LspConnection(
+            "xyz-abc", {"command": "x"}, Path("/tmp")
+        )
+        assert c.languages == []
+
+    def test_supports_language_defaults_false_when_empty(self):
+        # The bug from issue #12: a server with no languages used to
+        # claim to handle every language. Now it must claim none.
+        c = _LspConnection(
+            "xyz-abc", {"command": "x"}, Path("/tmp")
+        )
+        assert c.languages == []
+        assert c.supports_language("python") is False
+        assert c.supports_language("rust") is False
+        assert c.supports_language("anything") is False
+
+    def test_routing_raises_config_error_for_unknown_server(self, monkeypatch):
+        """A server with no resolvable languages fails fast at startup."""
+        from swival.lsp_client import LspManager
+
+        # Build a real _LspConnection whose name doesn't match any
+        # SERVER_LANGUAGE_HINTS entry and has no explicit languages.
+        # "xyz-abc" is verified safe against the current hints list.
+        conn = _LspConnection(
+            "xyz-abc", {"command": "echo"}, Path("/tmp")
+        )
+        assert conn.languages == []  # precondition
+
+        mgr = LspManager(
+            {"xyz-abc": {"command": "echo"}},
+            workspace_root="/tmp",
+        )
+        mgr._connections["xyz-abc"] = conn
+
+        with pytest.raises(ConfigError, match="no languages configured"):
+            mgr._build_routing()
 
 
 class TestAutoDetect:
