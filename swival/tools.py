@@ -1766,28 +1766,39 @@ def _view_image(
 
 
 def _read_files(
-    files: list[dict],
+    files: "list[dict | str] | tuple[dict | str, ...]",
     base_dir: str,
     extra_read_roots: list[Path] = (),
     extra_write_roots: list[Path] = (),
     files_mode: str = "some",
     tracker=None,
-) -> str:
-    """Read multiple files and return results grouped by file."""
+) -> tuple[str, dict[str, str]]:
+    """Read multiple files and return ``(formatted_result, full_contents)``.
+
+    ``full_contents`` maps the resolved absolute path of each
+    successfully-read file to its full disk content. It is populated
+    only for files that were read in full (no ``offset``/``limit``/
+    ``tail_lines``); callers needing partial content (e.g. for display)
+    should extract it from the formatted result via
+    :func:`_split_read_result`. Returning the raw content alongside the
+    formatted result lets downstream hooks (notably the LSP
+    ``didOpen`` notification) skip a redundant disk read.
+    """
     if not files:
         return (
             "error: read_files requires a non-empty 'files' array. Each entry is either a "
             'path string or an object like {"file_path": "...", "offset": 1, "limit": 200}. '
             "To read a single file, use read_file instead."
-        )
+        ), {}
     if len(files) > _MAX_READ_FILES:
-        return f"error: too many files requested ({len(files)}), maximum is {_MAX_READ_FILES}"
+        return f"error: too many files requested ({len(files)}), maximum is {_MAX_READ_FILES}", {}
 
     sections = []
     total_bytes = 0
     files_with_errors = 0
     files_succeeded = 0
     skipped_files = 0
+    full_contents: dict[str, str] = {}
 
     for i, spec in enumerate(files):
         if isinstance(spec, str):
@@ -1946,6 +1957,23 @@ def _read_files(
                 checksum=checksum,
             )
             files_succeeded += 1
+            # Capture the full disk content for files read without
+            # offset/limit/tail, so the LSP hook can skip a re-read.
+            # We check the spec dict (not the post-coercion values) so
+            # that the default full-read case — which resolves to
+            # ``limit=MAX_READ_LINES`` after parsing — is also caught.
+            if (
+                offset == 1
+                and "limit" not in spec
+                and "tail_lines" not in spec
+                and "tail" not in spec
+            ):
+                try:
+                    full_contents[str(resolved)] = resolved.read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                except OSError:
+                    pass
 
         section_bytes = len(section.encode("utf-8")) + 2
         if total_bytes + section_bytes > MAX_OUTPUT_BYTES:
@@ -1972,7 +2000,7 @@ def _read_files(
         output += (
             f"\n\n[batch_truncated: {skipped_files} file(s) skipped due to size limit]"
         )
-    return output
+    return output, full_contents
 
 
 def _write_file(
@@ -2093,7 +2121,7 @@ def _write_file(
     return f"Wrote {len(data)} bytes to {file_path}\n[checksum={_hash_bytes(data)}]"
 
 
-def _edit_file(
+def _apply_edit(
     file_path: str,
     old_string: str,
     new_string: str,
@@ -2105,8 +2133,14 @@ def _edit_file(
     files_mode: str = "some",
     tracker=None,
     verbose: bool = False,
-) -> str:
-    """Replace old_string with new_string in an existing file."""
+) -> tuple[str, str | None]:
+    """Replace ``old_string`` with ``new_string`` in an existing file.
+
+    Returns ``(result_text, new_content)`` where ``new_content`` is the
+    full post-edit file text on success, or ``None`` on any error
+    path. Returning the new content lets downstream hooks (notably
+    the LSP ``didChange`` notification) skip a redundant disk read.
+    """
     from .edit import replace
 
     try:
@@ -2117,26 +2151,26 @@ def _edit_file(
             files_mode=files_mode,
         )
     except ValueError as exc:
-        return f"error: {exc}"
+        return f"error: {exc}", None
 
     # Protect project config files from being edited.
     if resolved.name in ("swival.toml", "mcp.json"):
         return (
             f"error: cannot edit {resolved.name} — "
             "this file must never be modified by the agent under any circumstances"
-        )
+        ), None
 
     if not resolved.exists():
-        return f"error: file does not exist: {file_path}"
+        return f"error: file does not exist: {file_path}", None
 
     if tracker is not None:
         error = tracker.check_write_allowed(str(resolved), exists=True)
         if error:
-            return error
+            return error, None
 
     checksum_error = _verify_checksum(resolved, checksum, file_path, "edit_file")
     if checksum_error is not None:
-        return checksum_error
+        return checksum_error, None
 
     if not old_string:
         return (
@@ -2144,7 +2178,7 @@ def _edit_file(
             "To insert text into a file, pass the surrounding context as 'old_string' and the "
             "context plus your new content as 'new_string'. To create a new file or overwrite "
             "one entirely, use write_file instead."
-        )
+        ), None
 
     try:
         content = resolved.read_text(encoding="utf-8")
@@ -2152,9 +2186,9 @@ def _edit_file(
         return (
             f"error: edit_file: {file_path} is not valid UTF-8 text; "
             f"edit_file only handles text files: {exc}"
-        )
+        ), None
     except (PermissionError, OSError) as exc:
-        return f"error: edit_file: cannot read {file_path}: {exc}"
+        return f"error: edit_file: cannot read {file_path}: {exc}", None
 
     try:
         new_content = replace(
@@ -2165,7 +2199,7 @@ def _edit_file(
             line_number=line_number,
         )
     except ValueError as exc:
-        return f"error: edit_file: {exc} (in {file_path})"
+        return f"error: edit_file: {exc} (in {file_path})", None
 
     resolved.write_text(new_content, encoding="utf-8")
 
@@ -2181,8 +2215,44 @@ def _edit_file(
 
     new_checksum = _compute_checksum(resolved)
     if new_checksum is not None:
-        return f"Edited {file_path}\n[checksum={new_checksum}]"
-    return f"Edited {file_path}"
+        return f"Edited {file_path}\n[checksum={new_checksum}]", new_content
+    return f"Edited {file_path}", new_content
+
+
+def _edit_file(
+    file_path: str,
+    old_string: str,
+    new_string: str,
+    base_dir: str,
+    replace_all: bool = False,
+    line_number: int | None = None,
+    checksum: str | None = None,
+    extra_write_roots: list[Path] = (),
+    files_mode: str = "some",
+    tracker=None,
+    verbose: bool = False,
+) -> str:
+    """Replace old_string with new_string in an existing file.
+
+    Thin wrapper around :func:`_apply_edit` that returns only the
+    formatted result string. Callers that need the post-edit file
+    content (e.g. for LSP ``didChange``) should call ``_apply_edit``
+    directly to avoid a redundant disk read.
+    """
+    result, _new_content = _apply_edit(
+        file_path=file_path,
+        old_string=old_string,
+        new_string=new_string,
+        base_dir=base_dir,
+        replace_all=replace_all,
+        line_number=line_number,
+        checksum=checksum,
+        extra_write_roots=extra_write_roots,
+        files_mode=files_mode,
+        tracker=tracker,
+        verbose=verbose,
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -3526,7 +3596,7 @@ def dispatch(name: str, args: dict, base_dir: str, **kwargs) -> str:
             files = [files]
         if not isinstance(files, list):
             return "error: 'files' must be an array"
-        result = _read_files(
+        result, full_contents = _read_files(
             files=files,
             base_dir=base_dir,
             extra_read_roots=skill_read_roots,
@@ -3534,7 +3604,9 @@ def dispatch(name: str, args: dict, base_dir: str, **kwargs) -> str:
             files_mode=files_mode,
             tracker=file_tracker,
         )
-        # Notify LSP of file reads (best-effort)
+        # Notify LSP of file reads (best-effort). Prefer the content
+        # already read by _read_files; only fall back to a fresh read
+        # for files that were read with offset/limit/tail.
         if not result.startswith("error:") and _lsp_manager is not None:
             for _fp in files:
                 try:
@@ -3545,13 +3617,14 @@ def dispatch(name: str, args: dict, base_dir: str, **kwargs) -> str:
                         extra_write_roots=extra_write_roots,
                         files_mode=files_mode,
                     )
-                    if _abs.is_file():
-                        _notify_lsp(
-                            _lsp_manager,
-                            "read",
-                            _abs,
-                            _abs.read_text(encoding="utf-8", errors="replace"),
+                    if not _abs.is_file():
+                        continue
+                    content = full_contents.get(str(_abs))
+                    if content is None:
+                        content = _abs.read_text(
+                            encoding="utf-8", errors="replace"
                         )
+                    _notify_lsp(_lsp_manager, "read", _abs, content)
                 except Exception:
                     pass
         return result
@@ -3579,7 +3652,7 @@ def dispatch(name: str, args: dict, base_dir: str, **kwargs) -> str:
                 pass
         return result
     elif name == "edit_file":
-        result = _edit_file(
+        result, new_content = _apply_edit(
             file_path=args["file_path"],
             old_string=args["old_string"],
             new_string=args["new_string"],
@@ -3592,8 +3665,14 @@ def dispatch(name: str, args: dict, base_dir: str, **kwargs) -> str:
             tracker=file_tracker,
             verbose=kwargs.get("verbose", False),
         )
-        # Notify LSP of file edit (best-effort)
-        if not result.startswith("error:") and _lsp_manager is not None:
+        # Notify LSP of file edit (best-effort). Use the new content
+        # returned by _apply_edit; only fall back to a disk read if
+        # the edit failed (new_content is None in that case).
+        if (
+            not result.startswith("error:")
+            and _lsp_manager is not None
+            and new_content is not None
+        ):
             try:
                 _abs = safe_resolve(
                     args["file_path"],
@@ -3601,13 +3680,7 @@ def dispatch(name: str, args: dict, base_dir: str, **kwargs) -> str:
                     extra_write_roots=extra_write_roots,
                     files_mode=files_mode,
                 )
-                if _abs.is_file():
-                    _notify_lsp(
-                        _lsp_manager,
-                        "write",
-                        _abs,
-                        _abs.read_text(encoding="utf-8", errors="replace"),
-                    )
+                _notify_lsp(_lsp_manager, "write", _abs, new_content)
             except Exception:
                 pass
         return result
