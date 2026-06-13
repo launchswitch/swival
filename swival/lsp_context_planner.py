@@ -131,6 +131,7 @@ class LspContextPlanner:
         max_symbols: int = 6,
         timeout: float = 8.0,
         candidate_cap: int = 40,
+        response_tokens: int = 512,
         api_key: str | None = None,
         completion_fn: CompletionFn | None = None,
         verbose: bool = False,
@@ -141,6 +142,10 @@ class LspContextPlanner:
         self._max_symbols = max_symbols
         self._timeout = timeout
         self._candidate_cap = candidate_cap
+        # Response allowance for the planner LLM. Reasoning models often split
+        # their answer across content + reasoning_content and need headroom past
+        # 256 tokens to emit complete JSON; 512 is a safe default.
+        self._response_tokens = response_tokens
         self._api_key = api_key
         self._completion = completion_fn or _default_completion
         self._verbose = verbose
@@ -199,7 +204,7 @@ class LspContextPlanner:
                 api_key=self._api_key or "dummy",
                 system=_PLANNER_SYSTEM,
                 user=user,
-                max_tokens=256,
+                max_tokens=self._response_tokens,
                 temperature=0.0,
                 timeout=self._timeout,
             )

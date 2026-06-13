@@ -101,6 +101,7 @@ class Session:
         lsp_config: str | Path | None = None,
         no_lsp: bool = False,
         lsp_mode: str = "tools",
+        lsp_context_planner=None,
         extra_body: dict | None = None,
         reasoning_effort: str | None = None,
         continue_here: bool = True,
@@ -192,6 +193,9 @@ class Session:
         self.lsp_config = lsp_config
         self.no_lsp = no_lsp
         self.lsp_mode = lsp_mode
+        if no_lsp and lsp_mode != "off":
+            self.lsp_mode = "off"
+        self._lsp_context_planner = lsp_context_planner
         self.extra_body = extra_body
         self.reasoning_effort = reasoning_effort
         self.sanitize_thinking = sanitize_thinking
@@ -660,6 +664,12 @@ class Session:
             kwargs["a2a_manager"] = self._a2a_manager
         if self._lsp_manager is not None:
             kwargs["lsp_manager"] = self._lsp_manager
+        if self._lsp_context_planner is not None:
+            kwargs["lsp_context_planner"] = self._lsp_context_planner
+        # Explicit intent for the loop's LSP-as-context injection. Decoupled
+        # from the manager: in "tools" mode a manager exists but the loop must
+        # not inject [lsp automated context]. Mirrors lsp_mode at each entry.
+        kwargs["lsp_context_enabled"] = self.lsp_mode == "context"
         if self.llm_filter is not None:
             kwargs["llm_filter"] = self.llm_filter
         if self.command_middleware is not None:

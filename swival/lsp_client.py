@@ -19,6 +19,7 @@ import logging
 import os
 import queue
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote
@@ -702,6 +703,22 @@ class LspShutdownError(Exception):
     """Raised when call_tool() is invoked during or after shutdown."""
 
 
+@dataclass
+class _DirtyPath:
+    """A file written this turn whose diagnostics we are still waiting on.
+
+    ``publishDiagnostics`` is asynchronous, so diagnostics for a fresh edit can
+    arrive one loop iteration late. Rather than draining the dirty set on first
+    read (which loses those late diagnostics) we keep each entry for a small
+    turn TTL, removing it as soon as diagnostics are observed or its TTL hits
+    zero. See :meth:`LspManager.collect_turn_context`.
+    """
+
+    path: str
+    turns_remaining: int = 3
+    observed_diagnostics: bool = False
+
+
 class LspManager:
     """Manages connections to one or more LSP servers.
 
@@ -766,12 +783,16 @@ class LspManager:
         # Files written since the last collect_turn_context() call. Drives
         # LSP-as-context (``lsp_mode="context"``): diagnostics for these
         # files are injected into the model's context each turn instead of
-        # being exposed as lsp_* tools. Guarded by a lock because the
-        # notification worker thread mutates it while the agent thread
-        # reads and drains it.
-        self._dirty_paths: list[str] = []
+        # being exposed as lsp_* tools. An insertion-ordered dict keyed by
+        # absolute path -> _DirtyPath; entries survive a small turn TTL so
+        # late (asynchronous) diagnostics are not lost. Guarded by a lock
+        # because the notification worker thread mutates it while the agent
+        # thread reads and ages it.
+        self._dirty_paths: dict[str, _DirtyPath] = {}
         self._dirty_lock = threading.Lock()
         self._dirty_cap = 64
+        # Turns to keep a dirty path waiting for diagnostics before expiry.
+        self._dirty_ttl = 3
 
         # Every file opened in the LSP this session (read OR write). The Phase B
         # planner reads document symbols from these to find code relevant to the
@@ -929,9 +950,9 @@ class LspManager:
         self._enqueue_notification("delete", abs_path, None)
 
     def dirty_paths(self) -> list[str]:
-        """Snapshot of files written since the last ``collect_turn_context()``."""
+        """Snapshot of files with pending (not-yet-observed) diagnostics."""
         with self._dirty_lock:
-            return list(self._dirty_paths)
+            return list(self._dirty_paths.keys())
 
     def open_paths(self) -> list[str]:
         """Snapshot of files opened in the LSP this session (read or write)."""
@@ -939,35 +960,47 @@ class LspManager:
             return list(self._open_paths)
 
     def collect_turn_context(self, *, clear: bool = True) -> str | None:
-        """Return diagnostics text for files written since the last call.
+        """Return diagnostics text for files with pending dirty entries.
 
         Drives LSP-as-context (``lsp_mode="context"``): instead of exposing
         ``lsp_*`` tools, diagnostics for files the agent edited are injected
-        into the model's context each turn. Returns ``None`` when there is
-        nothing to report. When ``clear`` is True (default) the dirty set is
-        drained so each turn reports only newly-edited files.
+        into the model's context each turn. Returns ``None`` when nothing is
+        reportable this turn.
+
+        ``publishDiagnostics`` is asynchronous, so diagnostics for a fresh
+        edit can arrive one loop iteration late. To avoid losing them, dirty
+        entries are *not* drained on first read. Instead, when ``clear`` is
+        True (default) each call:
+
+        - removes a path as soon as its diagnostics are observed, and
+        - otherwise decrements its TTL, removing it once the TTL hits zero.
+
+        This waits for either diagnostics or TTL expiry, so neither late
+        diagnostics nor permanent stale state can accumulate. ``clear=False``
+        is a non-mutating snapshot (used by tests and candidate gathering);
+        it never changes the pending set.
 
         The diagnostics data is already maintained from
-        ``textDocument/publishDiagnostics`` notifications (no new LSP
-        traffic). Note: ``publishDiagnostics`` is asynchronous, so
-        diagnostics for a just-made edit may appear one iteration late.
+        ``textDocument/publishDiagnostics`` notifications (no new LSP traffic).
         """
+        with self._dirty_lock:
+            pending = list(self._dirty_paths.items())
+        if not pending:
+            return None
+
+        # No servers running: diagnostics can never arrive, so there is no
+        # value in the TTL wait. Drop the whole pending set (when clearing)
+        # rather than ageing it out over several turns.
         if not self._started or not self._connections:
             if clear:
                 with self._dirty_lock:
                     self._dirty_paths.clear()
             return None
 
-        with self._dirty_lock:
-            paths = list(self._dirty_paths)
-            if clear:
-                self._dirty_paths.clear()
-        if not paths:
-            return None
-
         blocks: list[str] = []
-        for raw in paths:
-            abs_path = Path(raw)
+        observed: set[str] = set()
+        for key, _entry in pending:
+            abs_path = Path(key)
             server_name = self._resolve_server(abs_path)
             if server_name is None:
                 continue
@@ -979,11 +1012,27 @@ class LspManager:
                 continue
             if not diags:
                 continue
+            observed.add(key)
             try:
                 rel = str(abs_path.relative_to(self._workspace_root))
             except ValueError:
                 rel = str(abs_path)
             blocks.append(_format_diagnostics(diags, rel))
+
+        if clear:
+            with self._dirty_lock:
+                for key, _entry in pending:
+                    if key in observed:
+                        # Diagnostics surfaced: drop it so we don't re-report.
+                        self._dirty_paths.pop(key, None)
+                        continue
+                    entry = self._dirty_paths.get(key)
+                    if entry is None:
+                        continue  # removed concurrently (e.g. by close())
+                    entry.turns_remaining -= 1
+                    entry.observed_diagnostics = False
+                    if entry.turns_remaining <= 0:
+                        del self._dirty_paths[key]
 
         if not blocks:
             return None
@@ -1222,30 +1271,38 @@ class LspManager:
         elif action == "delete":
             self._run_sync(conn.did_close(uri), timeout=5)
 
+    def _append_tracked(self, paths: list[str], cap: int, key: str) -> None:
+        """Dedupe-append to a tracked list under the shared lock, trimming oldest."""
+        with self._dirty_lock:
+            if key in paths:
+                return
+            paths.append(key)
+            over = len(paths) - cap
+            if over > 0:
+                del paths[:over]
+
     def _mark_dirty(self, abs_path: Path) -> None:
         """Record a file as edited, for LSP-as-context diagnostics.
 
-        Dedupes and caps the dirty set; older entries are dropped first.
+        Insert-or-refresh: a repeat write resets the TTL and moves the entry
+        to the end (most-recent), without duplicating it. The pending set is
+        capped to ``_dirty_cap`` by evicting the oldest entry, so a write
+        storm can't grow it unboundedly.
         """
         key = str(abs_path)
         with self._dirty_lock:
             if key in self._dirty_paths:
-                return
-            self._dirty_paths.append(key)
-            over = len(self._dirty_paths) - self._dirty_cap
-            if over > 0:
-                del self._dirty_paths[:over]
+                del self._dirty_paths[key]
+            self._dirty_paths[key] = _DirtyPath(
+                path=key, turns_remaining=self._dirty_ttl
+            )
+            while len(self._dirty_paths) > self._dirty_cap:
+                oldest = next(iter(self._dirty_paths))
+                del self._dirty_paths[oldest]
 
     def _mark_open(self, abs_path: Path) -> None:
         """Record a file as opened this session, for the Phase B planner."""
-        key = str(abs_path)
-        with self._dirty_lock:
-            if key in self._open_paths:
-                return
-            self._open_paths.append(key)
-            over = len(self._open_paths) - self._open_cap
-            if over > 0:
-                del self._open_paths[:over]
+        self._append_tracked(self._open_paths, self._open_cap, str(abs_path))
 
     def close(self) -> None:
         """Idempotent shutdown."""

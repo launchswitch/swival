@@ -91,7 +91,7 @@ class TestReadMultipleFilesHash:
     def test_section_carries_checksum(self, tmp_path):
         p = tmp_path / "x.txt"
         p.write_text("abc\n", encoding="utf-8")
-        result = _read_files([{"file_path": "x.txt"}], str(tmp_path))
+        result, _ = _read_files([{"file_path": "x.txt"}], str(tmp_path))
         expected = _expected_checksum(p.read_bytes())
         assert f"checksum: {expected}" in result
         assert "[checksum=" not in result
@@ -99,7 +99,7 @@ class TestReadMultipleFilesHash:
     def test_per_file_checksums_independent(self, tmp_path):
         (tmp_path / "a.txt").write_text("aaa\n", encoding="utf-8")
         (tmp_path / "b.txt").write_text("bbb\n", encoding="utf-8")
-        result = _read_files(
+        result, _ = _read_files(
             [{"file_path": "a.txt"}, {"file_path": "b.txt"}], str(tmp_path)
         )
         hashes = re.findall(

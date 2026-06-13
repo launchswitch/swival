@@ -32,7 +32,10 @@ TOOLS = [
                 "shows the next offset. Also lists directories. A "
                 "[checksum=...] trailer is appended for files; pass that "
                 "checksum to a later edit_file call to guard against the "
-                "file changing between read and edit."
+                "file changing between read and edit. To read only one "
+                "top-level definition, pass symbol=NAME (exact, top-level "
+                "function/class only); it is mutually exclusive with "
+                "offset/limit/tail_lines."
             ),
             "parameters": {
                 "type": "object",
@@ -40,6 +43,16 @@ TOOLS = [
                     "file_path": {
                         "type": "string",
                         "description": "Path to the file or directory to read.",
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": (
+                            "Optional top-level symbol name (function/class) to "
+                            "read. When provided, only that symbol's definition "
+                            "span is returned. Mutually exclusive with offset, "
+                            "limit, and tail_lines. Use the outline tool first if "
+                            "unsure of the exact name."
+                        ),
                     },
                     "offset": {
                         "type": "integer",
@@ -92,6 +105,14 @@ TOOLS = [
                                 "file_path": {
                                     "type": "string",
                                     "description": "Path to the file to read.",
+                                },
+                                "symbol": {
+                                    "type": "string",
+                                    "description": (
+                                        "Optional top-level symbol name "
+                                        "(function/class) to read. Mutually "
+                                        "exclusive with offset/limit/tail_lines."
+                                    ),
                                 },
                                 "offset": {
                                     "type": "integer",
@@ -1504,6 +1525,7 @@ def _read_file(
     offset: int = 1,
     limit: int | None = None,
     tail: int | None = None,
+    symbol: str | None = None,
     extra_read_roots: list[Path] = (),
     extra_write_roots: list[Path] = (),
     files_mode: str = "some",
@@ -1578,17 +1600,29 @@ def _read_file(
 
     lines = text.splitlines()
 
-    # Apply tail or offset (1-based) and limit
-    if tail is not None:
+    # Apply symbol / tail / offset (1-based) and limit. A symbol read overrides
+    # the line window with the definition span; the model asked for one symbol,
+    # so a "[N more lines]" continuation hint would be misleading — we skip it.
+    is_symbol_read = False
+    if symbol is not None:
+        resolved = _resolve_symbol_read_range(text, file_path, symbol)
+        if isinstance(resolved, str):
+            return resolved  # error: symbol not found
+        start_line, end_line = resolved
+        is_symbol_read = True
+        start = max(start_line - 1, 0)
+        end = min(end_line, len(lines))  # render_end is 1-based inclusive
+    elif tail is not None:
         if not isinstance(tail, int):
             return f"error: tail must be an integer, got {type(tail).__name__}"
         tail = max(tail, 1)
         if tail == 1 and limit > 1:
             tail = limit
         start = max(len(lines) - tail, 0)
+        end = start + limit
     else:
         start = max(offset - 1, 0)
-    end = start + limit
+        end = start + limit
     selected = lines[start:end]
 
     # Build output with line numbers, truncating long lines
@@ -1614,7 +1648,7 @@ def _read_file(
         tracker.record_read(str(resolved))
 
     result = "\n".join(output_parts)
-    if remaining > 0:
+    if remaining > 0 and not is_symbol_read:
         next_offset = start + lines_emitted + 1  # 1-based
         result += f"\n[{remaining} more lines, use offset={next_offset} to continue]"
     suffix = f"[checksum={_hash_bytes(data)}]"
@@ -1625,10 +1659,38 @@ def _read_file(
 _MAX_READ_FILES = 20
 
 
-def _format_read_request(offset: int, limit: int, tail: int | None) -> str:
+def _format_read_request(
+    offset: int, limit: int, tail: int | None, symbol: str | None = None
+) -> str:
+    if symbol is not None:
+        return f"symbol={symbol}"
     if tail is not None:
         return f"tail={tail}"
     return f"offset={offset} limit={limit}"
+
+
+def _resolve_symbol_read_range(
+    text: str, file_path: str, symbol: str
+) -> tuple[int, int] | str:
+    """Resolve a symbol name to a 1-based inclusive ``(start_line, end_line)``.
+
+    Uses :func:`swival.outline.symbol_spans`, which maps only *top-level*
+    definitions (module/file-scope functions and classes; methods are folded
+    into their enclosing class). Returns the ``(start, render_end)`` span on a
+    hit, or an ``error:`` string naming the file and listing the available
+    top-level symbols so the caller can fall back to the ``outline`` tool.
+    """
+    from .outline import symbol_spans
+
+    spans = symbol_spans(text, file_path)
+    span = spans.get(symbol)
+    if span is None:
+        available = ", ".join(sorted(spans)) if spans else "none"
+        return (
+            f"error: symbol {symbol!r} not found in {file_path}. "
+            f"Top-level symbols: {available}. Use the outline tool to browse."
+        )
+    return (span.start, span.render_end)
 
 
 def _coerce_int_arg(value, name: str) -> tuple[int | None, str | None]:
@@ -1835,6 +1897,29 @@ def _read_files(
         offset = spec.get("offset", 1)
         limit = spec.get("limit", MAX_READ_LINES)
         tail = spec.get("tail_lines") or spec.get("tail")
+        symbol = spec.get("symbol")
+
+        # symbol is mutually exclusive with explicit pagination. Check the raw
+        # spec (not coerced values) so defaults don't trigger the conflict.
+        if symbol is not None:
+            conflict = [
+                p for p in ("offset", "limit", "tail_lines", "tail") if p in spec
+            ]
+            if conflict:
+                sections.append(
+                    _build_read_multiple_files_section(
+                        file_path,
+                        "error",
+                        _format_read_request(1, MAX_READ_LINES, None, symbol),
+                        (
+                            "error: 'symbol' is mutually exclusive with pagination "
+                            f"parameter(s) {', '.join(conflict)}. To read just the "
+                            "symbol, drop them; to paginate, drop 'symbol'."
+                        ),
+                    )
+                )
+                files_with_errors += 1
+                continue
 
         offset, offset_error = _coerce_int_arg(offset, "offset")
         if offset_error is not None:
@@ -1901,7 +1986,7 @@ def _read_files(
         elif tail is not None:
             offset = 1
 
-        request = _format_read_request(offset, limit, tail)
+        request = _format_read_request(offset, limit, tail, symbol)
 
         # Reject directories — this tool is for files only.
         try:
@@ -1932,6 +2017,7 @@ def _read_files(
             offset=offset,
             limit=limit,
             tail=tail,
+            symbol=symbol,
             extra_read_roots=extra_read_roots,
             extra_write_roots=extra_write_roots,
             files_mode=files_mode,
@@ -1970,6 +2056,7 @@ def _read_files(
                 and "limit" not in spec
                 and "tail_lines" not in spec
                 and "tail" not in spec
+                and "symbol" not in spec  # partial read; let didOpen re-read
             ):
                 try:
                     full_contents[str(resolved)] = resolved.read_text(
@@ -3542,6 +3629,19 @@ def dispatch(name: str, args: dict, base_dir: str, **kwargs) -> str:
             return "error: think tool is not available"
         return thinking_state.process(args)
     elif name == "read_file":
+        symbol = args.get("symbol")
+        if symbol is not None:
+            # symbol is mutually exclusive with explicit pagination. Check the
+            # raw args dict (not coerced values) so defaults don't trip it.
+            conflict = [
+                p for p in ("offset", "limit", "tail_lines", "tail") if p in args
+            ]
+            if conflict:
+                return (
+                    "error: 'symbol' is mutually exclusive with pagination "
+                    f"parameter(s) {', '.join(conflict)}. To read just the "
+                    "symbol, drop them; to paginate, drop 'symbol'."
+                )
         offset, offset_error = _coerce_int_arg(args.get("offset", 1), "offset")
         if offset_error is not None:
             return offset_error
@@ -3568,6 +3668,7 @@ def dispatch(name: str, args: dict, base_dir: str, **kwargs) -> str:
             offset=offset,
             limit=limit,
             tail=tail,
+            symbol=symbol,
             extra_read_roots=skill_read_roots,
             extra_write_roots=extra_write_roots,
             files_mode=files_mode,

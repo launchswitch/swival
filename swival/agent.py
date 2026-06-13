@@ -2089,6 +2089,54 @@ def compact_messages(messages: list) -> list:
     return [msg for turn in turns for msg in turn]
 
 
+# Defaults for reduce_recent_large_file_tool_results(). Module constants (not
+# config) — matching the style of MAX_OUTPUT_BYTES etc. Tunable later if a real
+# need emerges; this pass is about removing the accidental dump, not knobs.
+_RECENT_REDUCE_TAIL_TURNS = 2
+_RECENT_REDUCE_THRESHOLD_CHARS = 6000
+
+
+def reduce_recent_large_file_tool_results(
+    messages: list,
+    *,
+    keep_tail_turns: int = _RECENT_REDUCE_TAIL_TURNS,
+    threshold_chars: int = _RECENT_REDUCE_THRESHOLD_CHARS,
+) -> int:
+    """Compact oversized recent ``read_file``/``read_multiple_files`` results.
+
+    :func:`compact_messages` deliberately preserves the most recent turns
+    verbatim, so a giant recent file read can survive untouched and keep the
+    next request bloated. This is its complement: within the last
+    ``keep_tail_turns`` turns, replace the *content* of any
+    ``read_file``/``read_multiple_files`` tool result above
+    ``threshold_chars`` with :func:`compact_tool_result`. ``edit_file``,
+    ``write_file``, and command output are left alone.
+
+    Mutates ``messages`` in place (durable, like compaction) and preserves
+    ``tool_call_id`` pairing — only the tool-result content string changes.
+    Returns the number of results reduced.
+    """
+    turns = group_into_turns(messages)
+    if not turns or keep_tail_turns <= 0:
+        return 0
+    recent = turns[-keep_tail_turns:]
+    reduced = 0
+    for turn in recent:
+        tc_index = _tool_call_index(turn)
+        for msg in turn:
+            if _msg_role(msg) != "tool":
+                continue
+            name, args = tc_index.get(_msg_tool_call_id(msg), ("?", None))
+            if name not in ("read_file", "read_multiple_files"):
+                continue
+            content = _msg_content(msg)
+            if not content or len(content) <= threshold_chars:
+                continue
+            _set_msg_content(msg, compact_tool_result(name, args, content))
+            reduced += 1
+    return reduced
+
+
 _DROPPABLE_USER_PREFIXES = (
     _IMAGE_SYNTHETIC_PREFIX,
     _COMMAND_TOOL_CONTEXT_PREFIX,
@@ -7444,6 +7492,7 @@ def _build_lsp_context_planner(args, base_dir: str):
         max_symbols=int(cfg.get("max_symbols", 6)),
         timeout=float(cfg.get("timeout", 8.0)),
         candidate_cap=int(cfg.get("candidate_cap", 40)),
+        response_tokens=int(cfg.get("response_tokens", 512)),
         api_key=cfg.get("api_key"),
         verbose=getattr(args, "verbose", False),
     )
@@ -7872,6 +7921,7 @@ def _run_main(args, report, _write_report, parser):
         a2a_manager=a2a_manager,
         lsp_manager=lsp_manager,
         lsp_context_planner=lsp_context_planner,
+        lsp_context_enabled=(lsp_mode == "context"),
         cache=llm_cache,
         secret_shield=secret_shield,
         command_policy=command_policy,
@@ -8290,6 +8340,7 @@ def run_agent_loop(
     a2a_manager=None,
     lsp_manager=None,
     lsp_context_planner=None,
+    lsp_context_enabled: bool = False,
     subagent_manager=None,
     continue_here: bool = True,
     cache=None,
@@ -8600,19 +8651,15 @@ def run_agent_loop(
     # every run_agent_loop call so it survives compaction. Best-effort: None on
     # any failure (Phase A diagnostics still inject independently below).
     _lsp_planner_text: str | None = None
-    if lsp_context_planner is not None and lsp_manager is not None:
+    if (
+        lsp_context_enabled
+        and lsp_context_planner is not None
+        and lsp_manager is not None
+    ):
         _planner_query = ""
         for _m in reversed(messages):
-            if isinstance(_m, dict) and _m.get("role") == "user":
-                _c = _m.get("content")
-                if isinstance(_c, str):
-                    _planner_query = _c
-                elif isinstance(_c, list):
-                    _planner_query = " ".join(
-                        p.get("text", "")
-                        for p in _c
-                        if isinstance(p, dict) and p.get("type") == "text"
-                    )
+            if _msg_role(_m) == "user":
+                _planner_query = _msg_content(_m)
                 if _planner_query:
                     break
         if _planner_query:
@@ -8710,15 +8757,28 @@ def run_agent_loop(
                     f"Backfilled {_orphans_filled} interrupted tool call(s) in history."
                 )
 
+        # --- Targeted reduction of recent large file-read results ---
+        # General compaction preserves the most recent turns verbatim, so a
+        # giant recent read_file/read_multiple_files result can survive and
+        # bloat the next request. Compact those (durable, in place) before the
+        # token estimate. Runs once per iteration after the previous turn's
+        # tool dispatch appended its results.
+        _recent_reduced = reduce_recent_large_file_tool_results(messages)
+        if _recent_reduced and verbose:
+            fmt.info(
+                f"Reduced {_recent_reduced} large recent file-read result(s) "
+                f"before next turn."
+            )
+
         # --- LSP-as-context (lsp_mode="context") ---
         # Each iteration, derive LSP context (diagnostics for files edited this
         # turn) and inject it as an ephemeral user message. The canonical
         # `messages` history is never mutated: the context is re-derived every
         # turn from live LSP state, so it cannot bloat the transcript and it
-        # survives compaction naturally. Every retry/repair call site below
-        # reuses the same _llm_args, so this single build covers them all.
+        # survives compaction naturally. All _llm_args (re)builds below use
+        # effective_messages so the LSP context survives compaction/retry.
         _lsp_context_msg = None
-        if lsp_manager is not None and getattr(lsp_manager, "context_mode", False):
+        if lsp_context_enabled and lsp_manager is not None:
             _lsp_parts: list[str] = []
             _lsp_diag = lsp_manager.collect_turn_context()
             if isinstance(_lsp_diag, str) and _lsp_diag:
@@ -8887,7 +8947,7 @@ def run_agent_loop(
                 _llm_args = (
                     api_base,
                     model_id,
-                    messages,
+                    effective_messages,
                     effective_max_output,
                     temperature,
                     top_p,
@@ -9040,7 +9100,7 @@ def run_agent_loop(
                     _llm_args = (
                         api_base,
                         model_id,
-                        messages,
+                        effective_messages,
                         _try_max_output,
                         temperature,
                         top_p,
@@ -9140,7 +9200,7 @@ def run_agent_loop(
                         _llm_args = (
                             api_base,
                             model_id,
-                            messages,
+                            effective_messages,
                             _retry_budget,
                             temperature,
                             top_p,
@@ -12206,6 +12266,7 @@ def repl_loop(
     a2a_manager=None,
     lsp_manager=None,
     lsp_context_planner=None,
+    lsp_context_enabled: bool = False,
     subagent_manager=None,
     continue_here: bool = True,
     cache=None,
@@ -12441,6 +12502,8 @@ def repl_loop(
         mcp_manager=mcp_manager,
         a2a_manager=a2a_manager,
         lsp_manager=lsp_manager,
+        lsp_context_planner=lsp_context_planner,
+        lsp_context_enabled=lsp_context_enabled,
         subagent_manager=subagent_manager,
         cache=cache,
         secret_shield=secret_shield,

@@ -1236,6 +1236,7 @@ def args_to_session_kwargs(args, base_dir: str) -> dict:
         "storm_breaker",
         "flatten_mcp_schemas",
         "location",
+        "lsp_mode",
     ]
 
     kwargs: dict = {"base_dir": base_dir}

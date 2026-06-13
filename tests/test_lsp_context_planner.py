@@ -175,3 +175,67 @@ class TestCollectCodeContext:
         lsp = FakeLsp([_candidate("alpha", "a.py", 1)], {})
         planner = _make_planner(lambda **kw: '{"pick":[0]}')
         assert planner.collect_code_context("", lsp, [], str(tmp_path)) is None
+
+
+# ---------------------------------------------------------------------------
+# response_tokens config (Phase 7)
+# ---------------------------------------------------------------------------
+
+
+class TestResponseTokens:
+    def test_default_is_512(self):
+        planner = _make_planner(lambda **kw: '{"pick":[0]}')
+        assert planner._response_tokens == 512
+
+    def test_custom_value_stored(self):
+        planner = _make_planner(lambda **kw: "{}", response_tokens=1024)
+        assert planner._response_tokens == 1024
+
+    def test_plan_passes_response_tokens_as_max_tokens(self, tmp_path):
+        captured = {}
+
+        def cap(**kw):
+            captured.update(kw)
+            return '{"pick":[0]}'
+
+        lsp = FakeLsp([_candidate("alpha", "a.py", 1)], {})
+        planner = _make_planner(cap, response_tokens=700)
+        planner.collect_code_context("use alpha", lsp, [], str(tmp_path))
+        assert captured.get("max_tokens") == 700
+
+
+class TestBuildPlannerFromConfig:
+    """_build_lsp_context_planner threads response_tokens from the TOML table."""
+
+    def test_response_tokens_threaded_from_toml(self):
+        import argparse
+
+        from swival.agent import _build_lsp_context_planner
+
+        args = argparse.Namespace()
+        args._lsp_context_planner_toml = {
+            "enabled": True,
+            "base_url": "http://localhost:8083/v1",
+            "model": "Qwopus3.6-27B-Coder-MTP-Q4_K_M.gguf",
+            "response_tokens": 900,
+        }
+        args.verbose = False
+        planner = _build_lsp_context_planner(args, "/tmp")
+        assert planner is not None
+        assert planner._response_tokens == 900
+
+    def test_response_tokens_defaults_to_512_when_absent(self):
+        import argparse
+
+        from swival.agent import _build_lsp_context_planner
+
+        args = argparse.Namespace()
+        args._lsp_context_planner_toml = {
+            "enabled": True,
+            "base_url": "http://localhost:8083/v1",
+            "model": "x",
+        }
+        args.verbose = False
+        planner = _build_lsp_context_planner(args, "/tmp")
+        assert planner is not None
+        assert planner._response_tokens == 512

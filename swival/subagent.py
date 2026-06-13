@@ -35,6 +35,13 @@ SA_TEMPLATE_EXCLUDE = frozenset(
         "event_callback",
         "report",
         "session",
+        # Subagents must not inject LSP-as-context. The manager is shared
+        # with the parent, and collect_turn_context()/TTL mutate the shared
+        # dirty set — a subagent draining it would steal the parent's late
+        # diagnostics. The planner also runs "once per user turn", which a
+        # subagent has none of. didOpen/dirty marking still happens via the
+        # manager's file hooks, which is harmless and useful.
+        "lsp_context_enabled",
     }
 )
 
@@ -416,6 +423,8 @@ def _subagent_thread_fn(
             turn_offset=0,
             cache=None,
             is_subagent=True,
+            # Never inject LSP-as-context in a subagent (see SA_TEMPLATE_EXCLUDE).
+            lsp_context_enabled=False,
         )
 
         cancel_before = composite_cancel.is_set()

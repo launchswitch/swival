@@ -85,8 +85,8 @@ class TestCollectTurnContext:
         assert "Diagnostics for files edited this turn:" in out
         assert "src/a.py" in out  # rendered relative to workspace root
         assert "undefined name 'y'" in out
-        # Dirty set is drained...
-        assert mgr._dirty_paths == []
+        # Dirty entry is removed once its diagnostics are observed...
+        assert mgr._dirty_paths == {}
         # ...so a follow-up call reports nothing new.
         assert mgr.collect_turn_context() is None
 
@@ -107,7 +107,9 @@ class TestCollectTurnContext:
         mgr._started = False
         mgr._mark_dirty(tmp_path / "a.py")
         assert mgr.collect_turn_context() is None
-        assert mgr._dirty_paths == []
+        # No servers => diagnostics can never arrive, so the whole pending
+        # set is dropped immediately rather than aged out over the TTL.
+        assert mgr._dirty_paths == {}
 
     def test_skips_files_with_no_resolvable_server(self, tmp_path):
         mgr, conn = _make_manager(tmp_path)
@@ -137,7 +139,7 @@ class TestMarkDirty:
         f = tmp_path / "a.py"
         mgr._mark_dirty(f)
         mgr._mark_dirty(f)
-        assert mgr._dirty_paths == [str(f)]
+        assert list(mgr._dirty_paths) == [str(f)]
 
     def test_caps_size_dropping_oldest(self, tmp_path):
         mgr, _ = _make_manager(tmp_path)
@@ -148,6 +150,75 @@ class TestMarkDirty:
         # Oldest entries dropped, most recent retained.
         assert str(tmp_path / "f5.py") in mgr._dirty_paths
         assert str(tmp_path / "f0.py") not in mgr._dirty_paths
+
+
+class TestDirtyPathTtl:
+    """Phase 2: dirty entries survive a turn TTL so late (asynchronous)
+    publishDiagnostics are not lost."""
+
+    def test_no_diagnostics_retained_after_first_collect(self, tmp_path):
+        mgr, _ = _make_manager(tmp_path)
+        f = tmp_path / "a.py"
+        f.write_text("x = 1\n")
+        mgr._mark_dirty(f)
+        # Nothing to report yet, but the path is NOT dropped.
+        assert mgr.collect_turn_context() is None
+        assert str(f) in mgr._dirty_paths
+
+    def test_late_diagnostics_included_on_second_collect(self, tmp_path):
+        mgr, conn = _make_manager(tmp_path)
+        f = tmp_path / "a.py"
+        f.write_text("x = 1\n")
+        mgr._mark_dirty(f)
+        # First collect: diagnostics have not arrived yet.
+        assert mgr.collect_turn_context() is None
+        assert str(f) in mgr._dirty_paths
+        # They arrive one turn late (publishDiagnostics is async).
+        conn._diagnostics[path_to_uri(f)] = [_diag("undefined name 'y'", line=3)]
+        out = mgr.collect_turn_context()
+        assert out is not None
+        assert "undefined name 'y'" in out
+        # Observed once -> removed so it isn't re-reported every turn.
+        assert str(f) not in mgr._dirty_paths
+
+    def test_expires_after_ttl_empty_collections(self, tmp_path):
+        mgr, _ = _make_manager(tmp_path)
+        f = tmp_path / "a.py"
+        f.write_text("x = 1\n")
+        mgr._mark_dirty(f)
+        ttl = mgr._dirty_ttl
+        # Survives (ttl - 1) empty collections...
+        for _ in range(ttl - 1):
+            assert mgr.collect_turn_context() is None
+            assert str(f) in mgr._dirty_paths
+        # ...and is evicted on the ttl-th empty collection.
+        assert mgr.collect_turn_context() is None
+        assert str(f) not in mgr._dirty_paths
+
+    def test_clear_false_does_not_decrement_ttl(self, tmp_path):
+        mgr, _ = _make_manager(tmp_path)
+        f = tmp_path / "a.py"
+        f.write_text("x = 1\n")
+        mgr._mark_dirty(f)
+        before = mgr._dirty_paths[str(f)].turns_remaining
+        assert mgr.collect_turn_context(clear=False) is None  # snapshot, no diags
+        assert mgr._dirty_paths[str(f)].turns_remaining == before
+        assert str(f) in mgr._dirty_paths
+
+    def test_repeated_write_refreshes_ttl_and_dedupes(self, tmp_path):
+        mgr, _ = _make_manager(tmp_path)
+        f = tmp_path / "a.py"
+        f.write_text("x = 1\n")
+        mgr._mark_dirty(f)
+        ttl = mgr._dirty_ttl
+        # Age it partway down.
+        for _ in range(ttl - 1):
+            mgr.collect_turn_context()
+        assert mgr._dirty_paths[str(f)].turns_remaining == 1
+        # A repeat write refreshes the TTL to full without duplicating.
+        mgr._mark_dirty(f)
+        assert len(mgr._dirty_paths) == 1
+        assert mgr._dirty_paths[str(f)].turns_remaining == ttl
 
 
 # ---------------------------------------------------------------------------
@@ -329,3 +400,120 @@ class TestFetchSymbolBody:
     def test_missing_file_returns_empty(self, tmp_path):
         mgr, _ = _make_manager(tmp_path)
         assert mgr.fetch_symbol_body(tmp_path / "nope.py", 1, 5) == ""
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: lsp_context_enabled decouples loop injection from manager internals
+# ---------------------------------------------------------------------------
+
+
+class _FakeLspManager:
+    """Loop-level stand-in: only the methods the injection seam touches."""
+
+    def __init__(self, context_mode: bool, diag_text: str = "MARKER_DIAG_TEXT"):
+        self.context_mode = context_mode
+        self._diag_text = diag_text
+
+    def collect_turn_context(self, clear=True):
+        return self._diag_text
+
+    def dirty_paths(self):
+        return []
+
+
+def _loop_kwargs_for_flag_test(tmp_path, **overrides):
+    from swival.thinking import ThinkingState
+    from swival.todo import TodoState
+
+    defaults = dict(
+        api_base="http://localhost",
+        model_id="test-model",
+        max_turns=3,
+        max_output_tokens=1024,
+        temperature=0.0,
+        top_p=None,
+        seed=None,
+        context_length=None,
+        base_dir=str(tmp_path),
+        thinking_state=ThinkingState(),
+        todo_state=TodoState(),
+        resolved_commands={},
+        skills_catalog={},
+        skill_read_roots=[],
+        extra_write_roots=[],
+        files_mode="all",
+        verbose=False,
+        llm_kwargs={},
+    )
+    defaults.update(overrides)
+    return defaults
+
+
+def _capturing_llm(sink: list):
+    """An agent.call_llm replacement that records the effective messages."""
+
+    def _llm(*args, **kwargs):
+        msgs = args[2] if len(args) > 2 else kwargs.get("messages") or []
+        sink.append(list(msgs))
+        msg = MagicMock()
+        msg.content = "the answer"
+        msg.tool_calls = None
+        return msg, "stop"
+
+    return _llm
+
+
+def _any_content_contains(turns: list, needle: str) -> bool:
+    from swival._msg import _msg_content
+
+    return any(needle in _msg_content(m) for turn in turns for m in turn)
+
+
+class TestLspContextEnabledFlag:
+    """The loop injects [lsp automated context] iff ``lsp_context_enabled``,
+    regardless of ``lsp_manager.context_mode``."""
+
+    def _run(self, tmp_path, monkeypatch, *, context_mode, lsp_context_enabled):
+        monkeypatch.setattr(agent, "call_llm", _capturing_llm(sink := []))
+        monkeypatch.setattr(agent, "discover_model", lambda *a: ("test-model", None))
+        agent.run_agent_loop(
+            [{"role": "user", "content": "hi"}],
+            [],
+            **_loop_kwargs_for_flag_test(tmp_path),
+            lsp_manager=_FakeLspManager(context_mode=context_mode),
+            lsp_context_enabled=lsp_context_enabled,
+        )
+        return sink
+
+    def test_flag_false_no_injection_even_if_context_mode_true(
+        self, tmp_path, monkeypatch
+    ):
+        # Manager says context_mode=True, but the caller passed the flag False.
+        captured = self._run(
+            tmp_path, monkeypatch, context_mode=True, lsp_context_enabled=False
+        )
+        assert captured, "LLM was never called"
+        assert not _any_content_contains(captured, "MARKER_DIAG_TEXT")
+        assert not _any_content_contains(captured, "[lsp automated context]")
+
+    def test_flag_true_injects_even_if_context_mode_false(self, tmp_path, monkeypatch):
+        # Manager says context_mode=False, but the explicit flag is True.
+        captured = self._run(
+            tmp_path, monkeypatch, context_mode=False, lsp_context_enabled=True
+        )
+        assert captured, "LLM was never called"
+        assert _any_content_contains(captured, "MARKER_DIAG_TEXT")
+        assert _any_content_contains(captured, "[lsp automated context]")
+
+    def test_default_flag_is_false(self, tmp_path, monkeypatch):
+        # Omitting the flag must never inject, even with a context-mode manager.
+        monkeypatch.setattr(agent, "call_llm", _capturing_llm(sink := []))
+        monkeypatch.setattr(agent, "discover_model", lambda *a: ("test-model", None))
+        agent.run_agent_loop(
+            [{"role": "user", "content": "hi"}],
+            [],
+            **_loop_kwargs_for_flag_test(tmp_path),
+            lsp_manager=_FakeLspManager(context_mode=True),
+        )
+        assert sink, "LLM was never called"
+        assert not _any_content_contains(sink, "[lsp automated context]")
