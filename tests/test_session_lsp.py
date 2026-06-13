@@ -1,7 +1,6 @@
 """Tests for LSP integration in the Session library API."""
 
 import types
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -35,7 +34,9 @@ class TestSessionLspExplicitConfig:
         mock_mgr.get_tool_info.return_value = {}
 
         with patch("swival.lsp_client.LspManager", return_value=mock_mgr) as MockLspMgr:
-            servers = {"pyright": {"command": "pyright-langserver", "args": ["--stdio"]}}
+            servers = {
+                "pyright": {"command": "pyright-langserver", "args": ["--stdio"]}
+            }
             s = Session(base_dir=str(tmp_path), history=False, lsp_servers=servers)
             s._setup()
 
@@ -43,6 +44,7 @@ class TestSessionLspExplicitConfig:
                 servers,
                 workspace_root=str(tmp_path),
                 verbose=False,
+                context_mode=False,
             )
             mock_mgr.start.assert_called_once()
             assert s._lsp_manager is mock_mgr
@@ -52,13 +54,22 @@ class TestSessionLspExplicitConfig:
         monkeypatch.setattr(agent, "call_llm", _simple_llm)
         monkeypatch.setattr(agent, "discover_model", lambda *a: ("test-model", None))
 
-        lsp_tool = {"type": "function", "function": {"name": "lsp_definition", "parameters": {}}}
+        lsp_tool = {
+            "type": "function",
+            "function": {"name": "lsp_definition", "parameters": {}},
+        }
         mock_mgr = MagicMock()
         mock_mgr.list_tools.return_value = [lsp_tool]
-        mock_mgr.get_tool_info.return_value = {"lsp": [("lsp_definition", "Find definitions")]}
+        mock_mgr.get_tool_info.return_value = {
+            "lsp": [("lsp_definition", "Find definitions")]
+        }
 
         with patch("swival.lsp_client.LspManager", return_value=mock_mgr):
-            s = Session(base_dir=str(tmp_path), history=False, lsp_servers={"s": {"command": "x"}})
+            s = Session(
+                base_dir=str(tmp_path),
+                history=False,
+                lsp_servers={"s": {"command": "x"}},
+            )
             s._setup()
 
             tool_names = [t["function"]["name"] for t in s._tools]
@@ -75,7 +86,11 @@ class TestSessionLspExplicitConfig:
         mock_mgr.get_tool_info.return_value = tool_info
 
         with patch("swival.lsp_client.LspManager", return_value=mock_mgr):
-            s = Session(base_dir=str(tmp_path), history=False, lsp_servers={"s": {"command": "x"}})
+            s = Session(
+                base_dir=str(tmp_path),
+                history=False,
+                lsp_servers={"s": {"command": "x"}},
+            )
             s._setup()
 
             # Verify get_tool_info was called (used in build_system_prompt)
@@ -91,7 +106,11 @@ class TestSessionLspExplicitConfig:
         mock_mgr.get_tool_info.return_value = {}
 
         with patch("swival.lsp_client.LspManager", return_value=mock_mgr):
-            s = Session(base_dir=str(tmp_path), history=False, lsp_servers={"s": {"command": "x"}})
+            s = Session(
+                base_dir=str(tmp_path),
+                history=False,
+                lsp_servers={"s": {"command": "x"}},
+            )
             s._setup()
 
             state = s._make_per_run_state(system_content=None)
@@ -108,7 +127,11 @@ class TestSessionLspExplicitConfig:
         mock_mgr.get_tool_info.return_value = {}
 
         with patch("swival.lsp_client.LspManager", return_value=mock_mgr):
-            s = Session(base_dir=str(tmp_path), history=False, lsp_servers={"s": {"command": "x"}})
+            s = Session(
+                base_dir=str(tmp_path),
+                history=False,
+                lsp_servers={"s": {"command": "x"}},
+            )
             s._setup()
 
             state = s._make_per_run_state(system_content=None)
@@ -125,7 +148,11 @@ class TestSessionLspExplicitConfig:
         mock_mgr.get_tool_info.return_value = {}
 
         with patch("swival.lsp_client.LspManager", return_value=mock_mgr):
-            s = Session(base_dir=str(tmp_path), history=False, lsp_servers={"s": {"command": "x"}})
+            s = Session(
+                base_dir=str(tmp_path),
+                history=False,
+                lsp_servers={"s": {"command": "x"}},
+            )
             s._setup()
 
             assert s._lsp_manager is mock_mgr
@@ -142,7 +169,11 @@ class TestSessionLspExplicitConfig:
         mock_mgr.get_tool_info.return_value = {}
 
         with patch("swival.lsp_client.LspManager", return_value=mock_mgr):
-            with Session(base_dir=str(tmp_path), history=False, lsp_servers={"s": {"command": "x"}}) as s:
+            with Session(
+                base_dir=str(tmp_path),
+                history=False,
+                lsp_servers={"s": {"command": "x"}},
+            ) as s:
                 s._setup()
                 assert s._lsp_manager is mock_mgr
 
@@ -233,7 +264,9 @@ class TestSessionLspAutoDetect:
         mock_mgr.get_tool_info.return_value = {}
 
         with (
-            patch("swival.lsp_client.auto_detect_lsp", return_value=detected) as mock_detect,
+            patch(
+                "swival.lsp_client.auto_detect_lsp", return_value=detected
+            ) as mock_detect,
             patch("swival.lsp_client.LspManager", return_value=mock_mgr),
         ):
             s = Session(base_dir=str(tmp_path), history=False)

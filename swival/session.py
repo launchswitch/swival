@@ -100,6 +100,7 @@ class Session:
         lsp_servers: dict | None = None,
         lsp_config: str | Path | None = None,
         no_lsp: bool = False,
+        lsp_mode: str = "tools",
         extra_body: dict | None = None,
         reasoning_effort: str | None = None,
         continue_here: bool = True,
@@ -190,6 +191,7 @@ class Session:
         self.lsp_servers = lsp_servers
         self.lsp_config = lsp_config
         self.no_lsp = no_lsp
+        self.lsp_mode = lsp_mode
         self.extra_body = extra_body
         self.reasoning_effort = reasoning_effort
         self.sanitize_thinking = sanitize_thinking
@@ -432,7 +434,7 @@ class Session:
                 self._tools.extend(a2a_tools)
 
         # Initialize LSP servers
-        if not self.no_lsp:
+        if not self.no_lsp and self.lsp_mode != "off":
             self._init_lsp()
 
         # Initialize secret encryption shield
@@ -480,7 +482,11 @@ class Session:
         # in run()/ask() so it can be keyed from the user's question).
         mcp_tool_info = self._mcp_manager.get_tool_info() if self._mcp_manager else None
         a2a_tool_info = self._a2a_manager.get_tool_info() if self._a2a_manager else None
-        lsp_tool_info = self._lsp_manager.get_tool_info() if self._lsp_manager else None
+        lsp_tool_info = (
+            self._lsp_manager.get_tool_info()
+            if (self._lsp_manager and self.lsp_mode == "tools")
+            else None
+        )
         # Build list of tool schemas exposable to command provider (MCP/A2A/skills).
         _command_tool_schemas = (
             _filter_command_tool_schemas(self._tools) or None
@@ -539,11 +545,16 @@ class Session:
             servers,
             workspace_root=self.base_dir,
             verbose=self.verbose,
+            context_mode=(self.lsp_mode == "context"),
         )
         self._lsp_manager.start()
-        lsp_tools = self._lsp_manager.list_tools()
-        if lsp_tools:
-            self._tools.extend(lsp_tools)
+        # 'tools': advertise lsp_* tools. 'context': run the manager for
+        # diagnostics/sync only; LSP-derived context is injected each turn
+        # and no lsp_* tools are advertised.
+        if self.lsp_mode == "tools":
+            lsp_tools = self._lsp_manager.list_tools()
+            if lsp_tools:
+                self._tools.extend(lsp_tools)
 
     def _system_with_memory(
         self,

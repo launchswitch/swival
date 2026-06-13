@@ -105,6 +105,9 @@ CONFIG_KEYS: dict[str, type | tuple[type, ...]] = {
     "no_a2a": bool,
     "no_lsp": bool,
     "lsp_config": str,
+    # "tools" (default; expose lsp_* tools), "context" (inject LSP-derived
+    # context automatically, no lsp_* tools), or "off" (no LSP at all).
+    "lsp_mode": str,
     "extra_body": dict,
     "reasoning_effort": str,
     "cache": bool,
@@ -218,6 +221,7 @@ _ARGPARSE_DEFAULTS: dict[str, Any] = {
     "lsp": False,
     "no_lsp": False,
     "lsp_config": None,
+    "lsp_mode": "tools",
     "extra_body": None,
     "reasoning_effort": None,
     "sanitize_thinking": False,
@@ -1161,6 +1165,11 @@ def apply_config_to_args(args: argparse.Namespace, config: dict) -> None:
         if _is_unset(dest):
             setattr(args, dest, default)
 
+    # --no-lsp is a shortcut for --lsp-mode off. Reconcile so lsp_mode is the
+    # single source of truth downstream (consumers read lsp_mode, not no_lsp).
+    if getattr(args, "no_lsp", False):
+        args.lsp_mode = "off"
+
 
 def args_to_session_kwargs(args, base_dir: str) -> dict:
     """Convert an argparse namespace to Session constructor kwargs.
@@ -1338,6 +1347,7 @@ _NESTED_KEYS = frozenset(
         "mcp_servers",
         "a2a_servers",
         "lsp_servers",
+        "lsp_context_planner",
         "serve_skills",
         "encrypt_secrets_patterns",
     }

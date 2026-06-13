@@ -5406,10 +5406,22 @@ def build_parser():
         help="Path to a TOML config file with [lsp_servers.*] tables.",
     )
     integrations_group.add_argument(
+        "--lsp-mode",
+        choices=("tools", "context", "off"),
+        default=_UNSET,
+        help=(
+            "How LSP intelligence reaches the model. 'tools' (default): expose "
+            "lsp_* tools the model calls on demand. 'context': automatically "
+            "inject LSP-derived context (diagnostics, and optionally relevant "
+            "code via [lsp_context_planner]) each turn, with no lsp_* tools. "
+            "'off': no LSP at all (same as --no-lsp)."
+        ),
+    )
+    integrations_group.add_argument(
         "--no-lsp",
         action="store_true",
         default=_UNSET,
-        help="Disable LSP server connections entirely.",
+        help="Disable LSP server connections entirely (equivalent to --lsp-mode off).",
     )
     integrations_group.add_argument(
         "--subagents",
@@ -6092,6 +6104,9 @@ def main():
 
     # Stash LSP servers from TOML config before apply_config_to_args strips them
     args._lsp_servers_toml = file_config.pop("lsp_servers", None)
+
+    # Stash the [lsp_context_planner] table (Phase B) likewise
+    args._lsp_context_planner_toml = file_config.pop("lsp_context_planner", None)
 
     # Stash serve_skills from TOML config before apply_config_to_args strips them
     args._serve_skills_config = file_config.pop("serve_skills", None)
@@ -7407,6 +7422,33 @@ def _resolve_lsp_servers(args, base_dir) -> dict | None:
     return merged or None
 
 
+def _build_lsp_context_planner(args, base_dir: str):
+    """Build the Phase B LSP-context planner from the [lsp_context_planner] table.
+
+    Returns None when disabled or incompletely configured (no base_url/model),
+    so the feature degrades silently to Phase A diagnostics.
+    """
+    cfg = getattr(args, "_lsp_context_planner_toml", None) or {}
+    if not cfg.get("enabled"):
+        return None
+    base_url = cfg.get("base_url")
+    model = cfg.get("model")
+    if not base_url or not model:
+        return None
+    from .lsp_context_planner import LspContextPlanner
+
+    return LspContextPlanner(
+        base_url=base_url,
+        model=model,
+        budget_tokens=int(cfg.get("budget_tokens", 1500)),
+        max_symbols=int(cfg.get("max_symbols", 6)),
+        timeout=float(cfg.get("timeout", 8.0)),
+        candidate_cap=int(cfg.get("candidate_cap", 40)),
+        api_key=cfg.get("api_key"),
+        verbose=getattr(args, "verbose", False),
+    )
+
+
 def _validate_external_command(cmd_string: str, label: str) -> None:
     """Validate that a shell command string is well-formed and the executable exists."""
     import shlex
@@ -7654,7 +7696,8 @@ def _run_main(args, report, _write_report, parser):
     # Initialize LSP servers
     lsp_manager = None
     lsp_tool_info = {}
-    if not getattr(args, "no_lsp", False):
+    lsp_mode = getattr(args, "lsp_mode", "tools")
+    if lsp_mode != "off":
         from .lsp_client import LspManager
 
         lsp_servers = _resolve_lsp_servers(args, base_dir)
@@ -7663,13 +7706,24 @@ def _run_main(args, report, _write_report, parser):
                 lsp_servers,
                 workspace_root=base_dir,
                 verbose=args.verbose,
+                context_mode=(lsp_mode == "context"),
             )
             lsp_manager.start()
-            lsp_tools = lsp_manager.list_tools()
-            if lsp_tools:
-                tools.extend(lsp_tools)
-            lsp_tool_info = lsp_manager.get_tool_info()
+            # 'tools' (default): advertise lsp_* tools the model calls on demand.
+            # 'context': run the manager for diagnostics/sync only and inject
+            # LSP-derived context automatically each turn (no lsp_* tools).
+            if lsp_mode == "tools":
+                lsp_tools = lsp_manager.list_tools()
+                if lsp_tools:
+                    tools.extend(lsp_tools)
+                lsp_tool_info = lsp_manager.get_tool_info()
     args._lsp_manager = lsp_manager
+
+    # Phase B: the small-LLM relevance planner (only meaningful in context mode)
+    lsp_context_planner = (
+        _build_lsp_context_planner(args, base_dir) if lsp_mode == "context" else None
+    )
+    args._lsp_context_planner = lsp_context_planner
 
     # --- Secret encryption lifecycle ---
     secret_shield = None
@@ -7817,6 +7871,7 @@ def _run_main(args, report, _write_report, parser):
         mcp_manager=mcp_manager,
         a2a_manager=a2a_manager,
         lsp_manager=lsp_manager,
+        lsp_context_planner=lsp_context_planner,
         cache=llm_cache,
         secret_shield=secret_shield,
         command_policy=command_policy,
@@ -8234,6 +8289,7 @@ def run_agent_loop(
     mcp_manager=None,
     a2a_manager=None,
     lsp_manager=None,
+    lsp_context_planner=None,
     subagent_manager=None,
     continue_here: bool = True,
     cache=None,
@@ -8536,6 +8592,42 @@ def run_agent_loop(
         turns -= 1
 
     _is_tools_retry = False
+
+    # --- Phase B: run the LSP-context planner once per user turn ---
+    # The small local LLM selects code relevant to the user's task; we fetch it
+    # directly from disk (no lsp_* tools). Computed once here — not per loop
+    # iteration — so a slow planner never stalls the loop, and re-derived on
+    # every run_agent_loop call so it survives compaction. Best-effort: None on
+    # any failure (Phase A diagnostics still inject independently below).
+    _lsp_planner_text: str | None = None
+    if lsp_context_planner is not None and lsp_manager is not None:
+        _planner_query = ""
+        for _m in reversed(messages):
+            if isinstance(_m, dict) and _m.get("role") == "user":
+                _c = _m.get("content")
+                if isinstance(_c, str):
+                    _planner_query = _c
+                elif isinstance(_c, list):
+                    _planner_query = " ".join(
+                        p.get("text", "")
+                        for p in _c
+                        if isinstance(p, dict) and p.get("type") == "text"
+                    )
+                if _planner_query:
+                    break
+        if _planner_query:
+            try:
+                _lsp_planner_text = lsp_context_planner.collect_code_context(
+                    _planner_query,
+                    lsp_manager,
+                    lsp_manager.dirty_paths(),
+                    base_dir,
+                )
+            except Exception as _planner_err:
+                if verbose:
+                    print(f"  LSP planner: {_planner_err}", flush=True)
+                _lsp_planner_text = None
+
     while turns < max_turns:
         turns += 1
 
@@ -8618,14 +8710,38 @@ def run_agent_loop(
                     f"Backfilled {_orphans_filled} interrupted tool call(s) in history."
                 )
 
-        token_est = estimate_tokens(messages, effective_tools)
+        # --- LSP-as-context (lsp_mode="context") ---
+        # Each iteration, derive LSP context (diagnostics for files edited this
+        # turn) and inject it as an ephemeral user message. The canonical
+        # `messages` history is never mutated: the context is re-derived every
+        # turn from live LSP state, so it cannot bloat the transcript and it
+        # survives compaction naturally. Every retry/repair call site below
+        # reuses the same _llm_args, so this single build covers them all.
+        _lsp_context_msg = None
+        if lsp_manager is not None and getattr(lsp_manager, "context_mode", False):
+            _lsp_parts: list[str] = []
+            _lsp_diag = lsp_manager.collect_turn_context()
+            if isinstance(_lsp_diag, str) and _lsp_diag:
+                _lsp_parts.append(_lsp_diag)
+            if isinstance(_lsp_planner_text, str) and _lsp_planner_text:
+                _lsp_parts.append(_lsp_planner_text)
+            if _lsp_parts:
+                _lsp_context_msg = {
+                    "role": "user",
+                    "content": "[lsp automated context]\n" + "\n\n".join(_lsp_parts),
+                }
+        effective_messages = (
+            messages if _lsp_context_msg is None else [*messages, _lsp_context_msg]
+        )
+
+        token_est = estimate_tokens(effective_messages, effective_tools)
         if verbose:
             fmt.turn_header(turns, max_turns, token_est, context_length)
 
         t0 = time.monotonic()
         try:
             effective_max_output = clamp_output_tokens(
-                messages, effective_tools, context_length, max_output_tokens
+                effective_messages, effective_tools, context_length, max_output_tokens
             )
             if effective_max_output != max_output_tokens and verbose:
                 fmt.info(
@@ -8635,7 +8751,7 @@ def run_agent_loop(
             _llm_args = (
                 api_base,
                 model_id,
-                messages,
+                effective_messages,
                 effective_max_output,
                 temperature,
                 top_p,
@@ -12089,6 +12205,7 @@ def repl_loop(
     mcp_manager=None,
     a2a_manager=None,
     lsp_manager=None,
+    lsp_context_planner=None,
     subagent_manager=None,
     continue_here: bool = True,
     cache=None,

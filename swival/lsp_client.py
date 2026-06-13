@@ -714,6 +714,7 @@ class LspManager:
         server_configs: dict[str, dict],
         workspace_root: str,
         verbose: bool = False,
+        context_mode: bool = False,
     ):
         """
         server_configs: {
@@ -730,6 +731,10 @@ class LspManager:
         self._server_configs = server_configs
         self._workspace_root = Path(workspace_root).resolve()
         self._verbose = verbose
+        # When True (lsp_mode="context"), the agent loop auto-injects LSP-derived
+        # context (diagnostics + planner code) each turn instead of advertising
+        # lsp_* tools. Read by the loop's context seam.
+        self.context_mode = context_mode
 
         # Background event loop
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -757,6 +762,24 @@ class LspManager:
         self._closing = False
         self._closed = False
         self._started = False
+
+        # Files written since the last collect_turn_context() call. Drives
+        # LSP-as-context (``lsp_mode="context"``): diagnostics for these
+        # files are injected into the model's context each turn instead of
+        # being exposed as lsp_* tools. Guarded by a lock because the
+        # notification worker thread mutates it while the agent thread
+        # reads and drains it.
+        self._dirty_paths: list[str] = []
+        self._dirty_lock = threading.Lock()
+        self._dirty_cap = 64
+
+        # Every file opened in the LSP this session (read OR write). The Phase B
+        # planner reads document symbols from these to find code relevant to the
+        # user's task even before anything is edited (pyright's workspace/symbol
+        # is unreliable, so document symbols on opened files are the primary
+        # candidate source). Same locking as _dirty_paths.
+        self._open_paths: list[str] = []
+        self._open_cap = 64
 
     # --- Public API ---
 
@@ -905,6 +928,222 @@ class LspManager:
             return
         self._enqueue_notification("delete", abs_path, None)
 
+    def dirty_paths(self) -> list[str]:
+        """Snapshot of files written since the last ``collect_turn_context()``."""
+        with self._dirty_lock:
+            return list(self._dirty_paths)
+
+    def open_paths(self) -> list[str]:
+        """Snapshot of files opened in the LSP this session (read or write)."""
+        with self._dirty_lock:
+            return list(self._open_paths)
+
+    def collect_turn_context(self, *, clear: bool = True) -> str | None:
+        """Return diagnostics text for files written since the last call.
+
+        Drives LSP-as-context (``lsp_mode="context"``): instead of exposing
+        ``lsp_*`` tools, diagnostics for files the agent edited are injected
+        into the model's context each turn. Returns ``None`` when there is
+        nothing to report. When ``clear`` is True (default) the dirty set is
+        drained so each turn reports only newly-edited files.
+
+        The diagnostics data is already maintained from
+        ``textDocument/publishDiagnostics`` notifications (no new LSP
+        traffic). Note: ``publishDiagnostics`` is asynchronous, so
+        diagnostics for a just-made edit may appear one iteration late.
+        """
+        if not self._started or not self._connections:
+            if clear:
+                with self._dirty_lock:
+                    self._dirty_paths.clear()
+            return None
+
+        with self._dirty_lock:
+            paths = list(self._dirty_paths)
+            if clear:
+                self._dirty_paths.clear()
+        if not paths:
+            return None
+
+        blocks: list[str] = []
+        for raw in paths:
+            abs_path = Path(raw)
+            server_name = self._resolve_server(abs_path)
+            if server_name is None:
+                continue
+            conn = self._connections[server_name]
+            uri = path_to_uri(abs_path)
+            try:
+                diags = conn.get_diagnostics(uri)
+            except Exception:
+                continue
+            if not diags:
+                continue
+            try:
+                rel = str(abs_path.relative_to(self._workspace_root))
+            except ValueError:
+                rel = str(abs_path)
+            blocks.append(_format_diagnostics(diags, rel))
+
+        if not blocks:
+            return None
+        return "Diagnostics for files edited this turn:\n\n" + "\n\n".join(blocks)
+
+    def gather_symbol_candidates(
+        self,
+        query_tokens: list[str],
+        dirty_paths: list[str],
+        *,
+        max_candidates: int = 40,
+    ) -> list[dict]:
+        """Return structured symbol candidates for the LSP-context planner.
+
+        Blends two sources, most-relevant first:
+
+        1. Document symbols of files edited this turn (``dirty_paths``) —
+           these carry full ranges and are definitely relevant.
+        2. ``workspace/symbol`` search for each query token — broader reach.
+
+        Each candidate is ``{name, kind, file, line, end_line, source}`` where
+        ``file`` is relative to the workspace root, lines are 1-based, and
+        ``source`` is ``"doc"`` or ``"ws"``. Deduped by ``(file, line, name)``
+        and capped at ``max_candidates``. Best-effort: returns ``[]`` on error.
+        """
+        if not self._started or not self._connections:
+            return []
+
+        seen: set[tuple[str, int, str]] = set()
+        out: list[dict] = []
+
+        def _add(name, kind, uri, rng, source) -> None:
+            path = uri_to_path(uri)
+            if path is None:
+                return
+            try:
+                rel = str(path.relative_to(self._workspace_root))
+            except ValueError:
+                rel = str(path)
+            start = (rng or {}).get("start", {})
+            end = (rng or {}).get("end", {})
+            line = start.get("line", 0) + 1
+            end_line = end.get("line", line - 1) + 1
+            key = (rel, line, name)
+            if key in seen:
+                return
+            seen.add(key)
+            out.append(
+                {
+                    "name": name,
+                    "kind": _symbol_kind_name(kind or 0),
+                    "file": rel,
+                    "line": line,
+                    "end_line": end_line,
+                    "source": source,
+                }
+            )
+
+        try:
+            # 1. Document symbols from files the agent has touched: edited this
+            #    turn (dirty) plus anything opened this session. pyright's
+            #    workspace/symbol is unreliable, so document symbols on opened
+            #    files are the primary candidate source — this lets the planner
+            #    find relevant code before anything is edited.
+            seen_files: set[str] = set()
+            doc_files: list[str] = []
+            for r in list(dirty_paths) + self.open_paths():
+                if r not in seen_files:
+                    seen_files.add(r)
+                    doc_files.append(r)
+            for raw in doc_files:
+                if len(out) >= max_candidates:
+                    break
+                abs_path = Path(raw)
+                server_name = self._resolve_server(abs_path)
+                if not server_name:
+                    continue
+                conn = self._connections[server_name]
+                uri = path_to_uri(abs_path)
+                try:
+                    syms = self._run_sync(conn.document_symbols(uri), timeout=5)
+                except Exception:
+                    syms = None
+
+                def _visit(s, _uri=uri):
+                    _add(
+                        s.get("name", ""),
+                        s.get("kind", 0),
+                        _uri,
+                        _symbol_range(s),
+                        "doc",
+                    )
+
+                _walk_doc_symbols(syms, _visit)
+
+            # 2. Workspace symbol search for query tokens (first server).
+            if self._connections:
+                conn = next(iter(self._connections.values()))
+                for tok in query_tokens:
+                    if len(out) >= max_candidates:
+                        break
+                    if not tok:
+                        continue
+                    try:
+                        syms = self._run_sync(conn.workspace_symbols(tok), timeout=5)
+                    except Exception:
+                        syms = None
+                    if not syms:
+                        continue
+                    for s in syms:
+                        if len(out) >= max_candidates:
+                            break
+                        loc = s.get("location", {}) or {}
+                        _add(
+                            s.get("name", ""),
+                            s.get("kind", 0),
+                            loc.get("uri", ""),
+                            loc.get("range", {}),
+                            "ws",
+                        )
+        except Exception:
+            pass
+        return out[:max_candidates]
+
+    def fetch_symbol_body(
+        self,
+        abs_path,
+        start_line: int,
+        end_line: int,
+        *,
+        max_lines: int = 60,
+        selection_window: int = 25,
+    ) -> str:
+        """Read source lines [start_line, end_line] (1-based, inclusive) from disk.
+
+        Used to render a selected symbol's source for the planner. A range
+        shorter than ~3 lines is almost certainly a narrow selection range
+        (workspace symbols) rather than a real body, so it is grown to
+        ``selection_window``; everything is capped at ``max_lines``. Returns
+        ``""`` on error or empty range. Never raises.
+        """
+        try:
+            p = Path(abs_path)
+            if not p.is_file():
+                return ""
+            text = p.read_text(encoding="utf-8", errors="replace")
+            lines = text.splitlines()
+            s = max(1, int(start_line)) - 1
+            e = int(end_line)
+            if e - s < 3:
+                e = s + selection_window
+            if e - s > max_lines:
+                e = s + max_lines
+            e = min(e, len(lines))
+            if s >= len(lines) or e <= s:
+                return ""
+            return "\n".join(lines[s:e])
+        except Exception:
+            return ""
+
     def _enqueue_notification(
         self, action: str, abs_path: Path, content: str | None
     ) -> None:
@@ -965,6 +1204,12 @@ class LspManager:
         server_name = self._resolve_server(abs_path)
         if server_name is None:
             return
+        # Record edits so collect_turn_context() can report their diagnostics.
+        if action == "write":
+            self._mark_dirty(abs_path)
+        # Track every opened file (read or write) for the Phase B planner.
+        if action in ("read", "write"):
+            self._mark_open(abs_path)
         conn = self._connections[server_name]
         ext = abs_path.suffix.lower()
         language_id = EXT_TO_LANGUAGE.get(ext, "plaintext")
@@ -976,6 +1221,31 @@ class LspManager:
                 self._run_sync(conn.did_change(uri, content, language_id), timeout=5)
         elif action == "delete":
             self._run_sync(conn.did_close(uri), timeout=5)
+
+    def _mark_dirty(self, abs_path: Path) -> None:
+        """Record a file as edited, for LSP-as-context diagnostics.
+
+        Dedupes and caps the dirty set; older entries are dropped first.
+        """
+        key = str(abs_path)
+        with self._dirty_lock:
+            if key in self._dirty_paths:
+                return
+            self._dirty_paths.append(key)
+            over = len(self._dirty_paths) - self._dirty_cap
+            if over > 0:
+                del self._dirty_paths[:over]
+
+    def _mark_open(self, abs_path: Path) -> None:
+        """Record a file as opened this session, for the Phase B planner."""
+        key = str(abs_path)
+        with self._dirty_lock:
+            if key in self._open_paths:
+                return
+            self._open_paths.append(key)
+            over = len(self._open_paths) - self._open_cap
+            if over > 0:
+                del self._open_paths[:over]
 
     def close(self) -> None:
         """Idempotent shutdown."""
@@ -1692,6 +1962,31 @@ _SYMBOL_KIND_NAMES = {
 def _symbol_kind_name(kind: int) -> str:
     """Convert an LSP SymbolKind number to a human-readable name."""
     return _SYMBOL_KIND_NAMES.get(kind, f"unknown({kind})")
+
+
+def _walk_doc_symbols(symbols, visit) -> None:
+    """Depth-first walk of DocumentSymbol trees, calling ``visit(sym)`` each.
+
+    DocumentSymbol results nest children inside ``children``.
+    """
+    for s in symbols or []:
+        visit(s)
+        children = s.get("children") or []
+        if children:
+            _walk_doc_symbols(children, visit)
+
+
+def _symbol_range(sym: dict) -> dict:
+    """Resolve a symbol's range whether it's a DocumentSymbol (top-level
+    ``range``) or a SymbolInformation (nested under ``location``).
+
+    pyright returns document symbols in SymbolInformation form, so this matters.
+    """
+    rng = sym.get("range")
+    if rng:
+        return rng
+    loc = sym.get("location") or {}
+    return loc.get("range") or {}
 
 
 # ---------------------------------------------------------------------------
